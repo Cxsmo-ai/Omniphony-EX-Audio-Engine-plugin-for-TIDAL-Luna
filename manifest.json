@@ -1,0 +1,9 @@
+{
+  "name": "Omniphony EX Audio Engine",
+  "description": "OmniFusion TIDAL playback with verified Omniphony JOC routing and codec telemetry.",
+  "author": "Pickymarker",
+  "dependencies": {},
+  "version": "2.1.19",
+  "main": "omniphony-live-sync.mjs?build=20261106-syllable-log-r1-2.1.19-service-2.1.25",
+  "hash": "5A9834BE1CFF4B96FF11E60CD602A3D4F28F374AF6D7505039A5D5A74EF250F8"
+}

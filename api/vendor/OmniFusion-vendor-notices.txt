@@ -1,0 +1,19 @@
+OmniFusion service runtime dependencies
+
+python-tidal
+  Source: https://github.com/EbbLabs/python-tidal
+  Version: 0.9.0 (local source package)
+  License: LGPL-3.0-or-later
+  License text: licenses/python-tidal-LICENSE
+
+psutil
+  Version: 7.2.2
+  License: BSD-3-Clause (see psutil-7.2.2.dist-info/LICENSE)
+
+Pinned python-tidal runtime dependencies
+  requests 2.32.3
+  python-dateutil 2.9.0.post0
+  isodate 0.7.2
+  mpegdash 0.4.1
+
+Dependency metadata and license files are kept in each .dist-info folder.

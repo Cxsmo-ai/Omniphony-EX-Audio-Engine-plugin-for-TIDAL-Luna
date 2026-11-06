@@ -1,0 +1,12 @@
+mpegdash-0.4.1.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4
+mpegdash-0.4.1.dist-info/METADATA,sha256=eoeZn9mJvrKwPOHf1Nc8xXZzEBkULk9LP_mZC24zT6M,2736
+mpegdash-0.4.1.dist-info/RECORD,,
+mpegdash-0.4.1.dist-info/REQUESTED,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+mpegdash-0.4.1.dist-info/WHEEL,sha256=_zCd3N1l69ArxyTb8rzEoP9TpbYXkqRFSNOD5OuxnTs,91
+mpegdash-0.4.1.dist-info/licenses/LICENSE,sha256=w83UWJWYnr2fS97uqFH_1Qqfn6KHa9hPeVK-Qfm2Xvw,1079
+mpegdash-0.4.1.dist-info/top_level.txt,sha256=sxbZYidKbBu_b5lQjQXV66UqGAQWtutaxFT40xHNh_o,9
+mpegdash/__init__.py,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+mpegdash/nodes.py,sha256=tQHCrMkQsObl1qKSaqE___SVxau1-ynzC4nG8tVQNpM,42449
+mpegdash/parser.py,sha256=IG08rkuGdq7LEk8DE6fDEVu6fGo4D6ViadzPpzsp_Fw,1255
+mpegdash/prettyprinter.py,sha256=Wp5rcrkXCX-yZ9-WF10psUBd4AJcELceJlj8kyxItyM,2285
+mpegdash/utils.py,sha256=9rk91JhmnWtYR5pfDLQN5ZVFgi9O_Aozz-FARzNy6dw,2362
