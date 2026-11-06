@@ -67,6 +67,7 @@ DEFAULT_SETTINGS = {
     "priority": ["AC4_IMS", "EAC3_JOC", "HI_RES_LOSSLESS", "LOSSLESS"],
     "audio_device": "auto",
     "volume": 100,
+    "eclipse_addons": [],
 }
 SUPPORTED_FORMAT_PRIORITY = ("AC4_IMS", "EAC3_JOC", "HI_RES_LOSSLESS", "LOSSLESS")
 CANCELLED_PLAY_REQUEST_TTL = 600.0
@@ -3355,6 +3356,33 @@ class TidalDashProxy:
             self.server.server_close()
             self.server = None
 
+
+def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str) -> dict | None:
+    try:
+        base = addon_manifest_url.rsplit('/manifest.json', 1)[0]
+        url = f'{base}/isrc/track/{isrc}.json'
+        req = urllib.request.Request(url, headers={'User-Agent': 'Eclipse/1.0.0'})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            data = json.loads(r.read().decode())
+            for s in data.get('streams', []):
+                if s.get('format') == requested_fmt:
+                    return {
+                        'format': s['format'],
+                        'codec': str(s.get('sourceCodec') or 'flac').lower(),
+                        'label': s.get('title', 'Eclipse Addon Stream'),
+                        'uri': s['url'],
+                        'transport': 'DIRECT',
+                        'sourceCodec': s.get('sourceCodec', 'FLAC'),
+                        'sourceBitrate': s.get('sourceBitrate'),
+                        'sourceSampleRate': s.get('sourceSampleRate', 44100),
+                        'sourceChannels': s.get('sourceChannels', 2),
+                        'sourceBitDepth': s.get('sourceBitDepth', 16),
+                        'sourceProvider': s.get('provider', 'AMAZON'),
+                    }
+    except Exception as e:
+        pass
+    return None
+
 def resolve_with_priority(track_id: int, priority_list: list[str]) -> dict:
     resolvers = {
         "EAC3_JOC": lambda tid: resolve_eac3_joc(tid),
@@ -3365,6 +3393,16 @@ def resolve_with_priority(track_id: int, priority_list: list[str]) -> dict:
     
     # Track candidate cache: clicked track is always evaluated
     candidate_ids = [track_id]
+    settings = load_settings()
+    eclipse_addons = settings.get("eclipse_addons", [])
+    track_isrc = None
+    try:
+        import tidalapi
+        sess = get_python_tidal_mobile_session()
+        t_obj = sess.track(track_id)
+        track_isrc = getattr(t_obj, "isrc", None)
+    except Exception:
+        pass
     
     # RealMAX cross-edition discovery: find alternate album releases (Atmos editions, Deluxe Hi-Res, etc.)
     try:
@@ -3386,6 +3424,12 @@ def resolve_with_priority(track_id: int, priority_list: list[str]) -> dict:
     for fmt in priority_list:
         if fmt not in resolvers:
             continue
+        if track_isrc and eclipse_addons:
+            for addon_url in eclipse_addons:
+                addon_res = resolve_eclipse_addon(addon_url, track_isrc, fmt)
+                if addon_res:
+                    print(f"[RealMAX] Selected Eclipse addon {addon_res.get('sourceProvider')} stream for {track_id} ({fmt})")
+                    return addon_res
         for tid in candidate_ids:
             try:
                 res = resolvers[fmt](tid)
@@ -3879,19 +3923,24 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             return self.send_json({"error": f"invalid JSON request: {exc}"}, status=400)
 
         if parsed.path == "/config":
-            if not isinstance(body, dict) or set(body) != {"priority"}:
+            if not isinstance(body, dict) or not set(body).issubset({"priority", "eclipse_addons"}):
                 return self.send_json({"error": "expected an object containing only priority"}, status=400)
-            priority = body["priority"]
-            if (not isinstance(priority, list)
-                    or len(priority) != len(SUPPORTED_FORMAT_PRIORITY)
-                    or any(not isinstance(item, str) for item in priority)
-                    or set(priority) != set(SUPPORTED_FORMAT_PRIORITY)):
-                return self.send_json({
-                    "error": "priority must contain each supported format exactly once",
-                    "supported": list(SUPPORTED_FORMAT_PRIORITY),
-                }, status=400)
+            updates = {}
+            if "priority" in body:
+                priority = body["priority"]
+                if (not isinstance(priority, list)
+                        or len(priority) != len(SUPPORTED_FORMAT_PRIORITY)
+                        or any(not isinstance(item, str) for item in priority)
+                        or set(priority) != set(SUPPORTED_FORMAT_PRIORITY)):
+                    return self.send_json({
+                        "error": "priority must contain each supported format exactly once",
+                        "supported": list(SUPPORTED_FORMAT_PRIORITY),
+                    }, status=400)
+                updates["priority"] = priority
+            if "eclipse_addons" in body and isinstance(body["eclipse_addons"], list):
+                updates["eclipse_addons"] = body["eclipse_addons"]
             try:
-                settings = update_settings({"priority": priority})
+                settings = update_settings(updates)
             except OSError as exc:
                 return self.send_json({"error": f"could not save settings: {exc}"}, status=500)
             self.send_json({"status": "saved", "config": settings})
@@ -4026,7 +4075,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             candidate_proxy = None
             route_status = None
 
-            if fmt in {"HI_RES_LOSSLESS", "LOSSLESS"} or (fmt == "EAC3_JOC" and stream_info.get("transport") == "DASH"):
+            if (fmt in {"HI_RES_LOSSLESS", "LOSSLESS"} and stream_info.get("transport") != "DIRECT") or (fmt == "EAC3_JOC" and stream_info.get("transport") == "DASH"):
                 try:
                     candidate_proxy = TidalDashProxy(
                         stream_info.get("manifestXml"),
