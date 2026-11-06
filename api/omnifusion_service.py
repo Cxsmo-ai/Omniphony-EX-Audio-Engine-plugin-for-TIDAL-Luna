@@ -4783,7 +4783,34 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
+
+def tidal_process_watchdog(engine):
+    """Monitor TIDAL.exe; if TIDAL closes, pause MPV automatically."""
+    import psutil
+    last_tidal_seen = time.monotonic()
+    while True:
+        time.sleep(2.0)
+        try:
+            tidal_running = any(
+                p.info.get("name") and p.info["name"].lower() == "tidal.exe"
+                for p in psutil.process_iter(["name"])
+            )
+            if tidal_running:
+                last_tidal_seen = time.monotonic()
+            elif time.monotonic() - last_tidal_seen > 3.0:
+                # TIDAL has been closed for more than 3 seconds
+                with engine.playback_lock:
+                    with engine.playback_generation_lock:
+                        if engine.proc and engine.proc.poll() is None and not engine.current_meta.get("paused", True):
+                            print("[*] TIDAL process exited: pausing background libmpv engine...")
+                            engine.cmd(["set_property", "pause", True])
+                            engine.current_meta["paused"] = True
+                            engine.current_meta["playbackState"] = "paused"
+        except Exception:
+            pass
+
 def run():
+    threading.Thread(target=tidal_process_watchdog, args=(engine,), daemon=True).start()
     settings = load_settings()
     save_settings(settings)
     threading.Thread(target=engine.ensure_mpv, kwargs={"device": settings.get("audio_device", "auto")}, daemon=True).start()

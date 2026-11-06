@@ -284,6 +284,28 @@ function onLoad() {
 unloads.add(() => {
   pluginDisposed = true;
   console.log("[Omniphony EX] Cleaning up plugin resources...");
+  // Pause background libmpv engine so audio stops when TIDAL closes or plugin unloads
+  try {
+    if (typeof navigator !== "undefined" && navigator.sendBeacon) {
+      const blob = new Blob([JSON.stringify({
+        trackId: currentStatusData?.trackId,
+        playbackGeneration: currentStatusData?.playbackGeneration,
+        requestId: currentStatusData?.requestId
+      })], { type: 'application/json' });
+      navigator.sendBeacon(`${API_BASE}/pause`, blob);
+    } else {
+      fetch(`${API_BASE}/pause`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          trackId: currentStatusData?.trackId,
+          playbackGeneration: currentStatusData?.playbackGeneration,
+          requestId: currentStatusData?.requestId
+        }),
+        keepalive: true
+      }).catch(() => {});
+    }
+  } catch (_) {}
   if (pollTimer) clearInterval(pollTimer);
   if (clockPollTimer) clearInterval(clockPollTimer);
   if (mediaInterceptTimer) clearInterval(mediaInterceptTimer);
