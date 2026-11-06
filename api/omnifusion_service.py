@@ -68,6 +68,7 @@ DEFAULT_SETTINGS = {
     "audio_device": "auto",
     "volume": 100,
     "eclipse_addons": [],
+    "realmax_source": "auto",
 }
 SUPPORTED_FORMAT_PRIORITY = ("AC4_IMS", "EAC3_JOC", "HI_RES_LOSSLESS", "LOSSLESS")
 CANCELLED_PLAY_REQUEST_TTL = 600.0
@@ -3400,6 +3401,7 @@ def resolve_with_priority(track_id: int, priority_list: list[str]) -> dict:
     candidate_ids = [track_id]
     settings = load_settings()
     eclipse_addons = settings.get("eclipse_addons", [])
+    source_mode = settings.get("realmax_source", "auto")
     track_isrc = None
     try:
         import tidalapi
@@ -3429,23 +3431,26 @@ def resolve_with_priority(track_id: int, priority_list: list[str]) -> dict:
     for fmt in priority_list:
         if fmt not in resolvers:
             continue
-        if track_isrc and eclipse_addons:
-            for addon_url in eclipse_addons:
-                addon_res = resolve_eclipse_addon(addon_url, track_isrc, fmt)
-                if addon_res:
-                    print(f"[RealMAX] Selected Eclipse addon {addon_res.get('sourceProvider')} stream for {track_id} ({fmt})")
-                    return addon_res
-        for tid in candidate_ids:
-            try:
-                res = resolvers[fmt](tid)
-                if res:
-                    if tid == track_id:
-                        print(f"[+] Track {track_id} resolved directly as: {fmt}")
-                    else:
-                        print(f"[RealMAX] Upgraded track {track_id} -> {tid} as: {fmt}")
-                    return res
-            except Exception as e:
-                pass
+        if track_isrc and eclipse_addons and source_mode != "tidal_only":
+            # Amazon Music does not carry Dolby AC-4 IMS; skip AC4_IMS for Amazon queries
+            if fmt != "AC4_IMS":
+                for addon_url in eclipse_addons:
+                    addon_res = resolve_eclipse_addon(addon_url, track_isrc, fmt)
+                    if addon_res:
+                        print(f"[RealMAX] Selected Eclipse addon {addon_res.get('sourceProvider')} stream for {track_id} ({fmt})")
+                        return addon_res
+        if source_mode != "amazon_only":
+            for tid in candidate_ids:
+                try:
+                    res = resolvers[fmt](tid)
+                    if res:
+                        if tid == track_id:
+                            print(f"[+] Track {track_id} resolved directly as: {fmt}")
+                        else:
+                            print(f"[RealMAX] Upgraded track {track_id} -> {tid} as: {fmt}")
+                        return res
+                except Exception as e:
+                    pass
 
     raise RuntimeError(f"Could not resolve any audio stream for track {track_id}")
 
@@ -3933,7 +3938,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             return self.send_json({"error": f"invalid JSON request: {exc}"}, status=400)
 
         if parsed.path == "/config":
-            if not isinstance(body, dict) or not set(body).issubset({"priority", "eclipse_addons"}):
+            if not isinstance(body, dict) or not set(body).issubset({"priority", "eclipse_addons", "realmax_source"}):
                 return self.send_json({"error": "expected an object containing only priority"}, status=400)
             updates = {}
             if "priority" in body:
@@ -3949,6 +3954,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 updates["priority"] = priority
             if "eclipse_addons" in body and isinstance(body["eclipse_addons"], list):
                 updates["eclipse_addons"] = body["eclipse_addons"]
+            if "realmax_source" in body and body["realmax_source"] in ("auto", "tidal_only", "amazon_only"):
+                updates["realmax_source"] = body["realmax_source"]
             try:
                 settings = update_settings(updates)
             except OSError as exc:
@@ -4489,6 +4496,20 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 "requestId": request_id,
             })
 
+        elif parsed.path == "/shutdown":
+            def do_exit():
+                time.sleep(0.5)
+                with engine.playback_lock:
+                    if engine.proc and engine.proc.poll() is None:
+                        try:
+                            engine.proc.terminate()
+                            engine.proc.wait(timeout=2)
+                        except Exception:
+                            pass
+                os._exit(0)
+            threading.Thread(target=do_exit, daemon=True).start()
+            return self.send_json({"status": "shutting_down"})
+
         elif parsed.path == "/pause":
             with engine.playback_lock:
                 with engine.playback_generation_lock:
@@ -4798,14 +4819,16 @@ def tidal_process_watchdog(engine):
             if tidal_running:
                 last_tidal_seen = time.monotonic()
             elif time.monotonic() - last_tidal_seen > 3.0:
-                # TIDAL has been closed for more than 3 seconds
+                # TIDAL closed: terminate MPV and shut down service completely
+                print("[*] TIDAL exited: terminating mpv.exe and shutting down OmniFusion service...")
                 with engine.playback_lock:
-                    with engine.playback_generation_lock:
-                        if engine.proc and engine.proc.poll() is None and not engine.current_meta.get("paused", True):
-                            print("[*] TIDAL process exited: pausing background libmpv engine...")
-                            engine.cmd(["set_property", "pause", True])
-                            engine.current_meta["paused"] = True
-                            engine.current_meta["playbackState"] = "paused"
+                    if engine.proc and engine.proc.poll() is None:
+                        try:
+                            engine.proc.terminate()
+                            engine.proc.wait(timeout=2)
+                        except Exception:
+                            pass
+                os._exit(0)
         except Exception:
             pass
 

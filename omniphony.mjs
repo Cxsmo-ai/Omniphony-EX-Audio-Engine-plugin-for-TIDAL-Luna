@@ -5021,6 +5021,53 @@ function toggleSettingsPanel() {
   panel.appendChild(priorityHelp);
   panel.appendChild(prioritySaveStatus);
 
+  // RealMAX Source Provider Selector (Both / TIDAL Only / Amazon Music Only)
+  const sourceLabel = document.createElement("label");
+  sourceLabel.innerText = "RealMAX Source Provider:";
+  sourceLabel.style.fontWeight = "600";
+  sourceLabel.style.display = "block";
+  sourceLabel.style.marginBottom = "6px";
+  panel.appendChild(sourceLabel);
+
+  const sourceSelect = document.createElement("select");
+  Object.assign(sourceSelect.style, {
+    width: "100%",
+    backgroundColor: "#222",
+    color: "#fff",
+    border: "1px solid #444",
+    borderRadius: "6px",
+    padding: "8px",
+    marginBottom: "14px",
+    outline: "none"
+  });
+  sourceSelect.id = "omniphony-source-select";
+  sourceSelect.setAttribute("aria-label", "RealMAX source provider mode");
+  [
+    { value: "auto", label: "Both (TIDAL + Amazon Music / Eclipse)" },
+    { value: "tidal_only", label: "TIDAL Only (Atmos AC-4/JOC + Hi-Res)" },
+    { value: "amazon_only", label: "Amazon Music Only (No AC-4 IMS)" },
+  ].forEach((opt) => {
+    const el = document.createElement("option");
+    el.value = opt.value;
+    el.innerText = opt.label;
+    sourceSelect.appendChild(el);
+  });
+  sourceSelect.onchange = async () => {
+    const mode = sourceSelect.value;
+    try {
+      await fetch(`${API_BASE}/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ realmax_source: mode })
+      });
+      console.log("[Omniphony EX] Saved RealMAX source mode:", mode);
+    } catch (err) {
+      console.warn("[Omniphony EX] Failed to save source mode:", err);
+    }
+  };
+  panel.appendChild(sourceSelect);
+
+
   // Audio Output Device Selector
   const deviceLabel = document.createElement("label");
   deviceLabel.innerText = "Audio Output Device:";
@@ -5263,6 +5310,7 @@ function toggleSettingsPanel() {
       settingsUiVerified = false;
     } else {
       currentConfig = { ...currentConfig, ...loaded };
+      if (document.getElementById("omniphony-source-select")) document.getElementById("omniphony-source-select").value = loaded?.realmax_source || "auto";
       prioritySelect.value = loaded.priority.join(",");
       updatePriorityTitle();
       prioritySelect.disabled = false;
