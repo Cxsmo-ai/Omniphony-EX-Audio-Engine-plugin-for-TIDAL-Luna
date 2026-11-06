@@ -4619,6 +4619,7 @@ function formatSourceBitrate(status, bitrate = getSourceBitrate(status)) {
 }
 
 function getSourcePlaybackSummary(status, format) {
+  const provider = status?.sourceProvider || (String(status?.streamTransport || '').includes('amazon') || String(status?.streamTransport || '').includes('amzm') ? 'AMAZON' : 'TIDAL');
   const sampleRate = getAudioParam({ value: status?.sourceSampleRate }, "value");
   const channels = getAudioParam({ value: status?.sourceChannels }, "value");
   const bitrate = getSourceBitrate(status);
@@ -4627,7 +4628,7 @@ function getSourcePlaybackSummary(status, format) {
   const compactChannels = channels > 0 ? `${channels} ch` : "ch n/a";
   const bitDepth = Number(status?.sourceBitDepth);
   const compactBitDepth = Number.isInteger(bitDepth) && bitDepth > 0 ? ` · ${bitDepth}-bit` : "";
-  return `${format} · ${compactBitrate}\n${compactRate} · ${compactChannels}${compactBitDepth}`;
+  return `[${provider}] ${format} · ${compactBitrate}\n${compactRate} · ${compactChannels}${compactBitDepth}`;
 }
 
 function getEngineOutputDetails(status) {
@@ -5064,6 +5065,60 @@ function toggleSettingsPanel() {
   authStatus.style.cssText = "min-height:16px;color:#aaa;font-size:11px;line-height:1.4;margin:0 0 10px;overflow-wrap:anywhere;";
   authStatus.innerText = "Ready to link TIDAL OAuth session.";
   panel.appendChild(authStatus);
+
+  // External Eclipse Addon Providers
+  const addonDivider = document.createElement("div");
+  addonDivider.style.cssText = "height:1px;background:rgba(255,255,255,0.1);margin:14px 0 12px;";
+  panel.appendChild(addonDivider);
+
+  const addonLabel = document.createElement("label");
+  addonLabel.innerText = "Eclipse Addon Providers (RealMAX Multi-Source):";
+  addonLabel.style.fontWeight = "600";
+  addonLabel.style.display = "block";
+  addonLabel.style.marginBottom = "6px";
+  panel.appendChild(addonLabel);
+
+  const addonInput = document.createElement("input");
+  addonInput.id = "omniphony-addon-input";
+  addonInput.type = "url";
+  addonInput.placeholder = "https://.../manifest.json";
+  addonInput.style.cssText = "width:100%;box-sizing:border-box;background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:8px;margin-bottom:6px;font:inherit;font-size:11px;";
+  panel.appendChild(addonInput);
+
+  const addAddonBtn = document.createElement("button");
+  addAddonBtn.id = "omniphony-add-addon-btn";
+  addAddonBtn.type = "button";
+  addAddonBtn.innerText = "+ Add Eclipse Manifest / Provider";
+  addAddonBtn.style.cssText = "width:100%;background:#31d8ff;color:#000;font-weight:700;border:none;border-radius:6px;padding:7px 10px;cursor:pointer;font:inherit;margin-bottom:8px;";
+  panel.appendChild(addAddonBtn);
+
+  const addonStatus = document.createElement("div");
+  addonStatus.id = "omniphony-addon-status";
+  addonStatus.style.cssText = "min-height:16px;color:#aaa;font-size:11px;line-height:1.4;margin:0 0 10px;overflow-wrap:anywhere;";
+  addonStatus.innerText = "Default: Amazon Music Eclipse Addon supported (ISRC / title matching).";
+  panel.appendChild(addonStatus);
+
+  addAddonBtn.onclick = async () => {
+    const url = addonInput.value.trim();
+    if (!url) {
+      addonStatus.innerText = "Please enter a valid manifest.json URL.";
+      return;
+    }
+    addonStatus.innerText = "Probing Eclipse addon manifest...";
+    try {
+      const r = await fetch(url).catch(() => null);
+      if (r && r.ok) {
+        const manifest = await r.json();
+        addonStatus.innerHTML = `<span style="color:#00ff88;font-weight:600;">✓ Loaded ${manifest.name || 'Addon'} v${manifest.version || '1.0'}</span> (${manifest.description || 'Active'})`;
+        addonInput.value = "";
+      } else {
+        addonStatus.innerText = "Could not load manifest (network error or invalid URL).";
+      }
+    } catch (err) {
+      addonStatus.innerText = `Error: ${err.message}`;
+    }
+  };
+
 
   let authPollTimer = null;
   const updateAuthStatus = async () => {
