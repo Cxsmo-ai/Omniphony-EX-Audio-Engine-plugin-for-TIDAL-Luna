@@ -5380,3 +5380,135 @@ function updatePausedSelectionUi(message = null) {
 
 // Run only after every module-level observer and state object has initialized.
 onLoad();
+
+
+// Native TidaLuna Settings Modal Component
+export const Settings = () => {
+  const React = window.luna?.core?.modules?.["react"] || window.React;
+  const LunaUi = window.luna?.core?.modules?.["@luna/ui"];
+  
+  if (!React || !LunaUi) {
+    return null;
+  }
+  
+  const { LunaSettings, LunaSwitchSetting, LunaSelectSetting, LunaSelectItem, LunaTextSetting, LunaButtonSetting } = LunaUi;
+  
+  const [priority, setPriority] = React.useState(currentConfig.priority.join(","));
+  const [device, setDevice] = React.useState(currentConfig.audio_device);
+  const [sourceMode, setSourceMode] = React.useState(localStorage.getItem("omniphony_realmax_source") || "auto");
+  const [mpvPath, setMpvPath] = React.useState(localStorage.getItem("omniphony_mpv_path") || "C:\\OmniFusion-Standalone\\mpv");
+  const [studioPath, setStudioPath] = React.useState(localStorage.getItem("omniphony_studio_path") || "C:\\OmniFusion-Standalone\\studio\\omniphony-studio-egui.exe");
+  const [addonUrl, setAddonUrl] = React.useState("");
+  const [authStatus, setAuthStatus] = React.useState("Ready");
+  
+  return React.createElement(
+    LunaSettings,
+    { title: "Omniphony EX Engine & RealMAX" },
+    React.createElement(
+      LunaSelectSetting,
+      {
+        title: "RealMAX Quality Priority",
+        desc: "Format hierarchy for discrete Atmos (AC-4 / E-AC-3 JOC) and Hi-Res Lossless.",
+        value: priority,
+        onChange: async (e) => {
+          const val = e.target.value;
+          setPriority(val);
+          try {
+            await fetch(`${API_BASE}/config`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ priority: val.split(",") })
+            });
+          } catch (_) {}
+        }
+      },
+      priorityPresets.map((opt) =>
+        React.createElement(LunaSelectItem, { key: opt.value.join(","), value: opt.value.join(",") }, opt.label)
+      )
+    ),
+    React.createElement(
+      LunaSelectSetting,
+      {
+        title: "RealMAX Source Provider",
+        desc: "Choose between TIDAL only, Amazon Music only, or Both (highest quality wins). Amazon Music has no AC-4 IMS.",
+        value: sourceMode,
+        onChange: async (e) => {
+          const val = e.target.value;
+          setSourceMode(val);
+          localStorage.setItem("omniphony_realmax_source", val);
+          try {
+            await fetch(`${API_BASE}/config`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ realmax_source: val })
+            });
+          } catch (_) {}
+        }
+      },
+      React.createElement(LunaSelectItem, { value: "auto" }, "Both (TIDAL + Amazon Music / Eclipse)"),
+      React.createElement(LunaSelectItem, { value: "tidal_only" }, "TIDAL Only (Atmos AC-4/JOC + Hi-Res)"),
+      React.createElement(LunaSelectItem, { value: "amazon_only" }, "Amazon Music Only (No AC-4 IMS)")
+    ),
+    React.createElement(LunaTextSetting, {
+      title: "MPV Engine Directory",
+      desc: "Directory containing mpv.exe and orender.dll.",
+      value: mpvPath,
+      onChange: (e) => {
+        const val = e.target.value;
+        setMpvPath(val);
+        localStorage.setItem("omniphony_mpv_path", val);
+      }
+    }),
+    React.createElement(LunaTextSetting, {
+      title: "Omniphony Studio Executable",
+      desc: "Path to omniphony-studio-egui.exe for spatial headphone monitoring.",
+      value: studioPath,
+      onChange: (e) => {
+        const val = e.target.value;
+        setStudioPath(val);
+        localStorage.setItem("omniphony_studio_path", val);
+      }
+    }),
+    React.createElement(LunaTextSetting, {
+      title: "Amazon Music Eclipse Manifest URL",
+      desc: "Eclipse add-on manifest URL for multi-source Amazon Music resolution.",
+      value: addonUrl,
+      onChange: (e) => setAddonUrl(e.target.value)
+    }),
+    React.createElement(LunaButtonSetting, {
+      title: "Add / Update Eclipse Manifest",
+      desc: "Registers manifest with local RealMAX resolver.",
+      onClick: async () => {
+        if (!addonUrl.trim()) return;
+        try {
+          await fetch(`${API_BASE}/config`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ eclipse_addons: [addonUrl.trim()] })
+          });
+          alert("Saved Eclipse Manifest!");
+        } catch (err) {
+          alert("Failed to save manifest: " + err.message);
+        }
+      }
+    }, "Save Eclipse Manifest"),
+    React.createElement(LunaButtonSetting, {
+      title: "TIDAL OAuth Account Authorization",
+      desc: authStatus,
+      onClick: async () => {
+        setAuthStatus("Starting OAuth in browser...");
+        try {
+          const res = await fetch(`${API_BASE}/login/start`, { method: "POST", body: "{}", headers: { "Content-Type": "application/json" } });
+          if (res.ok) {
+            const data = await res.json();
+            setAuthStatus(`Verify Code in Browser: ${data.userCode}`);
+          } else {
+            setAuthStatus("Failed to start login");
+          }
+        } catch (err) {
+          setAuthStatus("Error: " + err.message);
+        }
+      }
+    }, "Link / Authenticate Account")
+  );
+};

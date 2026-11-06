@@ -53,3 +53,5 @@ unloads.add(() => {
     } catch (_) {}
   }
 });
+
+export { Settings } from "./omniphony.mjs";
