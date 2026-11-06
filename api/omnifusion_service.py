@@ -165,6 +165,7 @@ def public_track_status(metadata: dict, playback_state: str) -> dict:
         "title": metadata.get("title"),
         "artist": metadata.get("artist"),
         "presentationVerified": metadata.get("presentationVerified", False),
+        "sourceProvider": metadata.get("sourceProvider", "TIDAL"),
         "lastFailure": last_failure,
     })
     return fields
@@ -4069,6 +4070,12 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
             try:
                 stream_info = resolve_with_priority(int(track_id), priority)
+            except RuntimeError as exc:
+                return self.send_json({
+                    "error": str(exc),
+                    "trackId": track_id,
+                    "sourceMode": settings.get("realmax_source", "auto"),
+                }, status=404)
             except Ac4TransportUnavailable as exc:
                 return self.send_json({
                     "error": str(exc),
@@ -4455,6 +4462,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                         "requestedQuality": stream_info.get("requestedQuality"),
                         "sourceQuality": stream_info.get("sourceQuality"),
                         "sourceAudioMode": stream_info.get("sourceAudioMode"),
+                        "sourceProvider": stream_info.get("sourceProvider", "TIDAL"),
                         "presentation": stream_info.get("presentation"),
                         "presentationVerified": stream_info.get("presentationVerified", False),
                         "decodedSampleRate": stream_info.get("decodedSampleRate"),
