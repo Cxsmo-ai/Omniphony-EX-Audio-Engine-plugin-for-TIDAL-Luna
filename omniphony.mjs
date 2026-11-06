@@ -136,6 +136,8 @@ let transportIntentRevision = 0;
 const transportCommandQueues = new Map();
 const transportCommandsInFlight = new Map();
 let prepareNextSelectionPaused = false;
+let autoAdvanceEnabled = true;
+let lastAutoAdvancedTrackId = null;
 let pausedSelectionPending = null;
 let pausedSelectionConfirmedTrackId = null;
 let pausedSelectionUserPlayAuthorization = null;
@@ -4040,6 +4042,19 @@ function startSyncLoop() {
         // Clock advancement is plugin-local evidence, not hardware-output proof.
         // Refresh only after comparing consecutive samples of the same track.
         updateBadgeUI(currentFormatLabel);
+        // Auto-advance to next track when playback finishes naturally
+        if (autoAdvanceEnabled && status.duration > 0 && status.timePos > 0) {
+          const remainingSec = status.duration - status.timePos;
+          if (remainingSec <= 0.6 && String(mediaTrackId) !== String(lastAutoAdvancedTrackId)) {
+            lastAutoAdvancedTrackId = String(mediaTrackId);
+            console.info(`[Omniphony EX] Track ${mediaTrackId} reached end (remaining: ${remainingSec.toFixed(2)}s). Advancing to next track seamlessly...`);
+            try {
+              window.luna?.lib?.PlayState?.next?.();
+            } catch (err) {
+              console.warn('[Omniphony EX] Error triggering next track on end:', err);
+            }
+          }
+        }
       } else {
         currentStatusData.engineClockAdvancing = false;
         previousEngineSample = null;
