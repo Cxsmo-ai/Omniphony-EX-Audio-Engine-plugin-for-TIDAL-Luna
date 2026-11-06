@@ -39,6 +39,14 @@ export async function onLoad() {
 }
 
 unloads.add(() => {
+  // Send graceful shutdown to OmniFusion API service and MPV on TIDAL exit/unload
+  try {
+    if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
+      navigator.sendBeacon('http://127.0.0.1:8765/shutdown', '{}');
+    } else {
+      fetch('http://127.0.0.1:8765/shutdown', { method: 'POST', body: '{}', keepalive: true }).catch(() => {});
+    }
+  } catch (_) {}
   if (serviceProcess) {
     try {
       serviceProcess.kill();

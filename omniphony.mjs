@@ -292,9 +292,9 @@ unloads.add(() => {
         playbackGeneration: currentStatusData?.playbackGeneration,
         requestId: currentStatusData?.requestId
       })], { type: 'application/json' });
-      navigator.sendBeacon(`${API_BASE}/pause`, blob);
+      navigator.sendBeacon(`${API_BASE}/shutdown`, blob);
     } else {
-      fetch(`${API_BASE}/pause`, {
+      fetch(`${API_BASE}/shutdown`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
