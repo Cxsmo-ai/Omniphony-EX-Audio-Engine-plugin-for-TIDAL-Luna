@@ -3376,6 +3376,7 @@ def resolve_with_priority(track_id: int, priority_list: list[str]) -> dict:
     # automatically discover the Atmos edition of this song
     if any(p in ('AC4_IMS', 'EAC3_JOC') for p in priority_list[:2]):
         try:
+            import tidalapi
             session = get_python_tidal_mobile_session()
             if session:
                 orig = session.track(track_id)
