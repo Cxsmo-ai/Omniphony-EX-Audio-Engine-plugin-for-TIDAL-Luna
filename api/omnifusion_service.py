@@ -3365,46 +3365,44 @@ def resolve_with_priority(track_id: int, priority_list: list[str]) -> dict:
         "HI_RES_LOSSLESS": lambda tid: resolve_hi_res_or_lossless(tid, "HI_RES_LOSSLESS"),
         "LOSSLESS": lambda tid: resolve_hi_res_or_lossless(tid, "LOSSLESS"),
     }
-    # 1. Direct resolution check on the clicked track ID
+    
+    # Track candidate cache: clicked track is always evaluated
+    candidate_ids = [track_id]
+    
+    # RealMAX cross-edition discovery: find alternate album releases (Atmos editions, Deluxe Hi-Res, etc.)
+    try:
+        import tidalapi
+        session = get_python_tidal_mobile_session()
+        if session:
+            orig = session.track(track_id)
+            if orig and orig.name:
+                artist_name = getattr(orig.artist, "name", "") if getattr(orig, "artist", None) else ""
+                query = f"{orig.name} {artist_name}".strip()
+                search_res = session.search(query, models=[tidalapi.media.Track], limit=20)
+                for cand in search_res.get("tracks", []):
+                    if cand.id != track_id and cand.name.lower() == orig.name.lower() and abs(cand.duration - orig.duration) <= 6:
+                        candidate_ids.append(cand.id)
+    except Exception as exc:
+        print(f"[-] RealMAX candidate search error: {exc}")
+
+    # Evaluate each format in user's strict priority order
     for fmt in priority_list:
-        if fmt in ('EAC3_JOC', 'AC4_IMS'):
-            res = resolvers[fmt](track_id)
-            if res:
-                print(f"[+] Track {track_id} resolved directly as: {fmt}")
-                return res
-    # 2. RealMAX matching: if Atmos was prioritized but clicked track is stereo,
-    # automatically discover the Atmos edition of this song
-    if any(p in ('AC4_IMS', 'EAC3_JOC') for p in priority_list[:2]):
-        try:
-            import tidalapi
-            session = get_python_tidal_mobile_session()
-            if session:
-                orig = session.track(track_id)
-                if orig and orig.name:
-                    artist_name = getattr(orig.artist, 'name', '') if getattr(orig, 'artist', None) else ''
-                    query = f"{orig.name} {artist_name}".strip()
-                    search_res = session.search(query, models=[tidalapi.media.Track], limit=20)
-                    for cand in search_res.get('tracks', []):
-                        if cand.id == track_id: continue
-                        if cand.name.lower() == orig.name.lower() and abs(cand.duration - orig.duration) <= 6:
-                            if 'DOLBY_ATMOS' in getattr(cand, 'audio_modes', []):
-                                print(f"[RealMAX] Discovered Atmos edition for '{orig.name}': track {cand.id}")
-                                for fmt in priority_list:
-                                    if fmt in ('EAC3_JOC', 'AC4_IMS'):
-                                        res = resolvers[fmt](cand.id)
-                                        if res:
-                                            print(f"[RealMAX] Successfully upgraded to Atmos {fmt} via track {cand.id}")
-                                            return res
-        except Exception as exc:
-            print(f"[-] RealMAX Atmos matching skipped: {exc}")
-    # 3. Fallback to standard quality lossless / hi-res
-    for fmt in priority_list:
-        if fmt in ('HI_RES_LOSSLESS', 'LOSSLESS'):
-            res = resolvers[fmt](track_id)
-            if res:
-                print(f"[+] Track {track_id} resolved as: {fmt}")
-                return res
+        if fmt not in resolvers:
+            continue
+        for tid in candidate_ids:
+            try:
+                res = resolvers[fmt](tid)
+                if res:
+                    if tid == track_id:
+                        print(f"[+] Track {track_id} resolved directly as: {fmt}")
+                    else:
+                        print(f"[RealMAX] Upgraded track {track_id} -> {tid} as: {fmt}")
+                    return res
+            except Exception as e:
+                pass
+
     raise RuntimeError(f"Could not resolve any audio stream for track {track_id}")
+
 
 
 active_login_flow = {
