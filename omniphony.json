@@ -4,6 +4,6 @@
   "author": "Pickymarker",
   "dependencies": {},
   "version": "2.1.19",
-  "main": "omniphony.mjs",
-  "hash": "B420D9816882B469C23AF1099EB97C5D686E376DCE3A0F2E870E7D53A66E4642"
+  "main": "omniphony.mjs?version=2.1.19&service=2.1.25",
+  "hash": "844785C31DAA1C6A56DB15B89A6E2FCA973BEAB087535D143C841AA44EDFB74B"
 }
