@@ -4,6 +4,6 @@
   "author": "Pickymarker",
   "dependencies": {},
   "version": "2.1.19",
-  "main": "omniphony-live-sync.mjs?build=20261106-syllable-log-r1-2.1.19-service-2.1.25",
+  "main": "omniphony.mjs",
   "hash": "B420D9816882B469C23AF1099EB97C5D686E376DCE3A0F2E870E7D53A66E4642"
 }
