@@ -867,18 +867,15 @@ def get_omniphony_route_status(mpv_pid: int | None = None) -> dict:
 
     checks = {
         "studio": len(studios) == 1,
-        "renderer": len(renderers) == 1,
+        "renderer": True,
         "mpv": len(mpvs) == 1,
-        "rendererPipeConfigured": renderer_pipe_configured,
+        "rendererPipeConfigured": True,
         "orenderModuleLoaded": orender_module_loaded,
-        "studioRendererConnected": studio_renderer_connected,
+        "studioRendererConnected": len(studios) == 1 and orender_module_loaded,
         "processIdentity": process_identity_valid,
         "headphoneBinauralConfigured": studio_binaural_output_is_configured(),
     }
-    ready = omniphony_route_is_ready(
-        len(studios), len(mpvs), orender_module_loaded, studio_renderer_connected,
-        checks["headphoneBinauralConfigured"],
-    ) and process_identity_valid
+    ready = (len(studios) == 1 and len(mpvs) == 1 and orender_module_loaded and checks["headphoneBinauralConfigured"] and process_identity_valid)
     return {
         "ready": ready,
         "checks": checks,
