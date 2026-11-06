@@ -276,6 +276,7 @@ function onLoad() {
 
   // UI and audio interception must not wait for the local service to respond.
   interceptMediaElements();
+  installLyricsClickListener();
   injectUI();
   startSyncLoop();
 }
@@ -2892,6 +2893,45 @@ function getNativeTimelinePosition(eventTarget) {
   if (!/progress|seek|timeline/i.test(label)) return null;
   const value = slider.value ?? slider.getAttribute?.("aria-valuenow");
   return parsePlaybackPosition(value);
+}
+
+// Native & Radiant Lyrics Click-to-Seek Listener
+function installLyricsClickListener() {
+  const onLyricsClick = (event) => {
+    // 1. Check for standard TIDAL lyrics line
+    const lineElement = event.target.closest('[class*="lyrics-line"], [class*="lyricsLine"], .rl-wbw-line, [data-test="lyrics-line"], [class*="_line_"]');
+    if (!lineElement) return;
+    
+    // Check if line carries timestamp in data attribute
+    let targetTime = null;
+    if (lineElement.dataset.time) targetTime = parseFloat(lineElement.dataset.time);
+    else if (lineElement.dataset.timestamp) targetTime = parseFloat(lineElement.dataset.timestamp);
+    else if (lineElement.dataset.startTime) targetTime = parseFloat(lineElement.dataset.startTime);
+    
+    // If not in dataset, check Radiant or TIDAL internal React props / fiber
+    if (targetTime === null || isNaN(targetTime)) {
+      for (const key in lineElement) {
+        if (key.startsWith('__reactFiber') || key.startsWith('__reactInternalInstance')) {
+          const fiber = lineElement[key];
+          const memoized = fiber?.memoizedProps;
+          const lineObj = memoized?.line || memoized?.item || memoized?.data;
+          if (lineObj && typeof lineObj.startTime === 'number') {
+            targetTime = lineObj.startTime;
+            break;
+          }
+        }
+      }
+    }
+    
+    if (targetTime !== null && !isNaN(targetTime) && targetTime >= 0) {
+      console.info(`[Omniphony EX] Lyrics line clicked -> seeking to ${targetTime}s`);
+      handleImmediateTidalSeek(targetTime, 'lyrics-click');
+      scheduleImmediateSync();
+    }
+  };
+  
+  document.addEventListener('click', onLyricsClick, true);
+  unloads.add(() => document.removeEventListener('click', onLyricsClick, true));
 }
 
 function installPlaybackObservers(onPlaybackChange, onSeek) {
