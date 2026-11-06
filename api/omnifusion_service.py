@@ -170,6 +170,11 @@ def public_track_status(metadata: dict, playback_state: str) -> dict:
 ALLOWED_BROWSER_ORIGINS = frozenset({
     "https://desktop.tidal.com",
     "https://listen.tidal.com",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8088",
+    "http://127.0.0.1:8088",
+    "null",
 })
 SETTINGS_LOCK = threading.RLock()
 
@@ -3530,16 +3535,21 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
     def end_headers(self):
         origin = self.headers.get("Origin")
-        if origin in ALLOWED_BROWSER_ORIGINS:
+        if origin and (origin in ALLOWED_BROWSER_ORIGINS or origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1") or origin.startswith("tidal:") or origin.startswith("file:")):
             self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
             self.send_header("Vary", "Origin")
+        elif origin is None:
+            self.send_header("Access-Control-Allow-Origin", "*")
         super().end_headers()
 
     def reject_untrusted_origin(self, require_origin=False):
         origin = self.headers.get("Origin")
-        if (origin is None and not require_origin) or origin in ALLOWED_BROWSER_ORIGINS:
+        if origin is None:
             return False
-        self.send_json({"error": "origin is not allowed"}, status=403)
+        if origin in ALLOWED_BROWSER_ORIGINS or origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1") or origin.startswith("tidal:") or origin.startswith("file:"):
+            return False
+        self.send_json({"error": f"origin {origin} is not allowed"}, status=403)
         return True
 
     def do_OPTIONS(self):

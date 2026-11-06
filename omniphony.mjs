@@ -5066,6 +5066,51 @@ function toggleSettingsPanel() {
   authStatus.innerText = "Ready to link TIDAL OAuth session.";
   panel.appendChild(authStatus);
 
+  // Engine & Studio Binary Paths Section
+  const pathsDivider = document.createElement("div");
+  pathsDivider.style.cssText = "height:1px;background:rgba(255,255,255,0.1);margin:14px 0 12px;";
+  panel.appendChild(pathsDivider);
+
+  const pathsHeader = document.createElement("label");
+  pathsHeader.innerText = "OmniFusion & Studio Directories:";
+  pathsHeader.style.fontWeight = "600";
+  pathsHeader.style.display = "block";
+  pathsHeader.style.marginBottom = "6px";
+  panel.appendChild(pathsHeader);
+
+  // MPV / Engine Folder Path
+  const mpvLabel = document.createElement("div");
+  mpvLabel.innerText = "MPV Engine Folder:";
+  mpvLabel.style.cssText = "color:#bbb;font-size:11px;margin-bottom:3px;";
+  panel.appendChild(mpvLabel);
+
+  const mpvInput = document.createElement("input");
+  mpvInput.id = "omniphony-mpv-path-input";
+  mpvInput.type = "text";
+  mpvInput.value = (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_mpv_path") : null) || "C:\\OmniFusion-Standalone\\mpv";
+  mpvInput.style.cssText = "width:100%;box-sizing:border-box;background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:6px 8px;margin-bottom:8px;font:inherit;font-size:11px;";
+  mpvInput.onchange = () => {
+    if (typeof localStorage !== "undefined") localStorage.setItem("omniphony_mpv_path", mpvInput.value.trim());
+  };
+  panel.appendChild(mpvInput);
+
+  // Omniphony Studio Path
+  const studioLabel = document.createElement("div");
+  studioLabel.innerText = "Omniphony Studio Executable / Folder:";
+  studioLabel.style.cssText = "color:#bbb;font-size:11px;margin-bottom:3px;";
+  panel.appendChild(studioLabel);
+
+  const studioInput = document.createElement("input");
+  studioInput.id = "omniphony-studio-path-input";
+  studioInput.type = "text";
+  studioInput.value = (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_studio_path") : null) || "C:\\OmniFusion-Standalone\\studio\\omniphony-studio-egui.exe";
+  studioInput.style.cssText = "width:100%;box-sizing:border-box;background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:6px 8px;margin-bottom:12px;font:inherit;font-size:11px;";
+  studioInput.onchange = () => {
+    if (typeof localStorage !== "undefined") localStorage.setItem("omniphony_studio_path", studioInput.value.trim());
+  };
+  panel.appendChild(studioInput);
+
+
   // External Eclipse Addon Providers
   const addonDivider = document.createElement("div");
   addonDivider.style.cssText = "height:1px;background:rgba(255,255,255,0.1);margin:14px 0 12px;";
