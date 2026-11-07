@@ -6056,6 +6056,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
+    allow_reuse_address = True
 
 
 def tidal_process_watchdog(engine):
@@ -6085,14 +6086,72 @@ def tidal_process_watchdog(engine):
         except Exception:
             pass
 
+_SINGLE_INSTANCE_MUTEX = None
+
+def ensure_single_instance() -> bool:
+    """Strictly enforce that only one OmniFusion service instance is active."""
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{PORT}/health",
+            headers={"User-Agent": "OmniFusion-SingleInstance-Probe"}
+        )
+        with urllib.request.urlopen(req, timeout=1.2) as resp:
+            if resp.status == 200:
+                print(f"[+] OmniFusion service is already active and healthy on port {PORT}. Exiting redundant process.")
+                return False
+    except Exception:
+        pass
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            CreateMutexW = kernel32.CreateMutexW
+            CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+            CreateMutexW.restype = wintypes.HANDLE
+            ERROR_ALREADY_EXISTS = 183
+
+            global _SINGLE_INSTANCE_MUTEX
+            _SINGLE_INSTANCE_MUTEX = CreateMutexW(None, True, "Local\\OmniFusion_Audio_Engine_Port8765_Mutex")
+            if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+                print("[*] Single-instance mutex already held by another process. Verifying health on port...")
+                for _ in range(4):
+                    try:
+                        req = urllib.request.Request(f"http://127.0.0.1:{PORT}/health", headers={"User-Agent": "OmniFusion-SingleInstance-Probe"})
+                        with urllib.request.urlopen(req, timeout=1.0) as resp:
+                            if resp.status == 200:
+                                print(f"[+] Active instance confirmed healthy on port {PORT}. Exiting cleanly.")
+                                return False
+                    except Exception:
+                        time.sleep(0.5)
+        except Exception as exc:
+            print(f"[-] Single-instance mutex check: {exc}")
+    return True
+
 def run():
+    if not ensure_single_instance():
+        sys.exit(0)
+
+    try:
+        server = ThreadedHTTPServer(("127.0.0.1", PORT), RequestHandler)
+    except OSError as exc:
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{PORT}/health")
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                if resp.status == 200:
+                    print(f"[+] Port {PORT} already bound and healthy. Exiting redundant instance.")
+                    sys.exit(0)
+        except Exception:
+            pass
+        print(f"[-] Fatal: could not bind port {PORT}: {exc}")
+        sys.exit(1)
+
+    print(f"[+] OmniFusion Standalone Audio Service listening on http://127.0.0.1:{PORT}")
     threading.Thread(target=tidal_process_watchdog, args=(engine,), daemon=True).start()
     settings = load_settings()
     save_settings(settings)
     threading.Thread(target=engine.ensure_mpv, kwargs={"device": settings.get("audio_device", "auto")}, daemon=True).start()
-
-    server = ThreadedHTTPServer(("127.0.0.1", PORT), RequestHandler)
-    print(f"[+] OmniFusion Standalone Audio Service listening on http://127.0.0.1:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

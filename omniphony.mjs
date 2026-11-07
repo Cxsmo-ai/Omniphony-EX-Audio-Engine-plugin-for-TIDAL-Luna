@@ -361,22 +361,28 @@ function localRequestFailureSummary(stage, error) {
   return `${stage}: ${name}`;
 }
 
-async function fetchConfig() {
-  try {
-    const res = await requestWithTimeout(`${API_BASE}/config`, { cache: "no-store" });
-    if (!res.ok) throw Object.assign(new Error("HTTP response"), { httpStatus: res.status });
-    const loaded = await res.json();
-    if (!Array.isArray(loaded.priority)
-        || loaded.priority.length !== supportedFormats.length
-        || !supportedFormats.every((format) => loaded.priority.includes(format))) {
-      throw Object.assign(new Error("Invalid settings"), { code: "INVALID_RESPONSE" });
+async function fetchConfig(retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await requestWithTimeout(`${API_BASE}/config`, { cache: "no-store" });
+      if (!res.ok) throw Object.assign(new Error("HTTP response"), { httpStatus: res.status });
+      const loaded = await res.json();
+      if (!Array.isArray(loaded.priority)
+          || loaded.priority.length !== supportedFormats.length
+          || !supportedFormats.every((format) => loaded.priority.includes(format))) {
+        throw Object.assign(new Error("Invalid settings"), { code: "INVALID_RESPONSE" });
+      }
+      lastSettingsFetchFailure = null;
+      return loaded;
+    } catch (error) {
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+        continue;
+      }
+      lastSettingsFetchFailure = localRequestFailureSummary("GET /config", error);
+      console.warn("[Omniphony EX] Could not load saved settings:", lastSettingsFetchFailure);
+      return null;
     }
-    lastSettingsFetchFailure = null;
-    return loaded;
-  } catch (error) {
-    lastSettingsFetchFailure = localRequestFailureSummary("GET /config", error);
-    console.warn("[Omniphony EX] Could not load saved settings:", lastSettingsFetchFailure);
-    return null;
   }
 }
 
@@ -476,23 +482,29 @@ function verifySettingsPanelControls(panel) {
   );
 }
 
-async function fetchDevices() {
-  try {
-    const res = await requestWithTimeout(`${API_BASE}/devices`, { cache: "no-store" });
-    if (!res.ok) throw Object.assign(new Error("HTTP response"), { httpStatus: res.status });
-    const data = await res.json();
-    if (!Array.isArray(data.devices)) {
-      throw Object.assign(new Error("Invalid device list"), { code: "INVALID_RESPONSE" });
+async function fetchDevices(retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await requestWithTimeout(`${API_BASE}/devices`, { cache: "no-store" });
+      if (!res.ok) throw Object.assign(new Error("HTTP response"), { httpStatus: res.status });
+      const data = await res.json();
+      if (!Array.isArray(data.devices)) {
+        throw Object.assign(new Error("Invalid device list"), { code: "INVALID_RESPONSE" });
+      }
+      availableDevices = data.devices;
+      lastDeviceFetchFailure = null;
+      const select = document.getElementById("omniphony-device-select");
+      if (select) populateDeviceSelector(select);
+      return true;
+    } catch (error) {
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+        continue;
+      }
+      lastDeviceFetchFailure = localRequestFailureSummary("GET /devices", error);
+      console.warn("[Omniphony EX] Could not load output devices:", lastDeviceFetchFailure);
+      return false;
     }
-    availableDevices = data.devices;
-    lastDeviceFetchFailure = null;
-    const select = document.getElementById("omniphony-device-select");
-    if (select) populateDeviceSelector(select);
-    return true;
-  } catch (error) {
-    lastDeviceFetchFailure = localRequestFailureSummary("GET /devices", error);
-    console.warn("[Omniphony EX] Could not load output devices:", lastDeviceFetchFailure);
-    return false;
   }
 }
 
