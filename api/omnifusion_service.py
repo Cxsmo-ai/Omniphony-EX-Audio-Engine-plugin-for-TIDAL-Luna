@@ -4171,6 +4171,282 @@ def resolve_with_priority(track_id: int, priority_list: list[str], title_hint: s
     raise RuntimeError(f"Could not resolve any audio stream for track {track_id}")
 
 
+
+DOWNLOAD_QUEUE_LOCK = threading.RLock()
+ACTIVE_DOWNLOADS = {}
+
+def pack_flac_metadata(comments: dict[str, str], picture_bytes: bytes = None, picture_mime: str = "image/jpeg") -> list[tuple[int, bytes]]:
+    blocks = []
+    import io, struct
+    b = io.BytesIO()
+    vendor = "Omniphony EX RealMAX".encode("utf-8")
+    b.write(struct.pack("<I", len(vendor)))
+    b.write(vendor)
+    b.write(struct.pack("<I", len(comments)))
+    for k, v in comments.items():
+        c_bytes = f"{k.upper()}={v}".encode("utf-8", errors="replace")
+        b.write(struct.pack("<I", len(c_bytes)))
+        b.write(c_bytes)
+    blocks.append((4, b.getvalue()))
+
+    if picture_bytes and len(picture_bytes) > 0:
+        pb = io.BytesIO()
+        pb.write(struct.pack(">I", 3)) # Cover Front
+        m_bytes = picture_mime.encode("ascii", errors="replace")
+        pb.write(struct.pack(">I", len(m_bytes)))
+        pb.write(m_bytes)
+        pb.write(struct.pack(">I", 0))
+        pb.write(struct.pack(">IIII", 1280, 1280, 24, 0))
+        pb.write(struct.pack(">I", len(picture_bytes)))
+        pb.write(picture_bytes)
+        blocks.append((6, pb.getvalue()))
+
+    return blocks
+
+def inject_flac_metadata(raw_flac_bytes: bytes, comments: dict[str, str], picture_bytes: bytes = None) -> bytes:
+    if len(raw_flac_bytes) < 4 or raw_flac_bytes[:4] != b"fLaC":
+        return raw_flac_bytes
+    import io, struct
+    f = io.BytesIO(raw_flac_bytes)
+    f.seek(4)
+    kept_blocks = []
+    while True:
+        h = f.read(4)
+        if len(h) < 4:
+            break
+        is_last = (h[0] & 0x80) != 0
+        b_type = h[0] & 0x7F
+        length = struct.unpack(">I", b"\x00" + h[1:4])[0]
+        data = f.read(length)
+        if b_type == 0:
+            kept_blocks.append((0, data))
+        if is_last:
+            break
+    audio_stream_data = f.read()
+    new_blocks = pack_flac_metadata(comments, picture_bytes=picture_bytes)
+    all_blocks = kept_blocks + new_blocks
+    out = io.BytesIO()
+    out.write(b"fLaC")
+    for i, (bt, bd) in enumerate(all_blocks):
+        last_flag = (0x80 if i == len(all_blocks) - 1 else 0x00)
+        out.write(bytes([last_flag | (bt & 0x7F)]) + struct.pack(">I", len(bd))[1:])
+        out.write(bd)
+    out.write(audio_stream_data)
+    return out.getvalue()
+
+def sanitize_filename_component(val: str) -> str:
+    s = re.sub(r'[\/:*?"<>|]+', '_', str(val or '')).strip()
+    return s or "Unknown"
+
+def execute_track_download(job_id: str, payload: dict) -> None:
+    track_id = payload.get("trackId")
+    title = payload.get("title") or "Unknown Title"
+    artist = payload.get("artist") or "Unknown Artist"
+    album = payload.get("album") or "Unknown Album"
+    year = payload.get("year") or ""
+    track_num = payload.get("trackNumber") or ""
+    isrc = payload.get("isrc") or ""
+    art_url = payload.get("albumArtUrl") or ""
+    dest_dir = Path(payload.get("destinationFolder") or str(STANDALONE_DIR / "downloads"))
+    ac4_fmt = (payload.get("ac4Format") or "flac").lower()
+    path_pattern = payload.get("pathPattern") or "{artist}/{album}/{title}"
+
+    with DOWNLOAD_QUEUE_LOCK:
+        ACTIVE_DOWNLOADS[job_id] = {
+            "jobId": job_id, "trackId": track_id, "title": title, "artist": artist,
+            "status": "resolving", "progress": 5, "error": None, "outputPath": None,
+        }
+
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        settings = load_settings()
+        priority = settings.get("priority", DEFAULT_SETTINGS["priority"])
+
+        with DOWNLOAD_QUEUE_LOCK:
+            ACTIVE_DOWNLOADS[job_id]["status"] = "resolving"
+            ACTIVE_DOWNLOADS[job_id]["progress"] = 15
+
+        stream_info = resolve_with_priority(int(track_id), priority, title_hint=title, artist_hint=artist)
+        if not stream_info or not stream_info.get("uri"):
+            raise RuntimeError("Could not resolve audio stream for track")
+
+        fmt = stream_info.get("format")
+        provider = stream_info.get("sourceProvider") or "TIDAL"
+        stream_uri = stream_info["uri"]
+        transport = stream_info.get("transport")
+
+        with DOWNLOAD_QUEUE_LOCK:
+            ACTIVE_DOWNLOADS[job_id]["status"] = "rendering" if fmt == "EAC3_JOC" else "downloading"
+            ACTIVE_DOWNLOADS[job_id]["format"] = fmt
+            ACTIVE_DOWNLOADS[job_id]["provider"] = provider
+            ACTIVE_DOWNLOADS[job_id]["progress"] = 30
+
+        sub_path = path_pattern
+        replacements = {
+            "{artist}": sanitize_filename_component(artist),
+            "{album}": sanitize_filename_component(album),
+            "{title}": sanitize_filename_component(title),
+            "{trackNumber}": str(track_num).zfill(2) if track_num else "01",
+            "{year}": str(year) if year else "",
+            "{isrc}": sanitize_filename_component(isrc),
+        }
+        for k, v in replacements.items():
+            sub_path = sub_path.replace(k, v)
+
+        ext = "wav" if (fmt == "AC4_IMS" and ac4_fmt == "wav") else "flac"
+        final_file_path = dest_dir / f"{sub_path}.{ext}"
+        final_file_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_dest = final_file_path.with_suffix(f".tmp_{uuid.uuid4().hex}.{ext}")
+
+        pic_bytes = None
+        if art_url:
+            try:
+                art_req = urllib.request.Request(art_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(art_req, timeout=8) as aresp:
+                    pic_bytes = aresp.read()
+            except Exception:
+                pass
+
+        lyrics_text = ""
+        lyrics_synced = ""
+        try:
+            sess = get_python_tidal_session()
+            if sess:
+                t_obj = sess.track(int(track_id))
+                if t_obj and hasattr(t_obj, "lyrics"):
+                    lyr = t_obj.lyrics()
+                    if lyr:
+                        lyrics_text = getattr(lyr, "text", "") or ""
+                        lyrics_synced = getattr(lyr, "subtitles", "") or ""
+        except Exception:
+            pass
+
+        if lyrics_synced:
+            try:
+                lrc_path = final_file_path.with_suffix(".lrc")
+                lrc_path.write_text(lyrics_synced, encoding="utf-8")
+            except Exception:
+                pass
+
+        comments = {
+            "TITLE": title,
+            "ARTIST": artist,
+            "ALBUM": album,
+            "DATE": str(year) if year else "",
+            "TRACKNUMBER": str(track_num) if track_num else "",
+            "ISRC": isrc,
+            "PROVIDER": provider,
+            "REALMAX_FORMAT": fmt,
+            "COMMENT": f"Omniphony EX RealMAX ({fmt}) via {provider}",
+        }
+        if lyrics_synced:
+            comments["LYRICS"] = lyrics_synced
+        elif lyrics_text:
+            comments["UNSYNCEDLYRICS"] = lyrics_text
+
+        if fmt == "EAC3_JOC":
+            comments["SPATIAL_BINAURAL"] = "Dolby Atmos E-AC-3 JOC 5.1 -> 48kHz 24-bit Binaural (Omniphony Studio SOFA HRIR)"
+            mpv_input = stream_uri
+            candidate_proxy = None
+            if transport == "DASH" and stream_info.get("manifestXml"):
+                candidate_proxy = TidalDashProxy(
+                    stream_info.get("manifestXml"),
+                    stream_info.get("segmentUrls"),
+                    stream_info.get("requestSession") or requests.Session(),
+                )
+                mpv_input = candidate_proxy.start()
+
+            cmd = [
+                str(MPV_EXE),
+                mpv_input,
+                "--vid=no",
+                "--vo=null",
+                "--ad=orender",
+                "--audio-channels=stereo",
+                f"-o={temp_dest}",
+                "--oac=flac",
+                "--ytdl=no"
+            ]
+            try:
+                res = subprocess.run(cmd, capture_output=True, timeout=300)
+                if res.returncode != 0:
+                    raise RuntimeError("mpv binaural FLAC render failed")
+            finally:
+                if candidate_proxy:
+                    candidate_proxy.close()
+
+            flac_bytes = temp_dest.read_bytes()
+            tagged_flac = inject_flac_metadata(flac_bytes, comments, picture_bytes=pic_bytes)
+            temp_dest.write_bytes(tagged_flac)
+
+        elif fmt == "AC4_IMS":
+            comments["SPATIAL_BINAURAL"] = "Dolby AC-4 IMS -> 48kHz Binaural (OxideAV)"
+            dl_resp = requests.get(stream_uri, timeout=45)
+            dl_resp.raise_for_status()
+            ac4_bytes = dl_resp.content
+            temp_ac4 = CACHE_DIR / f".dl_{track_id}_{uuid.uuid4().hex}.mp4"
+            temp_wav = CACHE_DIR / f".dl_{track_id}_{uuid.uuid4().hex}.wav"
+            try:
+                temp_ac4.write_bytes(ac4_bytes)
+                conv_res = subprocess.run([str(AC4_CONVERTER), str(temp_ac4), str(temp_wav)], capture_output=True, timeout=120)
+                if conv_res.returncode != 0 or not temp_wav.is_file():
+                    raise RuntimeError("OxideAV AC-4 decode failed")
+
+                if ac4_fmt == "wav":
+                    shutil.move(temp_wav, temp_dest)
+                else:
+                    cmd = [str(MPV_EXE), str(temp_wav), "--vid=no", "--vo=null", f"-o={temp_dest}", "--oac=flac", "--ytdl=no"]
+                    c_res = subprocess.run(cmd, capture_output=True, timeout=120)
+                    if c_res.returncode != 0:
+                        raise RuntimeError("Failed to encode AC-4 WAV to FLAC")
+                    flac_bytes = temp_dest.read_bytes()
+                    tagged_flac = inject_flac_metadata(flac_bytes, comments, picture_bytes=pic_bytes)
+                    temp_dest.write_bytes(tagged_flac)
+            finally:
+                temp_ac4.unlink(missing_ok=True)
+                temp_wav.unlink(missing_ok=True)
+
+        else:
+            comments["AUDIO_QUALITY"] = fmt
+            if transport == "DIRECT":
+                r_dl = requests.get(stream_uri, timeout=60)
+                r_dl.raise_for_status()
+                flac_bytes = r_dl.content
+            else:
+                candidate_proxy = TidalDashProxy(
+                    stream_info.get("manifestXml"),
+                    stream_info.get("segmentUrls"),
+                    stream_info.get("requestSession") or requests.Session(),
+                )
+                try:
+                    mpv_input = candidate_proxy.start()
+                    cmd = [str(MPV_EXE), mpv_input, "--vid=no", "--vo=null", f"-o={temp_dest}", "--oac=flac", "--ytdl=no"]
+                    res = subprocess.run(cmd, capture_output=True, timeout=300)
+                    if res.returncode != 0:
+                        raise RuntimeError("DASH FLAC assembly failed")
+                    flac_bytes = temp_dest.read_bytes()
+                finally:
+                    candidate_proxy.close()
+
+            tagged_flac = inject_flac_metadata(flac_bytes, comments, picture_bytes=pic_bytes)
+            temp_dest.write_bytes(tagged_flac)
+
+        if final_file_path.exists():
+            final_file_path.unlink()
+        os.replace(temp_dest, final_file_path)
+
+        with DOWNLOAD_QUEUE_LOCK:
+            ACTIVE_DOWNLOADS[job_id]["status"] = "completed"
+            ACTIVE_DOWNLOADS[job_id]["progress"] = 100
+            ACTIVE_DOWNLOADS[job_id]["outputPath"] = str(final_file_path)
+
+    except Exception as exc:
+        print(f"[-] Download error for {title}: {exc}")
+        with DOWNLOAD_QUEUE_LOCK:
+            ACTIVE_DOWNLOADS[job_id]["status"] = "failed"
+            ACTIVE_DOWNLOADS[job_id]["error"] = str(exc)
+
+
 active_login_flow = {
     "flowId": None,
     "deviceCode": None,
@@ -4460,6 +4736,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"error": clock_error}, status=clock_error_status)
                 return
             self.send_json(clock_response)
+
+        elif parsed.path == "/download/status":
+            with DOWNLOAD_QUEUE_LOCK:
+                self.send_json({"jobs": list(ACTIVE_DOWNLOADS.values())})
 
         elif parsed.path == "/status":
             position_sample_started_unix_ms = time.time_ns() / 1_000_000
@@ -5510,6 +5790,24 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             if acknowledgement_error is not None:
                 return self.send_json(acknowledgement_error, status=acknowledgement_status)
             self.send_json(response_body)
+
+        elif parsed.path == "/download":
+            track_id = body.get("trackId")
+            if not track_id:
+                return self.send_json({"error": "missing trackId"}, status=400)
+            job_id = uuid.uuid4().hex
+            threading.Thread(target=execute_track_download, args=(job_id, body), daemon=True).start()
+            self.send_json({"status": "queued", "jobId": job_id})
+
+        elif parsed.path == "/download/status":
+            job_id = body.get("jobId")
+            with DOWNLOAD_QUEUE_LOCK:
+                if job_id:
+                    info = ACTIVE_DOWNLOADS.get(job_id)
+                    if not info:
+                        return self.send_json({"error": "job not found"}, status=404)
+                    return self.send_json(info)
+                return self.send_json({"jobs": list(ACTIVE_DOWNLOADS.values())})
 
         elif parsed.path == "/volume":
             vol = body.get("volume")

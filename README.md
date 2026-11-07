@@ -21,6 +21,11 @@
 - **True Bit-Accurate & Spatial Playback:** Routes audio through headless **`libmpv`**, **OxideAV** (`AC-4 IMS` binaural stereo decoder), and in-process **`orender.dll`** connected to **Omniphony Studio** (`E-AC-3 JOC` 3D object spatializer with SOFA HRIR binaural headphone rendering).
 - **Deep Web Audio Detachment (No OS Muting):** Detaches TIDAL's internal Chromium media output cleanly without muting your Windows mixer or breaking TIDAL's internal player state.
 - **Sub-Millisecond UI & Lyrics Sync:** Polls `libmpv` IPC at 50 ms cadence and reconciles TIDAL Redux / Radiant player clocks every 100 ms—keeping word-by-word synced lyrics, click-to-seek lyrics, waveform scrubbing, and seamless queue auto-advance 1:1 with the audio engine.
+- **RealMAX Native Song, Album & Playlist Downloader:** Directly integrated into TIDAL's native right-click context menu and settings surfaces.
+  - **Dolby Atmos E-AC-3 JOC:** Rendered into bit-perfect 24-bit/48 kHz Binaural FLAC through `libmpv` (`--ad=orender`) using your active Omniphony Studio SOFA profile and headphone calibration.
+  - **Dolby AC-4 IMS:** Decoded via OxideAV and exported as bit-perfect WAV or compressed 24-bit/48 kHz FLAC.
+  - **Full Metadata & Artwork Tagging:** Automatically injects Vorbis comments (`TITLE`, `ARTIST`, `ALBUM`, `DATE`, `TRACKNUMBER`, `ISRC`, `SPATIAL_BINAURAL`, `LYRICS`), embeds high-resolution front cover artwork (type 3), and writes synchronized `.lrc` sidecar lyrics files.
+  - **Customizable Folder & Path Templates:** Supports `{artist}/{album}/{trackNumber} - {title}` and native Windows folder picker (`showOpenDialog`).
 - **RealMAX Multi-Source Resolution:** Dynamically evaluates all 24 user-selectable format priority orders across **TIDAL** (`EbbLabs/python-tidal`), user-supplied **Amazon Music Eclipse** addons, and an automatic **Tido Eclipse** fallback when the main TIDAL API is not yet linked.
 
 ---

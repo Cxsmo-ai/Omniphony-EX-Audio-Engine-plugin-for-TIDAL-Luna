@@ -5138,6 +5138,98 @@ function toggleSettingsPanel() {
   panel.appendChild(authStatus);
 
   // Engine & Studio Binary Paths Section
+  
+  // Omniphony EX RealMAX Downloader Section
+  const dlDivider = document.createElement("div");
+  dlDivider.style.cssText = "height:1px;background:rgba(255,255,255,0.1);margin:14px 0 12px;";
+  panel.appendChild(dlDivider);
+
+  const dlHeader = document.createElement("label");
+  dlHeader.innerText = "RealMAX Downloader (Tracks & Albums):";
+  dlHeader.style.fontWeight = "600";
+  dlHeader.style.display = "block";
+  dlHeader.style.marginBottom = "6px";
+  panel.appendChild(dlHeader);
+
+  const dlFolderLabel = document.createElement("div");
+  dlFolderLabel.innerText = "Download Save Folder:";
+  dlFolderLabel.style.cssText = "color:#bbb;font-size:11px;margin-bottom:3px;";
+  panel.appendChild(dlFolderLabel);
+
+  const dlFolderInput = document.createElement("input");
+  dlFolderInput.id = "omniphony-dl-folder-input";
+  dlFolderInput.type = "text";
+  dlFolderInput.value = (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_folder") : null) || "C:\OmniFusion-Standalone\downloads";
+  dlFolderInput.style.cssText = "width:100%;box-sizing:border-box;background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:6px 8px;margin-bottom:6px;font:inherit;font-size:11px;";
+  dlFolderInput.onchange = () => {
+    if (typeof localStorage !== "undefined") localStorage.setItem("omniphony_download_folder", dlFolderInput.value.trim());
+  };
+  panel.appendChild(dlFolderInput);
+
+  const browseFolderBtn = document.createElement("button");
+  browseFolderBtn.type = "button";
+  browseFolderBtn.innerText = "📁 Select Download Directory...";
+  browseFolderBtn.style.cssText = "width:100%;background:#20242b;color:#fff;border:1px solid #46515d;border-radius:6px;padding:6px 8px;cursor:pointer;font:inherit;font-size:11px;margin-bottom:10px;";
+  browseFolderBtn.onclick = async () => {
+    const chosen = await selectDownloadFolderNative();
+    if (chosen) {
+      dlFolderInput.value = chosen;
+      if (typeof localStorage !== "undefined") localStorage.setItem("omniphony_download_folder", chosen);
+    }
+  };
+  panel.appendChild(browseFolderBtn);
+
+  const ac4FmtLabel = document.createElement("div");
+  ac4FmtLabel.innerText = "AC-4 IMS Download Format:";
+  ac4FmtLabel.style.cssText = "color:#bbb;font-size:11px;margin-bottom:3px;";
+  panel.appendChild(ac4FmtLabel);
+
+  const ac4FmtSelect = document.createElement("select");
+  ac4FmtSelect.style.cssText = "width:100%;background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:6px 8px;margin-bottom:10px;font:inherit;font-size:11px;";
+  [
+    { value: "flac", label: "FLAC (Binaural 24-bit/48kHz - Compact & Tagged)" },
+    { value: "wav", label: "WAV (Binaural 24-bit/48kHz - Bit-Perfect Uncompressed)" },
+  ].forEach((opt) => {
+    const el = document.createElement("option");
+    el.value = opt.value;
+    el.innerText = opt.label;
+    if (((typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_ac4_format") : null) || "flac") === opt.value) el.selected = true;
+    ac4FmtSelect.appendChild(el);
+  });
+  ac4FmtSelect.onchange = () => {
+    if (typeof localStorage !== "undefined") localStorage.setItem("omniphony_download_ac4_format", ac4FmtSelect.value);
+  };
+  panel.appendChild(ac4FmtSelect);
+
+  const dlNowBtn = document.createElement("button");
+  dlNowBtn.type = "button";
+  dlNowBtn.innerText = "⬇ Download Current Playing Track (RealMAX)";
+  dlNowBtn.style.cssText = "width:100%;background:#00d2c4;color:#000;font-weight:700;border:none;border-radius:6px;padding:8px 10px;cursor:pointer;font:inherit;font-size:12px;margin-bottom:6px;";
+  dlNowBtn.onclick = async () => {
+    const meta = currentPlaybackMeta;
+    if (!meta || !meta.trackId) {
+      alert("No active track is loaded or playing.");
+      return;
+    }
+    dlNowBtn.disabled = true;
+    dlNowBtn.innerText = "Queueing Download...";
+    try {
+      const q = await queueTrackDownload({
+        id: meta.trackId,
+        title: meta.title,
+        artist: meta.artist,
+        album: meta.album,
+      });
+      alert(`Download queued! Job ID: ${q.jobId}`);
+    } catch (e) {
+      alert("Download error: " + e.message);
+    } finally {
+      dlNowBtn.disabled = false;
+      dlNowBtn.innerText = "⬇ Download Current Playing Track (RealMAX)";
+    }
+  };
+  panel.appendChild(dlNowBtn);
+
   const pathsDivider = document.createElement("div");
   pathsDivider.style.cssText = "height:1px;background:rgba(255,255,255,0.1);margin:14px 0 12px;";
   panel.appendChild(pathsDivider);
@@ -5360,6 +5452,155 @@ function toggleSettingsPanel() {
   };
 }
 
+
+// ==============================================================================
+// Omniphony EX RealMAX Native Song & Album Downloader
+// ==============================================================================
+
+const downloadState = { active: false, cancel: false };
+let downloadButtonRef = null;
+
+function getDownloadSettings() {
+  return {
+    destinationFolder: (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_folder") : null) || "C:\OmniFusion-Standalone\downloads",
+    pathPattern: (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_pattern") : null) || "{artist}/{album}/{trackNumber} - {title}",
+    ac4Format: (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_ac4_format") : null) || "flac",
+  };
+}
+
+async function selectDownloadFolderNative() {
+  try {
+    const showOpenDialog = window.luna?.native?.showOpenDialog || window.luna?.lib?.showOpenDialog;
+    if (showOpenDialog) {
+      const res = await showOpenDialog({ properties: ["openDirectory", "createDirectory"] });
+      if (!res?.canceled && res?.filePaths?.[0]) {
+        return res.filePaths[0];
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function queueTrackDownload(trackMeta) {
+  const cfg = getDownloadSettings();
+  const payload = {
+    trackId: trackMeta.id || trackMeta.trackId,
+    title: trackMeta.title || trackMeta.name || "Unknown Title",
+    artist: trackMeta.artist || trackMeta.artistName || (typeof trackMeta.artist === "object" ? trackMeta.artist?.name : "Unknown Artist"),
+    album: trackMeta.album || trackMeta.albumTitle || (typeof trackMeta.album === "object" ? trackMeta.album?.title || trackMeta.album?.name : "Unknown Album"),
+    year: trackMeta.year || (trackMeta.releaseDate ? String(trackMeta.releaseDate).slice(0, 4) : ""),
+    trackNumber: trackMeta.trackNumber || trackMeta.track_number || "",
+    isrc: trackMeta.isrc || "",
+    albumArtUrl: trackMeta.artworkURL || trackMeta.cover || (trackMeta.album?.cover ? `https://resources.tidal.com/images/${trackMeta.album.cover.replace(/-/g, "/")}/640x640.jpg` : ""),
+    destinationFolder: cfg.destinationFolder,
+    ac4Format: cfg.ac4Format,
+    pathPattern: cfg.pathPattern,
+  };
+
+  const res = await requestWithTimeout(`${API_BASE}/download`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }, 10000);
+
+  if (!res.ok) {
+    throw new Error(`Download queue failed: ${res.status}`);
+  }
+  return await res.json();
+}
+
+function installNativeDownloadContextMenu() {
+  try {
+    const ContextMenu = window.luna?.lib?.ContextMenu;
+    if (!ContextMenu || typeof ContextMenu.onMediaItem !== "function") {
+      return;
+    }
+    const btn = ContextMenu.addButton(unloads);
+    downloadButtonRef = btn;
+
+    ContextMenu.onMediaItem(unloads, async ({ mediaCollection, contextMenu }) => {
+      let count = 0;
+      try {
+        count = await mediaCollection.count();
+      } catch (_) {
+        count = 1;
+      }
+      if (count === 0) return;
+
+      const defaultText = (btn.text = count > 1 ? `Download ${count} tracks (RealMAX)` : `Download Track (RealMAX)`);
+
+      btn.onClick(async () => {
+        if (!btn.elem) return;
+        if (downloadState.active) {
+          downloadState.cancel = true;
+          btn.text = "Stopping...";
+          return;
+        }
+
+        downloadState.active = true;
+        downloadState.cancel = false;
+        try {
+          let items = [];
+          if (typeof mediaCollection.mediaItems === "function") {
+            for await (const m of await mediaCollection.mediaItems()) {
+              items.push(m);
+            }
+          }
+          if (items.length === 0 && typeof mediaCollection.all === "function") {
+            items = await mediaCollection.all();
+          }
+
+          let doneCount = 0;
+          for (const item of items) {
+            if (downloadState.cancel) break;
+            btn.text = `Queueing ${++doneCount}/${items.length}...`;
+            try {
+              let tMeta = item;
+              if (typeof item.flacTags === "function") {
+                const { tags } = await item.flacTags();
+                tMeta = { ...item, ...tags };
+              }
+              const qRes = await queueTrackDownload(tMeta);
+              const jobId = qRes?.jobId;
+              if (jobId) {
+                // Poll progress briefly
+                let finished = false;
+                for (let poll = 0; poll < 60; poll++) {
+                  await new Promise((r) => setTimeout(r, 800));
+                  const pollRes = await requestWithTimeout(`${API_BASE}/download/status`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ jobId })
+                  }, 4000);
+                  if (pollRes.ok) {
+                    const st = await pollRes.json();
+                    btn.text = `${st.status === "rendering" ? "Rendering Binaural" : "Downloading"} ${st.progress || 0}%`;
+                    if (st.status === "completed" || st.status === "failed") {
+                      finished = true;
+                      break;
+                    }
+                  }
+                }
+              }
+            } catch (err) {
+              console.warn("[Omniphony EX Downloader] Track error:", err);
+            }
+          }
+        } finally {
+          downloadState.active = false;
+          downloadState.cancel = false;
+          btn.text = defaultText;
+        }
+      });
+
+      await btn.show(contextMenu);
+    });
+  } catch (err) {
+    console.warn("[Omniphony EX Downloader] ContextMenu setup error:", err);
+  }
+}
+
+
 function updatePausedSelectionUi(message = null) {
   const button = document.getElementById("omniphony-prepare-paused");
   const status = document.getElementById("omniphony-prepare-paused-status");
@@ -5397,6 +5638,7 @@ function updatePausedSelectionUi(message = null) {
 
 // Run only after every module-level observer and state object has initialized.
 onLoad();
+installNativeDownloadContextMenu();
 
 
 // Native TidaLuna Settings Modal Component
@@ -5417,6 +5659,9 @@ export const Settings = () => {
   const [studioPath, setStudioPath] = React.useState(localStorage.getItem("omniphony_studio_path") || "C:\\OmniFusion-Standalone\\studio\\omniphony-studio-egui.exe");
   const [addonUrl, setAddonUrl] = React.useState("");
   const [authStatus, setAuthStatus] = React.useState("Ready");
+  const [dlFolder, setDlFolder] = React.useState(localStorage.getItem("omniphony_download_folder") || "C:\\OmniFusion-Standalone\\downloads");
+  const [ac4Format, setAc4Format] = React.useState(localStorage.getItem("omniphony_download_ac4_format") || "flac");
+  const [dlPattern, setDlPattern] = React.useState(localStorage.getItem("omniphony_download_pattern") || "{artist}/{album}/{trackNumber} - {title}");
   
   return React.createElement(
     LunaSettings,
@@ -5509,6 +5754,53 @@ export const Settings = () => {
         }
       }
     }, "Save Eclipse Manifest"),
+    
+    React.createElement(LunaTextSetting, {
+      title: "RealMAX Download Folder",
+      desc: "Directory where downloaded tracks, albums, and lyrics are saved.",
+      value: dlFolder,
+      onChange: (e) => {
+        const val = e.target.value;
+        setDlFolder(val);
+        localStorage.setItem("omniphony_download_folder", val);
+      }
+    }),
+    React.createElement(LunaButtonSetting, {
+      title: "Select Download Directory",
+      desc: `Current folder: ${dlFolder}`,
+      onClick: async () => {
+        const chosen = await selectDownloadFolderNative();
+        if (chosen) {
+          setDlFolder(chosen);
+          localStorage.setItem("omniphony_download_folder", chosen);
+        }
+      }
+    }, "Browse Folder..."),
+    React.createElement(
+      LunaSelectSetting,
+      {
+        title: "AC-4 IMS Download Format",
+        desc: "Choose between 24-bit/48kHz Binaural FLAC (tagged & compact) or Bit-Perfect WAV.",
+        value: ac4Format,
+        onChange: (e) => {
+          const val = e.target.value;
+          setAc4Format(val);
+          localStorage.setItem("omniphony_download_ac4_format", val);
+        }
+      },
+      React.createElement(LunaSelectItem, { value: "flac" }, "FLAC (Binaural 24-bit/48kHz - Tagged)"),
+      React.createElement(LunaSelectItem, { value: "wav" }, "WAV (Binaural 24-bit/48kHz - Uncompressed)")
+    ),
+    React.createElement(LunaTextSetting, {
+      title: "Download Filename & Folder Template",
+      desc: "Supports {artist}, {album}, {title}, {trackNumber}, {year}, and {isrc}.",
+      value: dlPattern,
+      onChange: (e) => {
+        const val = e.target.value;
+        setDlPattern(val);
+        localStorage.setItem("omniphony_download_pattern", val);
+      }
+    }),
     React.createElement(LunaButtonSetting, {
       title: "TIDAL OAuth Account Authorization",
       desc: authStatus,
