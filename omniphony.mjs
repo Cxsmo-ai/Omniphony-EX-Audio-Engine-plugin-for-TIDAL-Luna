@@ -5802,29 +5802,41 @@ let nativeSearchDebounce = null;
 function installNativeSearchInterceptor() {
   const amazonLogoSvg = `<svg style='width:11px;height:11px;fill:currentColor;flex-shrink:0;' viewBox='0 0 24 24'><path d='M.045 18.02c.072-.116.187-.124.348-.022 3.636 2.11 7.594 3.166 11.87 3.166 2.852 0 5.668-.533 8.447-1.595l.315-.14c.138-.06.234-.1.293-.13.226-.088.39-.046.525.13.12.174.09.336-.12.48-.256.19-.6.41-1.006.654-1.244.743-2.64 1.316-4.185 1.726a17.617 17.617 0 01-10.951-.577 17.88 17.88 0 01-5.43-3.35c-.1-.074-.151-.15-.151-.22 0-.047.021-.09.051-.13zm6.565-6.218c0-1.005.247-1.863.743-2.577.495-.71 1.17-1.25 2.04-1.615.796-.335 1.756-.575 2.912-.72.39-.046 1.033-.103 1.92-.174v-.37c0-.93-.105-1.558-.3-1.875-.302-.43-.78-.65-1.44-.65h-.182c-.48.046-.896.196-1.246.46-.35.27-.575.63-.675 1.096-.06.3-.206.465-.435.51l-2.52-.315c-.248-.06-.372-.18-.372-.39 0-.046.007-.09.022-.15.247-1.29.855-2.25 1.82-2.88.976-.616 2.1-.975 3.39-1.05h.54c1.65 0 2.957.434 3.888 1.29.135.15.27.3.405.48.12.165.224.314.283.45.075.134.15.33.195.57.06.254.105.42.135.51.03.104.062.3.076.615.01.313.02.493.02.553v5.28c0 .376.06.72.165 1.036.105.313.21.54.315.674l.51.674c.09.136.136.256.136.36 0 .12-.06.226-.18.314-1.2 1.05-1.86 1.62-1.963 1.71-.165.135-.375.15-.63.045a6.062 6.062 0 01-.526-.496l-.31-.347a9.391 9.391 0 01-.317-.42l-.3-.435c-.81.886-1.603 1.44-2.4 1.665-.494.15-1.093.227-1.83.227-1.11 0-2.04-.343-2.76-1.034-.72-.69-1.08-1.665-1.08-2.94l-.05-.076zm3.753-.438c0 .566.14 1.02.425 1.364.285.34.675.512 1.155.512.045 0 .106-.007.195-.02.09-.016.134-.023.166-.023.614-.16 1.08-.553 1.424-1.178.165-.28.285-.58.36-.91.09-.32.12-.59.135-.8.015-.195.015-.54.015-1.005v-.54c-.84 0-1.484.06-1.92.18-1.275.36-1.92 1.17-1.92 2.43l-.035-.02zm9.162 7.027c.03-.06.075-.11.132-.17.362-.243.714-.41 1.05-.5a8.094 8.094 0 011.612-.24c.14-.012.28 0 .41.03.65.06 1.05.168 1.172.33.063.09.099.228.099.39v.15c0 .51-.149 1.11-.424 1.8-.278.69-.664 1.248-1.156 1.68-.073.06-.14.09-.197.09-.03 0-.06 0-.09-.012-.09-.044-.107-.12-.064-.24.54-1.26.806-2.143.806-2.64 0-.15-.03-.27-.087-.344-.145-.166-.55-.257-1.224-.257-.243 0-.533.016-.87.046-.363.045-.7.09-1 .135-.09 0-.148-.014-.18-.044-.03-.03-.036-.047-.02-.077 0-.017.006-.03.02-.063v-.06z'/></svg>`;
 
-  function badgeExistingTidalResults() {
+  function badgeExistingTidalResults(upgrades = []) {
     try {
-      const links = document.querySelectorAll('a[href*="/track/"], a[href*="/album/"], a[href*="/video/"], [data-test="track-title"]');
-      links.forEach((link) => {
-        const text = (link.textContent || '').trim();
-        if (!text || text.length < 3) return;
-        const isAmazon = /amazon/i.test(text);
-        if (!isAmazon) return;
-        const parent = link.parentElement;
+      const candidates = Array.from(document.querySelectorAll('a, span, div')).filter((el) => {
+        if (el.children.length > 1) return false;
+        const text = (el.textContent || '').trim();
+        return text.length >= 3 && !el.closest('.omniphony-amz-badge') && !el.classList.contains('omniphony-amz-badge');
+      });
+
+      candidates.forEach((el) => {
+        const text = (el.textContent || '').trim();
+        const isAmazonText = /amazon/i.test(text);
+        const matchingUpgrade = upgrades.find((u) => u.title && text.toLowerCase().includes(u.title.toLowerCase()));
+
+        if (!isAmazonText && !matchingUpgrade) return;
+        const parent = el.parentElement;
         if (!parent || parent.querySelector('.omniphony-amz-badge')) return;
-        const badge = document.createElement('span');
-        badge.className = 'omniphony-amz-badge';
-        badge.style.cssText = 'display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:6px;vertical-align:middle;line-height:1;gap:3px;';
-        badge.innerHTML = `${amazonLogoSvg}<span>AMAZON MUSIC</span>`;
-        link.parentNode.insertBefore(badge, link);
+        const targetEl = el.tagName === 'A' ? el : (el.closest('a') || el);
+        if (targetEl.parentElement && !targetEl.parentElement.querySelector('.omniphony-amz-badge')) {
+          const badge = document.createElement('span');
+          badge.className = 'omniphony-amz-badge';
+          if (matchingUpgrade && matchingUpgrade.isAtmos) {
+            badge.style.cssText = 'display:inline-flex;align-items:center;background:rgba(255,153,0,0.18);border:1px solid #ff9900;color:#ff9900;font-weight:700;font-size:9px;padding:1px 5px;border-radius:3px;margin-right:6px;vertical-align:middle;line-height:1;gap:3px;flex-shrink:0;';
+            badge.innerHTML = `${amazonLogoSvg}<span>AMZ ATMOS 5.1</span>`;
+          } else {
+            badge.style.cssText = 'display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:6px;vertical-align:middle;line-height:1;gap:3px;flex-shrink:0;';
+            badge.innerHTML = `${amazonLogoSvg}<span>AMAZON MUSIC</span>`;
+          }
+          targetEl.parentNode.insertBefore(badge, targetEl);
+        }
       });
     } catch (_) {}
   }
 
   async function checkAndInjectNativeSearch() {
     try {
-      badgeExistingTidalResults();
-
       const searchInput = document.querySelector('input[type="search"], input[data-test="search-input"], input[placeholder*="Search"], header input');
       let query = (searchInput && searchInput.value ? searchInput.value : '').trim();
       if (!query && window.location.href.includes('q=')) {
@@ -5837,6 +5849,25 @@ function installNativeSearchInterceptor() {
       if (!query || query.length < 2) {
         const existing = document.getElementById('omniphony-native-amazon-search');
         if (existing) existing.remove();
+        badgeExistingTidalResults();
+        return;
+      }
+
+      const res = await fetch(`${API_BASE}/search/multi?q=${encodeURIComponent(query)}&limit=15`).catch(() => null);
+      if (!res || !res.ok) {
+        badgeExistingTidalResults();
+        return;
+      }
+      const data = await res.json();
+      const allTracks = data?.tracks || [];
+      const amazonTracks = allTracks.filter((t) => t.source === 'AMAZON' || t.exclusive || (t.upgrade && t.upgrade.provider === 'AMAZON'));
+
+      // Badge matching tracks on TIDAL list based on actual Eclipse Addon data (Atmos / Amazon)
+      badgeExistingTidalResults(amazonTracks);
+
+      if (!amazonTracks.length) {
+        const existing = document.getElementById('omniphony-native-amazon-search');
+        if (existing) existing.remove();
         return;
       }
 
@@ -5845,31 +5876,15 @@ function installNativeSearchInterceptor() {
       }
       lastNativeSearchQuery = query;
 
-      const res = await fetch(`${API_BASE}/search/multi?q=${encodeURIComponent(query)}&limit=15`).catch(() => null);
-      if (!res || !res.ok) return;
-      const data = await res.json();
-      const amazonTracks = (data?.tracks || []).filter((t) => t.source === 'AMAZON' || t.exclusive || (t.upgrade && t.upgrade.provider === 'AMAZON'));
-
-      if (!amazonTracks.length) {
-        const existing = document.getElementById('omniphony-native-amazon-search');
-        if (existing) existing.remove();
-        return;
-      }
-
-      const topLink = Array.from(document.querySelectorAll('a')).find((a) => (a.textContent || '').trim() === 'Top results' || (a.textContent || '').trim() === 'Tracks');
-      const tabBar = topLink ? topLink.closest('div, nav, [role="tablist"]') : null;
-      const main = document.querySelector('main, div[data-test="main-content"], [role="main"]') || document.body;
+      const main = document.querySelector('main, div[data-test="main-content"], [role="main"]');
+      if (!main) return;
 
       let section = document.getElementById('omniphony-native-amazon-search');
       if (!section) {
         section = document.createElement('div');
         section.id = 'omniphony-native-amazon-search';
-        section.style.cssText = 'margin:14px 0 16px;padding:14px;background:#181818;border:1px solid rgba(255,153,0,0.45);border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.6);font-family:inherit;position:relative;z-index:5;';
-        if (tabBar && tabBar.parentElement) {
-          tabBar.parentElement.insertBefore(section, tabBar.nextSibling);
-        } else {
-          main.prepend(section);
-        }
+        section.style.cssText = 'margin:14px 20px 18px;padding:14px 16px;background:#181818;border:2px solid #ff9900;border-radius:10px;box-shadow:0 6px 30px rgba(0,0,0,0.7);font-family:inherit;position:relative;z-index:5;box-sizing:border-box;';
+        main.prepend(section);
       }
 
       let rowsHtml = '';
@@ -5879,7 +5894,7 @@ function installNativeSearchInterceptor() {
         const hiResPill = (t.quality && t.quality.toLowerCase().includes('192')) || (t.quality && t.quality.toLowerCase().includes('hi-res')) ? `<span style='display:inline-flex;align-items:center;background:#00ff88;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;'>192kHz HI-RES</span>` : '';
         const exclusivePill = t.exclusive ? `<span style='display:inline-flex;align-items:center;background:#7928ca;color:#fff;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;'>EXCLUSIVE</span>` : '';
         const sourceBadge = `<span style='display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;gap:3px;'>${amazonLogoSvg}<span>AMAZON MUSIC</span></span>`;
-        const coverImg = t.cover ? `<img src='${t.cover}' style='width:36px;height:36px;border-radius:4px;object-fit:cover;flex-shrink:0;' onerror="this.style.display='none'" alt=''/>` : '';
+        const coverImg = t.cover ? `<img src='${t.cover}' style='width:38px;height:38px;border-radius:4px;object-fit:cover;flex-shrink:0;' onerror="this.style.display='none'" alt=''/>` : '';
         const mins = Math.floor((t.duration || 0) / 60);
         const secs = String(Math.floor((t.duration || 0) % 60)).padStart(2, '0');
         const durText = t.duration ? `${mins}:${secs}` : '';
@@ -5888,21 +5903,21 @@ function installNativeSearchInterceptor() {
         const safeAlbum = (t.album || '').replace(/'/g, '&#39;');
 
         rowsHtml += `
-          <div class='omniphony-amz-row' data-track-id='${t.id}' style='display:flex;align-items:center;justify-content:space-between;padding:7px 10px;border-radius:6px;margin-bottom:3px;background:rgba(255,255,255,0.03);gap:10px;'>
+          <div class='omniphony-amz-row' data-track-id='${t.id}' style='display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-radius:6px;margin-bottom:4px;background:rgba(255,255,255,0.03);gap:12px;'>
             ${coverImg}
             <div style='flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>
-              <div style='display:flex;align-items:center;gap:3px;margin-bottom:2px;'>
+              <div style='display:flex;align-items:center;gap:4px;margin-bottom:2px;'>
                 ${sourceBadge}${exclusivePill}${atmosPill}${hiResPill}
-                <strong style='color:#fff;font-size:12px;overflow:hidden;text-overflow:ellipsis;'>${t.title}</strong>
+                <strong style='color:#fff;font-size:13px;overflow:hidden;text-overflow:ellipsis;'>${t.title}</strong>
               </div>
               <div style='color:#888;font-size:11px;'>${t.artist} · ${t.album}</div>
             </div>
-            <div style='display:flex;align-items:center;gap:6px;flex-shrink:0;'>
-              <span style='color:#666;font-size:11px;min-width:30px;text-align:right;'>${durText}</span>
-              <button type='button' class='omniphony-native-play-btn' data-id='${t.id}' data-title='${safeTitle}' data-artist='${safeArtist}' data-album='${safeAlbum}' style='display:inline-flex;align-items:center;gap:4px;background:#232f3e;border:1px solid #ff9900;color:#ff9900;font-weight:700;font-size:10px;padding:5px 10px;border-radius:4px;cursor:pointer;font-family:inherit;'>
+            <div style='display:flex;align-items:center;gap:8px;flex-shrink:0;'>
+              <span style='color:#666;font-size:11px;min-width:32px;text-align:right;'>${durText}</span>
+              <button type='button' class='omniphony-native-play-btn' data-id='${t.id}' data-title='${safeTitle}' data-artist='${safeArtist}' data-album='${safeAlbum}' style='display:inline-flex;align-items:center;gap:4px;background:#232f3e;border:1px solid #ff9900;color:#ff9900;font-weight:700;font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;font-family:inherit;'>
                 ▶ Stream RealMAX
               </button>
-              <button type='button' class='omniphony-native-dl-btn' data-id='${t.id}' data-title='${safeTitle}' data-artist='${safeArtist}' data-album='${safeAlbum}' data-year='${t.year || ""}' data-isrc='${t.isrc || ""}' data-art='${t.cover || ""}' style='display:inline-flex;align-items:center;gap:4px;background:#1b2820;border:1px solid #00ff88;color:#00ff88;font-weight:700;font-size:10px;padding:5px 8px;border-radius:4px;cursor:pointer;font-family:inherit;'>
+              <button type='button' class='omniphony-native-dl-btn' data-id='${t.id}' data-title='${safeTitle}' data-artist='${safeArtist}' data-album='${safeAlbum}' data-year='${t.year || ""}' data-isrc='${t.isrc || ""}' data-art='${t.cover || ""}' style='display:inline-flex;align-items:center;gap:4px;background:#1b2820;border:1px solid #00ff88;color:#00ff88;font-weight:700;font-size:11px;padding:6px 9px;border-radius:4px;cursor:pointer;font-family:inherit;'>
                 ⬇
               </button>
             </div>
@@ -5911,20 +5926,20 @@ function installNativeSearchInterceptor() {
       });
 
       section.innerHTML = `
-        <div style='display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;border-bottom:1px solid rgba(255,153,0,0.25);padding-bottom:6px;'>
+        <div style='display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;border-bottom:1px solid rgba(255,153,0,0.25);padding-bottom:8px;'>
           <div style='display:flex;align-items:center;gap:8px;'>
             <span style='display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:11px;padding:3px 7px;border-radius:4px;gap:4px;line-height:1;'>
               ${amazonLogoSvg}
               <span>AMAZON MUSIC</span>
             </span>
-            <span style='font-size:14px;font-weight:700;color:#fff;'>Eclipse Addon Results</span>
+            <span style='font-size:15px;font-weight:700;color:#fff;'>Eclipse Addon Results</span>
             <span style='font-size:11px;color:#888;'>RealMAX Spatial & Hi-Res</span>
           </div>
           <span style='background:rgba(255,153,0,0.15);border:1px solid #ff9900;color:#ff9900;font-weight:700;font-size:10px;padding:2px 8px;border-radius:12px;'>
-            ${amazonTracks.length} tracks found
+            ${amazonTracks.length} available
           </span>
         </div>
-        <div style='max-height:340px;overflow-y:auto;'>${rowsHtml}</div>
+        <div style='max-height:360px;overflow-y:auto;'>${rowsHtml}</div>
       `;
 
       section.querySelectorAll('.omniphony-native-play-btn').forEach((btn) => {
@@ -5986,8 +6001,6 @@ function installNativeSearchInterceptor() {
     }
   });
 }
-
-
 // Native TidaLuna Settings Modal Component
 export const Settings = () => {
   const React = window.luna?.core?.modules?.["react"] || window.React;
