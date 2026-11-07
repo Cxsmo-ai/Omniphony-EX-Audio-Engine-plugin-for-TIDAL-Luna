@@ -80,46 +80,53 @@ All screenshots below are real captures taken directly from a live Windows 11 se
 ## Architecture & Signal Pipeline
 
 ```mermaid
+
 flowchart TD
-    subgraph TIDAL["TIDAL Desktop + TidaLuna (Renderer)"]
-        UI["Native TIDAL UI, Queue & Click-to-Seek Lyrics"]
-        DETACH["Deep Web Audio & HTMLMediaElement Detachment"]
-        SYNC["50ms IPC Clock Poll + 100ms Redux State Reconciler"]
-        BADGE["Native Footer Badge + Drawer + @luna/ui Settings"]
+    subgraph TIDAL["TIDAL Desktop / TidaLuna"]
+        UI["Native TIDAL UI, Queue and Click-to-Seek Lyrics"]
+        DETACH["Web Audio and HTMLMediaElement Detachment"]
+        SYNC["50ms IPC Clock Poll and 100ms Redux Reconciler"]
+        BADGE["Footer Badge, Drawer and Luna UI Settings"]
     end
 
-    subgraph SERVICE["OmniFusion Bundled Service (127.0.0.1:8765)"]
-        PRIO["RealMAX Priority & Multi-Source Resolver"]
-        DASH["Loopback TidalDashProxy (Zero-Disk Streaming)"]
-        OXIDE["OxideAV v0.1.71 AC-4 DSI/TOC Probe & Decoder"]
+    subgraph SERVICE["OmniFusion Service - 127.0.0.1:8765"]
+        PRIO["RealMAX Priority and Multi-Source Resolver"]
+        DASH["TidalDashProxy - Zero-Disk Streaming"]
+        OXIDE["OxideAV v0.1.71 - AC-4 DSI/TOC Decoder"]
     end
 
-    subgraph SOURCES["Multi-Source Catalog & Stream Providers"]
-        EBB["EbbLabs python-tidal (PKCE + Mobile OAuth + TV Atmos)"]
-        AMZM["User-Supplied Amazon Music Eclipse Addon (Optional)"]
-        TIDO["Tido Eclipse Unauthenticated Fallback (When Main API Unlinked)"]
+    subgraph SOURCES["Multi-Source Providers"]
+        EBB["EbbLabs python-tidal - PKCE, Mobile OAuth, TV Atmos"]
+        AMZM["Amazon Music Eclipse Addon - Optional"]
+        TIDO["Tido Eclipse - Unauthenticated Fallback"]
     end
 
-    subgraph ENGINE["Native Audio & Spatial Rendering Stack"]
-        MPV["Headless libmpv Engine (WASAPI Shared / Dedicated Endpoint)"]
-        ORENDER["In-Process orender.dll Decoder"]
-        STUDIO["Omniphony Studio v0.7.0 (3D Spatial & SOFA HRIR Binaural)"]
+    subgraph ENGINE["Native Spatial Audio Engine"]
+        MPV["Headless libmpv - WASAPI Audio Output"]
+        ORENDER["In-Process orender.dll"]
+        STUDIO["Omniphony Studio v0.7.0 - SOFA HRIR Binaural"]
     end
 
     UI --> DETACH
-    DETACH -->|POST /play, /seek, /pause, /resume| PRIO
+    DETACH -->|"Play, Seek, Pause, Resume"| PRIO
+
     PRIO --> EBB
     PRIO --> AMZM
     PRIO --> TIDO
-    EBB -->|AC-4 IMS MP4| OXIDE
-    EBB -->|E-AC-3 JOC / FLAC MPD| DASH
-    TIDO -->|E-AC-3 JOC / FLAC MPD| DASH
-    AMZM -->|Direct HTTPS FLAC / E-AC-3 JOC| MPV
-    OXIDE -->|Verified 48kHz Binaural PCM| MPV
-    DASH -->|Loopback HTTP Segments| MPV
-    MPV -->|EAC3_JOC| ORENDER
-    ORENDER <-->|OSC Loopback TCP 9000| STUDIO
-    MPV -->|GET /clock & /status| SYNC
+
+    EBB -->|"AC-4 IMS MP4"| OXIDE
+    EBB -->|"E-AC-3 JOC or FLAC MPD"| DASH
+    TIDO -->|"E-AC-3 JOC or FLAC MPD"| DASH
+    AMZM -->|"Direct HTTPS Audio"| MPV
+
+    OXIDE -->|"Verified 48kHz Binaural PCM"| MPV
+    DASH -->|"HTTP Audio Segments"| MPV
+
+    MPV -->|"EAC3_JOC"| ORENDER
+    ORENDER -->|"OSC TCP Port 9000"| STUDIO
+    STUDIO -->|"Spatial Rendering Control"| ORENDER
+
+    MPV -->|"Clock and Status"| SYNC
     SYNC --> BADGE
 ```
 
