@@ -5230,6 +5230,130 @@ function toggleSettingsPanel() {
   };
   panel.appendChild(dlNowBtn);
 
+    // RealMAX Multi-Source Unified Search Section
+  const searchDivider = document.createElement("div");
+  searchDivider.style.cssText = "height:1px;background:rgba(255,255,255,0.1);margin:14px 0 12px;";
+  panel.appendChild(searchDivider);
+
+  const searchHeader = document.createElement("label");
+  searchHeader.innerText = "RealMAX Multi-Source Unified Search:";
+  searchHeader.style.fontWeight = "600";
+  searchHeader.style.display = "block";
+  searchHeader.style.marginBottom = "6px";
+  panel.appendChild(searchHeader);
+
+  const searchInput = document.createElement("input");
+  searchInput.id = "omniphony-multi-search-input";
+  searchInput.type = "text";
+  searchInput.placeholder = "Search tracks, Atmos editions, exclusives across TIDAL & Amazon...";
+  searchInput.style.cssText = "width:100%;box-sizing:border-box;background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:8px 10px;margin-bottom:8px;font:inherit;font-size:12px;";
+  panel.appendChild(searchInput);
+
+  const searchResultsContainer = document.createElement("div");
+  searchResultsContainer.id = "omniphony-search-results";
+  searchResultsContainer.style.cssText = "max-height:220px;overflow-y:auto;background:rgba(0,0,0,0.3);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:6px;margin-bottom:12px;font-size:11px;display:none;";
+  panel.appendChild(searchResultsContainer);
+
+  let searchDebounceTimer = null;
+  searchInput.oninput = () => {
+    if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    const q = searchInput.value.trim();
+    if (!q) {
+      searchResultsContainer.style.display = "none";
+      searchResultsContainer.innerHTML = "";
+      return;
+    }
+    searchResultsContainer.style.display = "block";
+    searchResultsContainer.innerHTML = "<div style='color:#888;padding:6px;'>Searching across TIDAL & Amazon Music...</div>";
+
+    searchDebounceTimer = setTimeout(async () => {
+      try {
+        const sRes = await fetch(`${API_BASE}/search/multi?q=${encodeURIComponent(q)}&limit=10`);
+        if (!sRes.ok) throw new Error(`Search failed: ${sRes.status}`);
+        const data = await sRes.json();
+        const tracks = data?.tracks || [];
+        if (!tracks.length) {
+          searchResultsContainer.innerHTML = "<div style='color:#888;padding:6px;'>No tracks found across providers.</div>";
+          return;
+        }
+
+        searchResultsContainer.innerHTML = "";
+        tracks.forEach((t) => {
+          const row = document.createElement("div");
+          row.style.cssText = "display:flex;align-items:center;justify-content:space-between;padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.05);gap:8px;";
+
+          const metaDiv = document.createElement("div");
+          metaDiv.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+
+          const sourceBadge = t.source === "AMAZON"
+            ? "<span style='background:#ff9900;color:#000;font-weight:700;font-size:9px;padding:2px 4px;border-radius:3px;margin-right:4px;'>AMAZON</span>"
+            : "<span style='background:#00d2c4;color:#000;font-weight:700;font-size:9px;padding:2px 4px;border-radius:3px;margin-right:4px;'>TIDAL</span>";
+
+          const atmosPill = t.isAtmos || t.upgrade
+            ? "<span style='background:#31d8ff;color:#000;font-weight:700;font-size:9px;padding:2px 4px;border-radius:3px;margin-right:4px;'>ATMOS</span>"
+            : "";
+
+          metaDiv.innerHTML = `<div>${sourceBadge}${atmosPill}<strong>${t.title}</strong></div><div style='color:#888;font-size:10px;'>${t.artist} · ${t.album}</div>`;
+          row.appendChild(metaDiv);
+
+          const btnGroup = document.createElement("div");
+          btnGroup.style.cssText = "display:flex;gap:4px;";
+
+          const playBtn = document.createElement("button");
+          playBtn.type = "button";
+          playBtn.innerText = "▶";
+          playBtn.title = "Stream with RealMAX";
+          playBtn.style.cssText = "background:#222;color:#31d8ff;border:1px solid #444;border-radius:4px;padding:4px 7px;cursor:pointer;font-size:10px;";
+          playBtn.onclick = async () => {
+            playBtn.innerText = "⏳";
+            try {
+              await fetch(`${API_BASE}/play`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  trackId: t.id,
+                  title: t.title,
+                  artist: t.artist,
+                  album: t.album,
+                  timePos: 0,
+                  startPaused: false
+                })
+              });
+            } catch (err) {
+              alert("Play error: " + err.message);
+            } finally {
+              playBtn.innerText = "▶";
+            }
+          };
+          btnGroup.appendChild(playBtn);
+
+          const dlBtn = document.createElement("button");
+          dlBtn.type = "button";
+          dlBtn.innerText = "⬇";
+          dlBtn.title = "Download with RealMAX";
+          dlBtn.style.cssText = "background:#222;color:#00ff88;border:1px solid #444;border-radius:4px;padding:4px 7px;cursor:pointer;font-size:10px;";
+          dlBtn.onclick = async () => {
+            dlBtn.innerText = "⏳";
+            try {
+              const qRes = await queueTrackDownload(t);
+              alert(`Queued download for ${t.title}! (Job: ${qRes.jobId})`);
+            } catch (err) {
+              alert("Download error: " + err.message);
+            } finally {
+              dlBtn.innerText = "⬇";
+            }
+          };
+          btnGroup.appendChild(dlBtn);
+
+          row.appendChild(btnGroup);
+          searchResultsContainer.appendChild(row);
+        });
+      } catch (err) {
+        searchResultsContainer.innerHTML = `<div style='color:#ff7272;padding:6px;'>Error: ${err.message}</div>`;
+      }
+    }, 300);
+  };
+
   const pathsDivider = document.createElement("div");
   pathsDivider.style.cssText = "height:1px;background:rgba(255,255,255,0.1);margin:14px 0 12px;";
   panel.appendChild(pathsDivider);

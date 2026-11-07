@@ -4172,6 +4172,122 @@ def resolve_with_priority(track_id: int, priority_list: list[str], title_hint: s
 
 
 
+
+def execute_multi_source_search(query: str, limit: int = 10) -> dict:
+    """Concurrently search TIDAL, Amazon Music, and Tido Eclipse addons, merging and deduplicating results."""
+    clean_q = (query or "").strip()
+    if not clean_q:
+        return {"query": "", "tracks": []}
+
+    results = {"query": clean_q, "tracks": []}
+    tidal_tracks = []
+    amazon_tracks = []
+
+    # 1. Search TIDAL
+    try:
+        sess = get_python_tidal_session()
+        if sess:
+            import tidalapi
+            t_res = sess.search(clean_q, models=[tidalapi.media.Track], limit=limit)
+            for t in t_res.get("tracks", []):
+                modes = getattr(t, "audio_modes", []) or []
+                is_atmos = any("DOLBY_ATMOS" in str(m).upper() for m in modes)
+                tidal_tracks.append({
+                    "id": t.id,
+                    "title": t.name,
+                    "artist": t.artist.name if getattr(t, "artist", None) else "",
+                    "album": t.album.name if getattr(t, "album", None) else "",
+                    "duration": int(getattr(t, "duration", 0) or 0),
+                    "isAtmos": is_atmos,
+                    "quality": getattr(t, "audio_quality", "LOSSLESS"),
+                    "cover": t.album.image(640) if hasattr(t.album, "image") else "",
+                    "isrc": getattr(t, "isrc", "") or "",
+                    "source": "TIDAL",
+                })
+    except Exception as exc:
+        print(f"[-] TIDAL multi-search error: {exc}")
+
+    # 2. Search Amazon Music Eclipse Addon
+    try:
+        settings = load_settings()
+        addons = settings.get("eclipse_addons", [])
+        amazon_addons = [u for u in addons if isinstance(u, str) and u.strip() and not _is_tido_eclipse_addon(u)]
+        if amazon_addons:
+            addon_url = amazon_addons[0]
+            base = _eclipse_worker_base_url(addon_url)
+            token = _get_eclipse_addon_access_token("com.yourname.amazonmusic")
+            headers = {
+                "User-Agent": "Mozilla/5.0",
+                "X-Client-Platform": "web",
+                "Origin": "https://eclipsemusic.app",
+                "Referer": "https://eclipsemusic.app/",
+            }
+            if token:
+                headers["X-Eclipse-Access"] = token
+            s_url = f"{base}/search?q={urllib.parse.quote(clean_q)}"
+            req = urllib.request.Request(s_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=6.0) as r:
+                a_data = json.loads(r.read().decode("utf-8"))
+                for t in a_data.get("tracks", [])[:limit]:
+                    amazon_tracks.append({
+                        "id": t.get("id"),
+                        "title": t.get("title") or "Unknown Title",
+                        "artist": t.get("artist") or "Unknown Artist",
+                        "album": t.get("album") or "Unknown Album",
+                        "duration": int(t.get("duration") or 0),
+                        "isAtmos": bool(t.get("atmosAvailable")),
+                        "quality": t.get("audioQuality") or "FLAC",
+                        "cover": t.get("artworkURL") or "",
+                        "isrc": t.get("isrc") or "",
+                        "source": "AMAZON",
+                    })
+    except Exception as exc:
+        print(f"[-] Amazon multi-search error: {exc}")
+
+    # 3. Merge, Deduplicate & Badge
+    seen_isrc = set()
+    seen_keys = set()
+
+    for item in tidal_tracks:
+        norm_t = re.sub(r"[^a-z0-9]+", " ", item["title"].lower()).strip()
+        norm_a = re.sub(r"[^a-z0-9]+", " ", item["artist"].lower()).strip()
+        key = f"{norm_t}|{norm_a}"
+        if item["isrc"]:
+            seen_isrc.add(item["isrc"].upper())
+        seen_keys.add(key)
+
+        # Cross-reference Amazon for Atmos upgrade
+        amz_match = next((
+            a for a in amazon_tracks
+            if (a["isrc"] and a["isrc"].upper() == item["isrc"].upper())
+            or (re.sub(r"[^a-z0-9]+", " ", a["title"].lower()).strip() == norm_t and re.sub(r"[^a-z0-9]+", " ", a["artist"].lower()).strip() == norm_a)
+        ), None)
+
+        if amz_match and amz_match["isAtmos"] and not item["isAtmos"]:
+            item["upgrade"] = {
+                "provider": "AMAZON",
+                "format": "EAC3_JOC",
+                "label": "Amazon Dolby Atmos 5.1",
+            }
+        results["tracks"].append(item)
+
+    for a in amazon_tracks:
+        norm_t = re.sub(r"[^a-z0-9]+", " ", a["title"].lower()).strip()
+        norm_a = re.sub(r"[^a-z0-9]+", " ", a["artist"].lower()).strip()
+        key = f"{norm_t}|{norm_a}"
+        if (a["isrc"] and a["isrc"].upper() in seen_isrc) or (key in seen_keys):
+            continue
+        seen_keys.add(key)
+        if a["isrc"]:
+            seen_isrc.add(a["isrc"].upper())
+        results["tracks"].append({
+            **a,
+            "exclusive": True,
+        })
+
+    return results
+
+
 DOWNLOAD_QUEUE_LOCK = threading.RLock()
 ACTIVE_DOWNLOADS = {}
 
@@ -4792,6 +4908,17 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"error": clock_error}, status=clock_error_status)
                 return
             self.send_json(clock_response)
+
+        elif parsed.path == "/search/multi":
+            query_params = urllib.parse.parse_qs(parsed.query)
+            q = query_params.get("q", [""])[0]
+            limit_val = 10
+            try:
+                limit_val = int(query_params.get("limit", [10])[0])
+            except Exception:
+                limit_val = 10
+            search_results = execute_multi_source_search(q, limit=limit_val)
+            self.send_json(search_results)
 
         elif parsed.path == "/download/status":
             with DOWNLOAD_QUEUE_LOCK:
