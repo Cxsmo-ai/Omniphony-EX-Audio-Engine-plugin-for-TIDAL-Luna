@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 280" width="100%">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090c12"/>
+      <stop offset="50%" stop-color="#0f1520"/>
+      <stop offset="100%" stop-color="#080a0f"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00d2c4"/>
+      <stop offset="50%" stop-color="#31d8ff"/>
+      <stop offset="100%" stop-color="#00ff88"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#00d2c4" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#00d2c4" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="280" rx="16" fill="url(#bg)" stroke="#1e293b" stroke-width="2"/>
+  <rect x="0" y="0" width="1200" height="120" rx="16" fill="url(#glow)"/>
+  <line x1="80" y1="220" x2="1120" y2="220" stroke="url(#accent)" stroke-width="1.5" stroke-opacity="0.35"/>
+
+  <g stroke="#ffffff" stroke-opacity="0.04" stroke-width="1">
+    <line x1="200" y1="0" x2="200" y2="280"/>
+    <line x1="400" y1="0" x2="400" y2="280"/>
+    <line x1="600" y1="0" x2="600" y2="280"/>
+    <line x1="800" y1="0" x2="800" y2="280"/>
+    <line x1="1000" y1="0" x2="1000" y2="280"/>
+    <line x1="0" y1="70" x2="1200" y2="70"/>
+    <line x1="0" y1="140" x2="1200" y2="140"/>
+  </g>
+
+  <text x="600" y="102" text-anchor="middle" fill="#ffffff" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="54" font-weight="800" letter-spacing="6">
+    OMNIPHONY <tspan fill="url(#accent)">EX</tspan>
+  </text>
+  <text x="600" y="142" text-anchor="middle" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="16" font-weight="600" letter-spacing="3.5">
+    REALMAX MULTI-SOURCE SPATIAL &amp; HI-RES AUDIO ENGINE FOR TIDAL LUNA
+  </text>
+  <text x="600" y="172" text-anchor="middle" fill="#64748b" font-family="'Consolas', 'JetBrains Mono', monospace" font-size="13" font-weight="500" letter-spacing="1">
+    libmpv + orender.dll · OxideAV AC-4 IMS · Omniphony Studio 3D · TIDAL + Amazon Music Eclipse
+  </text>
+
+  <g font-family="'Consolas', 'JetBrains Mono', monospace" font-size="12" font-weight="700" text-anchor="middle">
+    <rect x="115" y="234" width="210" height="28" rx="6" fill="#111827" stroke="#00d2c4" stroke-opacity="0.5"/>
+    <text x="220" y="252" fill="#00d2c4">DOLBY AC-4 IMS (BINAURAL)</text>
+
+    <rect x="350" y="234" width="230" height="28" rx="6" fill="#111827" stroke="#31d8ff" stroke-opacity="0.5"/>
+    <text x="465" y="252" fill="#31d8ff">DOLBY ATMOS E-AC-3 JOC 5.1</text>
+
+    <rect x="605" y="234" width="220" height="28" rx="6" fill="#111827" stroke="#00ff88" stroke-opacity="0.5"/>
+    <text x="715" y="252" fill="#00ff88">24-BIT / 192 KHZ HI-RES FLAC</text>
+
+    <rect x="850" y="234" width="235" height="28" rx="6" fill="#111827" stroke="#f5c400" stroke-opacity="0.5"/>
+    <text x="967" y="252" fill="#f5c400">SUB-MS REDUX &amp; LYRICS SYNC</text>
+  </g>
+</svg>

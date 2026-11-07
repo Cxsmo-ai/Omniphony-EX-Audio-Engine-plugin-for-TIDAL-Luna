@@ -1,9 +1,9 @@
 {
   "name": "Omniphony EX Audio Engine",
-  "description": "Ultra-native RealMax stream resolving, deep Web Audio detachment preserving live lyrics, and headless libmpv spatial playback.",
+  "description": "RealMAX multi-source spatial & Hi-Res audio engine for TIDAL Luna \u2014 Dolby AC-4 IMS, E-AC-3 JOC 5.1 (Omniphony Studio 3D), 24-bit/192kHz FLAC, and sub-millisecond native UI sync.",
   "type": "module",
   "author": "Pickymarker",
-  "version": "2.0.2",
+  "version": "2.1.19",
   "plugins": [
     "omniphony.mjs"
   ]
