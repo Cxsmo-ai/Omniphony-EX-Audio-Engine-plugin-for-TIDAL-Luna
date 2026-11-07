@@ -2080,6 +2080,8 @@ def _resolve_eac3_joc_data_manifest(session, track_id: int, auth_profile: str) -
 
 
 def resolve_eac3_joc(track_id: int) -> dict | None:
+    if not str(track_id).strip().isdigit():
+        return None
     """Resolve the selected JOC manifest using python-tidal.
 
     Try the authenticated PKCE DATA DASH manifest first. After a confirmed
@@ -2719,6 +2721,8 @@ class Ac4TransportUnavailable(RuntimeError):
 
 
 def resolve_ac4_ims(track_id: int) -> dict | None:
+    if not str(track_id).strip().isdigit():
+        return None
     """Resolve AC-4 through EbbLabs/python-tidal with PKCE-first profile order.
 
     The separate mobile OAuth profile is queried only when PKCE Track.get_stream()
@@ -2985,6 +2989,8 @@ def is_verified_oxideav_atmos_ims_probe(fields: dict, source_rate: int) -> bool:
 
 
 def get_python_tidal_track_info(track_id: int) -> dict | None:
+    if not str(track_id).strip().isdigit():
+        return None
     """Read catalog-level quality tags through the authenticated PKCE session."""
     now = time.monotonic()
     with _TIDAL_API_LOCK:
@@ -3143,6 +3149,8 @@ def get_tidal_dash_audio_metadata(
         return {}
 
 def resolve_hi_res_or_lossless(track_id: int, quality="HI_RES_LOSSLESS") -> dict | None:
+    if not str(track_id).strip().isdigit():
+        return None
     """Resolve the library-selected FLAC stream using Track.get_stream()."""
     quality = str(getattr(quality, "value", quality) or "").upper()
     if quality not in {"HI_RES_LOSSLESS", "LOSSLESS"}:
@@ -3826,7 +3834,7 @@ def resolve_tido_eclipse_addon(
         print(f"[-] Tido Eclipse addon resolution error ({requested_fmt}): {exc}")
     return None
 
-def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str, title: str = "", artist: str = "", duration: int | float = 0) -> dict | None:
+def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str, title: str = "", artist: str = "", duration: int | float = 0, explicit_track_id: str = "") -> dict | None:
     """Resolve streams from Eclipse Music addons adhering strictly to the official Eclipse specification."""
     if requested_fmt == "AC4_IMS":
         return None
@@ -3869,10 +3877,18 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
 
         track_id = None
         matched_track_meta: dict = {}
-        cached_lookup = search_cache.get(lookup_key) if isinstance(search_cache, dict) else None
-        if isinstance(cached_lookup, dict) and now < float(cached_lookup.get("expires_at") or 0):
-            track_id = cached_lookup.get("track_id")
-            matched_track_meta = cached_lookup.get("meta") or {}
+        if explicit_track_id:
+            track_id = str(explicit_track_id).strip()
+            if isinstance(search_cache, dict):
+                for entry in search_cache.values():
+                    if isinstance(entry, dict) and entry.get("track_id") == track_id and isinstance(entry.get("meta"), dict):
+                        matched_track_meta = entry["meta"]
+                        break
+        else:
+            cached_lookup = search_cache.get(lookup_key) if isinstance(search_cache, dict) else None
+            if isinstance(cached_lookup, dict) and now < float(cached_lookup.get("expires_at") or 0):
+                track_id = cached_lookup.get("track_id")
+                matched_track_meta = cached_lookup.get("meta") or {}
 
         # 1. Primary lookup: GET /search?q={query} when title is known (fastest & most reliable on AMZM worker)
         if not track_id and (title or isrc):
@@ -4055,7 +4071,7 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
     return None
 
 
-def resolve_with_priority(track_id: int, priority_list: list[str], title_hint: str = "", artist_hint: str = "") -> dict:
+def resolve_with_priority(track_id: int | str, priority_list: list[str], title_hint: str = "", artist_hint: str = "") -> dict:
     resolvers = {
         "EAC3_JOC": lambda tid: resolve_eac3_joc(tid),
         "AC4_IMS": lambda tid: resolve_ac4_ims(tid),
@@ -4063,8 +4079,9 @@ def resolve_with_priority(track_id: int, priority_list: list[str], title_hint: s
         "LOSSLESS": lambda tid: resolve_hi_res_or_lossless(tid, "LOSSLESS"),
     }
 
-    # Track candidate cache: clicked track is always evaluated
-    candidate_ids = [track_id]
+    clean_id_str = str(track_id).strip()
+    is_numeric = clean_id_str.isdigit()
+
     settings = load_settings()
     raw_eclipse_addons = settings.get("eclipse_addons", [])
     amazon_addons = [u for u in raw_eclipse_addons if isinstance(u, str) and u.strip() and not _is_tido_eclipse_addon(u)]
@@ -4073,6 +4090,31 @@ def resolve_with_priority(track_id: int, priority_list: list[str], title_hint: s
 
     source_mode = settings.get("realmax_source", "auto")
     main_api_authorized = is_main_tidal_api_authorized()
+
+    if not is_numeric:
+        if not amazon_addons:
+            raise RuntimeError(f"Cannot resolve non-numeric Amazon/Eclipse track '{clean_id_str}' without an Amazon Eclipse addon configured")
+        for fmt in priority_list:
+            if fmt == "AC4_IMS":
+                continue
+            for addon_url in amazon_addons:
+                addon_res = resolve_eclipse_addon(
+                    addon_url,
+                    "",
+                    fmt,
+                    title_hint or "",
+                    artist_hint or "",
+                    duration=0,
+                    explicit_track_id=clean_id_str,
+                )
+                if addon_res:
+                    print(f"[RealMAX] Selected Amazon Eclipse addon stream for ASIN {clean_id_str} ({fmt})")
+                    return addon_res
+        raise RuntimeError(f"Could not resolve any audio stream for track {clean_id_str}")
+
+    track_id = int(clean_id_str)
+    # Track candidate cache: clicked track is always evaluated
+    candidate_ids = [track_id]
     track_isrc = None
     track_title = title_hint or ""
     track_artist = artist_hint or ""
@@ -4382,7 +4424,8 @@ def execute_track_download(job_id: str, payload: dict) -> None:
             ACTIVE_DOWNLOADS[job_id]["status"] = "resolving"
             ACTIVE_DOWNLOADS[job_id]["progress"] = 15
 
-        stream_info = resolve_with_priority(int(track_id), priority, title_hint=title, artist_hint=artist)
+        track_id_param = int(track_id) if str(track_id).strip().isdigit() else str(track_id).strip()
+        stream_info = resolve_with_priority(track_id_param, priority, title_hint=title, artist_hint=artist)
         if not stream_info or not stream_info.get("uri"):
             raise RuntimeError("Could not resolve audio stream for track")
 
@@ -4443,7 +4486,7 @@ def execute_track_download(job_id: str, payload: dict) -> None:
         # 2. TIDAL Metadata, Lyrics & High-Res Cover Art enrichment
         try:
             sess = get_python_tidal_session()
-            if sess:
+            if sess and str(track_id).strip().isdigit():
                 t_obj = sess.track(int(track_id))
                 if t_obj:
                     full_name = getattr(t_obj, "full_name", None)
@@ -5252,7 +5295,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             device = settings.get("audio_device", "auto")
 
             try:
-                stream_info = resolve_with_priority(int(track_id), priority, title_hint=title, artist_hint=artist)
+                track_id_param = int(track_id) if str(track_id).strip().isdigit() else str(track_id).strip()
+                stream_info = resolve_with_priority(track_id_param, priority, title_hint=title, artist_hint=artist)
             except RuntimeError as exc:
                 return self.send_json({
                     "error": str(exc),
