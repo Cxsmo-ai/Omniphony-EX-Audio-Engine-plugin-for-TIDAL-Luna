@@ -69,7 +69,7 @@ All screenshots below are real captures taken directly from a live Windows 11 se
 | <img src="assets/screenshots/real-omniphony-settings-drawer.png" alt="Omniphony EX Drawer — E-AC-3 JOC" width="380" /> | <img src="assets/screenshots/real-drawer-ac4-telemetry.png" alt="Omniphony EX Drawer — AC-4 IMS" width="380" /> |
 
 ### 5. Omniphony Studio 3D Spatial Renderer (`Connected · mpv · SOFA HRIR Binaural`)
-*Real capture of `omniphony-studio-egui.exe` connected to `libmpv` over loopback OSC (`127.0.0.1:9000`), rendering 7.1.4 spatial speaker beds and dynamic objects through `Meta_Universal_HRTF_48k_16384pts_128tap_Omniphony.sofa`:*
+*Real capture of `omniphony-studio-egui.exe` connected to `libmpv` over loopback OSC (`127.0.0.1:9000`), rendering full 3D object-based audio, any speaker layout (`2.0` through `5.1.2`, `7.1.2`, `7.1.4`, `9.1.6`, `22.2`, or custom 3D speaker layouts), and direct SOFA HRIR binaural headphone rendering through the bundled Meta Audio SDK HRTF (`assets/hrtf/Meta_Universal_HRTF_48k_16384pts_128tap_Omniphony.sofa`):*
 
 <p align="center">
   <img src="assets/screenshots/omniphony-studio-3d-spatial.png" alt="Omniphony Studio 3D Spatial Control Connected to mpv" width="96%" />
@@ -160,7 +160,7 @@ flowchart TD
 1. Go to [**Releases → v2.1.25**](https://github.com/Cxsmo-ai/omniphony-tidal-luna-plugin/releases/tag/v2.1.25) and download **`OmniFusion-Engine-win64.zip`**.
 2. Extract it to `C:\OmniFusion-Standalone` (or any custom directory of your choice). It contains:
    - `mpv/` — `mpv.exe`, `libmpv-2.dll`, and in-process `orender` spatial hooks
-   - `studio/` — `omniphony-studio-egui.exe`, `orender.exe`, and SOFA HRIR binaural assets
+   - `studio/` — `omniphony-studio-egui.exe`, `orender.exe`, all speaker layout presets (`2.0` through `5.1.2`, `7.1.2`, `7.1.4`, `9.1.6`, `22.2`, and custom layouts), and the bundled Meta Audio SDK SOFA HRIR (`Meta_Universal_HRTF_48k_16384pts_128tap_Omniphony.sofa`)
    - `oxideav/` — `ac4-to-wav.exe` (`adapter-v0.1.71`) for Dolby AC-4 IMS verification & decoding
 
 ### Step 2 — Install the Plugin in TidaLuna
@@ -194,6 +194,8 @@ omniphony-tidal-luna-plugin/
 ├── store.json                         # TidaLuna Plugin Store metadata
 ├── assets/
 │   ├── header.svg                     # Crisp vector header banner
+│   ├── hrtf/
+│   │   └── Meta_Universal_HRTF_48k_16384pts_128tap_Omniphony.sofa # Bundled Meta Audio SDK 48kHz 16384-pt SOFA HRIR
 │   └── screenshots/
 │       ├── tidal-desktop-live.png             # Live TIDAL Desktop playing E-AC-3 JOC with drawer open
 │       ├── tidal-desktop-ac4-ims-live.png     # Live TIDAL Desktop playing AC-4 IMS with drawer open
