@@ -8,38 +8,56 @@ export const unloads = omniphony.unloads || new Set();
 
 let serviceProcess = null;
 
-export async function onLoad() {
-  console.log('[Omniphony EX] Initializing ultra-native TidaLuna plugin with bundled API...');
-  
-  // Auto-launch the bundled API service if it is not already running
+async function ensureLocalServiceRunning() {
   try {
     const res = await fetch('http://127.0.0.1:8765/health', { method: 'GET' }).catch(() => null);
-    if (!res || !res.ok) {
-      console.log('[Omniphony EX] Local audio service offline, spawning bundled runtime...');
-      if (window.require) {
-        const { spawn } = window.require('child_process');
-        const path = window.require('path');
-        const apiDir = path.join(__dirname, 'api');
-        const pythonExe = path.join(apiDir, 'runtime', 'python.exe');
-        const scriptPath = path.join(apiDir, 'omnifusion_service.py');
-        serviceProcess = spawn(pythonExe, [scriptPath], {
-          cwd: apiDir,
-          windowsHide: true,
-          stdio: 'ignore'
-        });
-        serviceProcess.unref();
-        console.log('[Omniphony EX] Spawned bundled background service successfully');
-      }
-    } else {
+    if (res && res.ok) {
       console.log('[Omniphony EX] Local audio engine already running');
+      return true;
     }
-  } catch (err) {
-    console.warn('[Omniphony EX] Service check error:', err);
+  } catch (_) {}
+
+  console.log('[Omniphony EX] Audio service offline, launching bundled runtime...');
+  if (window.require) {
+    try {
+      const { spawn } = window.require('child_process');
+      const path = window.require('path');
+      const apiDir = path.join(__dirname, 'api');
+      const pythonExe = path.join(apiDir, 'runtime', 'python.exe');
+      const scriptPath = path.join(apiDir, 'omnifusion_service.py');
+      
+      serviceProcess = spawn(pythonExe, [scriptPath], {
+        cwd: apiDir,
+        windowsHide: true,
+        stdio: 'ignore',
+        detached: true
+      });
+      serviceProcess.unref();
+      console.log('[Omniphony EX] Spawned bundled background service successfully');
+      
+      // Wait up to 3 seconds for health
+      for (let i = 0; i < 6; i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        const check = await fetch('http://127.0.0.1:8765/health', { method: 'GET' }).catch(() => null);
+        if (check && check.ok) {
+          console.log('[Omniphony EX] Bundled service became healthy!');
+          break;
+        }
+      }
+      return true;
+    } catch (err) {
+      console.warn('[Omniphony EX] Could not spawn bundled service via child_process:', err);
+    }
   }
+  return false;
+}
+
+export async function onLoad() {
+  console.log('[Omniphony EX] Initializing ultra-native TidaLuna plugin with bundled API...');
+  await ensureLocalServiceRunning();
 }
 
 unloads.add(() => {
-  // Send graceful shutdown to OmniFusion API service and MPV on TIDAL exit/unload
   try {
     if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
       navigator.sendBeacon('http://127.0.0.1:8765/shutdown', '{}');
