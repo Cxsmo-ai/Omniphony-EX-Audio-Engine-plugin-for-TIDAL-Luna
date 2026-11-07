@@ -5796,8 +5796,7 @@ function updatePausedSelectionUi(message = null) {
 onLoad();
 installNativeDownloadContextMenu();
 installNativeSearchInterceptor();
-
-let lastNativeSearchQuery = "";
+let lastNativeSearchQuery = '';
 let nativeSearchDebounce = null;
 
 function installNativeSearchInterceptor() {
@@ -5805,17 +5804,17 @@ function installNativeSearchInterceptor() {
 
   function badgeExistingTidalResults() {
     try {
-      const links = document.querySelectorAll('a[href^="/track/"], a[href^="/album/"]');
+      const links = document.querySelectorAll('a[href*="/track/"], a[href*="/album/"], a[href*="/video/"], [data-test="track-title"]');
       links.forEach((link) => {
-        const text = (link.textContent || "").trim();
+        const text = (link.textContent || '').trim();
         if (!text || text.length < 3) return;
         const isAmazon = /amazon\s*original|amazon\s*music/i.test(text);
         if (!isAmazon) return;
         const parent = link.parentElement;
-        if (!parent || parent.querySelector(".omniphony-amz-badge")) return;
-        const badge = document.createElement("span");
-        badge.className = "omniphony-amz-badge";
-        badge.style.cssText = "display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:6px;vertical-align:middle;line-height:1;gap:3px;";
+        if (!parent || parent.querySelector('.omniphony-amz-badge')) return;
+        const badge = document.createElement('span');
+        badge.className = 'omniphony-amz-badge';
+        badge.style.cssText = 'display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:6px;vertical-align:middle;line-height:1;gap:3px;';
         badge.innerHTML = `${amazonLogoSvg}<span>AMAZON MUSIC</span>`;
         link.parentNode.insertBefore(badge, link);
       });
@@ -5827,21 +5826,21 @@ function installNativeSearchInterceptor() {
       badgeExistingTidalResults();
 
       const searchInput = document.querySelector('input[type="search"], input[data-test="search-input"], input[placeholder*="Search"], header input');
-      let query = (searchInput && searchInput.value ? searchInput.value : "").trim();
-      if (!query && window.location.href.includes("q=")) {
+      let query = (searchInput && searchInput.value ? searchInput.value : '').trim();
+      if (!query && window.location.href.includes('q=')) {
         try {
           const u = new URL(window.location.href);
-          query = (u.searchParams.get("q") || "").trim();
+          query = (u.searchParams.get('q') || '').trim();
         } catch (_) {}
       }
 
       if (!query || query.length < 2) {
-        const existing = document.getElementById("omniphony-native-amazon-search");
+        const existing = document.getElementById('omniphony-native-amazon-search');
         if (existing) existing.remove();
         return;
       }
 
-      if (query === lastNativeSearchQuery && document.getElementById("omniphony-native-amazon-search")) {
+      if (query === lastNativeSearchQuery && document.getElementById('omniphony-native-amazon-search')) {
         return;
       }
       lastNativeSearchQuery = query;
@@ -5849,45 +5848,44 @@ function installNativeSearchInterceptor() {
       const res = await fetch(`${API_BASE}/search/multi?q=${encodeURIComponent(query)}&limit=15`).catch(() => null);
       if (!res || !res.ok) return;
       const data = await res.json();
-      const amazonTracks = (data?.tracks || []).filter((t) => t.source === "AMAZON" || t.exclusive || (t.upgrade && t.upgrade.provider === "AMAZON"));
+      const amazonTracks = (data?.tracks || []).filter((t) => t.source === 'AMAZON' || t.exclusive || (t.upgrade && t.upgrade.provider === 'AMAZON'));
 
       if (!amazonTracks.length) {
-        const existing = document.getElementById("omniphony-native-amazon-search");
+        const existing = document.getElementById('omniphony-native-amazon-search');
         if (existing) existing.remove();
         return;
       }
 
-      const tabLinks = Array.from(document.querySelectorAll("a")).filter((a) => (a.textContent || "").trim() === "Top results" || (a.textContent || "").trim() === "Tracks");
-      const tabContainer = tabLinks.length ? tabLinks[0].parentElement : null;
-      const targetMount = tabContainer ? tabContainer.parentElement : (document.querySelector('main, div[data-test="main-content"], [role="main"]') || document.body);
-      if (!targetMount) return;
+      const topLink = Array.from(document.querySelectorAll('a')).find((a) => (a.textContent || '').trim() === 'Top results' || (a.textContent || '').trim() === 'Tracks');
+      const tabBar = topLink ? topLink.closest('div, nav, [role="tablist"]') : null;
+      const main = document.querySelector('main, div[data-test="main-content"], [role="main"]') || document.body;
 
-      let section = document.getElementById("omniphony-native-amazon-search");
+      let section = document.getElementById('omniphony-native-amazon-search');
       if (!section) {
-        section = document.createElement("div");
-        section.id = "omniphony-native-amazon-search";
-        section.style.cssText = "margin:14px 20px;padding:14px;background:#181818;border:1px solid rgba(255,153,0,0.35);border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.5);font-family:inherit;";
-        if (tabContainer && tabContainer.nextSibling) {
-          tabContainer.parentNode.insertBefore(section, tabContainer.nextSibling);
+        section = document.createElement('div');
+        section.id = 'omniphony-native-amazon-search';
+        section.style.cssText = 'margin:14px 20px;padding:14px;background:#181818;border:1px solid rgba(255,153,0,0.4);border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.6);font-family:inherit;';
+        if (tabBar && tabBar.parentElement) {
+          tabBar.parentElement.insertBefore(section, tabBar.nextSibling);
         } else {
-          targetMount.prepend(section);
+          main.prepend(section);
         }
       }
 
-      let rowsHtml = "";
+      let rowsHtml = '';
       amazonTracks.forEach((t) => {
-        const isAtmos = t.isAtmos || (t.upgrade && t.upgrade.format === "EAC3_JOC");
-        const atmosPill = isAtmos ? `<span style='display:inline-flex;align-items:center;background:#31d8ff;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;'>ATMOS 5.1</span>` : "";
-        const hiResPill = (t.quality && t.quality.toLowerCase().includes("192")) || (t.quality && t.quality.toLowerCase().includes("hi-res")) ? `<span style='display:inline-flex;align-items:center;background:#00ff88;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;'>192kHz HI-RES</span>` : "";
-        const exclusivePill = t.exclusive ? `<span style='display:inline-flex;align-items:center;background:#7928ca;color:#fff;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;'>EXCLUSIVE</span>` : "";
+        const isAtmos = t.isAtmos || (t.upgrade && t.upgrade.format === 'EAC3_JOC');
+        const atmosPill = isAtmos ? `<span style='display:inline-flex;align-items:center;background:#31d8ff;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;'>ATMOS 5.1</span>` : '';
+        const hiResPill = (t.quality && t.quality.toLowerCase().includes('192')) || (t.quality && t.quality.toLowerCase().includes('hi-res')) ? `<span style='display:inline-flex;align-items:center;background:#00ff88;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;'>192kHz HI-RES</span>` : '';
+        const exclusivePill = t.exclusive ? `<span style='display:inline-flex;align-items:center;background:#7928ca;color:#fff;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;'>EXCLUSIVE</span>` : '';
         const sourceBadge = `<span style='display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;gap:3px;'>${amazonLogoSvg}<span>AMAZON MUSIC</span></span>`;
-        const coverImg = t.cover ? `<img src='${t.cover}' style='width:36px;height:36px;border-radius:4px;object-fit:cover;flex-shrink:0;' onerror="this.style.display='none'" alt=''/>` : "";
+        const coverImg = t.cover ? `<img src='${t.cover}' style='width:36px;height:36px;border-radius:4px;object-fit:cover;flex-shrink:0;' onerror="this.style.display='none'" alt=''/>` : '';
         const mins = Math.floor((t.duration || 0) / 60);
-        const secs = String(Math.floor((t.duration || 0) % 60)).padStart(2, "0");
-        const durText = t.duration ? `${mins}:${secs}` : "";
-        const safeTitle = (t.title || "").replace(/'/g, "&#39;");
-        const safeArtist = (t.artist || "").replace(/'/g, "&#39;");
-        const safeAlbum = (t.album || "").replace(/'/g, "&#39;");
+        const secs = String(Math.floor((t.duration || 0) % 60)).padStart(2, '0');
+        const durText = t.duration ? `${mins}:${secs}` : '';
+        const safeTitle = (t.title || '').replace(/'/g, '&#39;');
+        const safeArtist = (t.artist || '').replace(/'/g, '&#39;');
+        const safeAlbum = (t.album || '').replace(/'/g, '&#39;');
 
         rowsHtml += `
           <div class='omniphony-amz-row' data-track-id='${t.id}' style='display:flex;align-items:center;justify-content:space-between;padding:7px 10px;border-radius:6px;margin-bottom:3px;background:rgba(255,255,255,0.03);gap:10px;'>
@@ -5932,11 +5930,11 @@ function installNativeSearchInterceptor() {
       section.querySelectorAll('.omniphony-native-play-btn').forEach((btn) => {
         btn.onclick = async () => {
           const orig = btn.innerText;
-          btn.innerText = "⏳ Loading...";
+          btn.innerText = '⏳ Loading...';
           try {
             await fetch(`${API_BASE}/play`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 trackId: btn.dataset.id,
                 title: btn.dataset.title,
@@ -5946,9 +5944,9 @@ function installNativeSearchInterceptor() {
                 startPaused: false
               })
             });
-            btn.innerText = "▶ Playing";
+            btn.innerText = '▶ Playing';
           } catch (err) {
-            alert("Play error: " + err.message);
+            alert('Play error: ' + err.message);
             btn.innerText = orig;
           }
         };
@@ -5956,7 +5954,7 @@ function installNativeSearchInterceptor() {
 
       section.querySelectorAll('.omniphony-native-dl-btn').forEach((btn) => {
         btn.onclick = async () => {
-          btn.innerText = "⏳";
+          btn.innerText = '⏳';
           try {
             const qRes = await queueTrackDownload({
               id: btn.dataset.id,
@@ -5968,27 +5966,26 @@ function installNativeSearchInterceptor() {
               albumArtUrl: btn.dataset.art,
             });
             alert(`Queued download for ${btn.dataset.title}! (Job: ${qRes.jobId})`);
-            btn.innerText = "✓";
+            btn.innerText = '✓';
           } catch (err) {
-            alert("Download error: " + err.message);
-            btn.innerText = "⬇";
+            alert('Download error: ' + err.message);
+            btn.innerText = '⬇';
           }
         };
       });
     } catch (e) {
-      console.debug("[Omniphony EX Search]", e);
+      console.debug('[Omniphony EX Search]', e);
     }
   }
 
   setInterval(checkAndInjectNativeSearch, 800);
-  document.addEventListener("input", (e) => {
+  document.addEventListener('input', (e) => {
     if (e.target && e.target.matches && e.target.matches('input[type="search"], input[data-test="search-input"], input[placeholder*="Search"], header input')) {
       if (nativeSearchDebounce) clearTimeout(nativeSearchDebounce);
       nativeSearchDebounce = setTimeout(checkAndInjectNativeSearch, 300);
     }
   });
 }
-
 
 
 // Native TidaLuna Settings Modal Component
