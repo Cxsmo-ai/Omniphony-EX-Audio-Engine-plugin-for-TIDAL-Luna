@@ -4358,6 +4358,7 @@ def execute_track_download(job_id: str, payload: dict) -> None:
 
             cmd = [
                 str(MPV_EXE),
+                "--no-config",
                 mpv_input,
                 "--vid=no",
                 "--vo=null",
