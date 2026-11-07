@@ -4803,7 +4803,44 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             return
         parsed = urllib.parse.urlparse(self.path)
 
-        if parsed.path == "/health":
+        if parsed.path in ("/omniphony", "/omniphony/manifest.json", "/omniphony.json", "/manifest.json"):
+            manifest_path = STANDALONE_DIR / "dist" / "omniphony-tidal-luna-plugin" / "manifest.json"
+            if manifest_path.exists():
+                data = manifest_path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
+        elif parsed.path in ("/omniphony/omniphony.mjs", "/omniphony.mjs", "/omniphony-live-sync.mjs", "/index.js"):
+            mjs_path = STANDALONE_DIR / "dist" / "omniphony-tidal-luna-plugin" / "omniphony.mjs"
+            if mjs_path.exists():
+                data = mjs_path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/javascript; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
+        elif parsed.path in ("/omniphony/store.json", "/store.json"):
+            store_path = STANDALONE_DIR / "dist" / "omniphony-tidal-luna-plugin" / "store.json"
+            if store_path.exists():
+                data = store_path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
+        elif parsed.path == "/health":
             self.send_json({
                 "status": "ok",
                 "service": "OmniFusion Standalone Audio Engine",
