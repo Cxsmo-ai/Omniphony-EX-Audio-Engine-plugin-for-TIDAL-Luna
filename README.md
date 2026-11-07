@@ -227,3 +227,20 @@ omniphony-tidal-luna-plugin/
 ```
 
 For deep protocol details, loopback HTTP endpoints, and verification gates, see [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md).
+
+---
+
+## License & Third-Party Notices
+
+Omniphony EX is released under the [**MIT License**](LICENSE).
+
+This project bundles and interoperates with third-party open-source components under their respective licenses:
+- **Python Embedded Runtime (Python 3.14):** [Python Software Foundation License](THIRD-PARTY-NOTICES.md#1-python-software-foundation-license-python-314-embedded-runtime) (`api/runtime/LICENSE.txt`)
+- **EbbLabs `python-tidal`:** [GNU Lesser General Public License v3.0+](THIRD-PARTY-NOTICES.md#2-ebblabs-python-tidal-lgpl-30-or-later) (`api/vendor/licenses/python-tidal-LICENSE`)
+- **`psutil`:** [BSD-3-Clause License](THIRD-PARTY-NOTICES.md#3-psutil-bsd-3-clause)
+- **`requests`:** [Apache-2.0 License](THIRD-PARTY-NOTICES.md#4-requests-apache-20)
+- **`mpegdash`:** [MIT License](THIRD-PARTY-NOTICES.md#5-mpegdash-mit)
+- **`certifi`:** [Mozilla Public License 2.0](THIRD-PARTY-NOTICES.md#6-certifi-mpl-20)
+- **Meta Audio SDK / Universal HRTF:** [Derived Measurement & Interoperability Notice](THIRD-PARTY-NOTICES.md#7-meta-audio-sdk--sofa-reference)
+
+For full license texts and attribution notices, see [**THIRD-PARTY-NOTICES.md**](THIRD-PARTY-NOTICES.md).
