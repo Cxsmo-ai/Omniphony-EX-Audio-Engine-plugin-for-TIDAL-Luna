@@ -5808,7 +5808,7 @@ function installNativeSearchInterceptor() {
       links.forEach((link) => {
         const text = (link.textContent || '').trim();
         if (!text || text.length < 3) return;
-        const isAmazon = /amazon\s*original|amazon\s*music/i.test(text);
+        const isAmazon = /amazon/i.test(text);
         if (!isAmazon) return;
         const parent = link.parentElement;
         if (!parent || parent.querySelector('.omniphony-amz-badge')) return;
@@ -5864,7 +5864,7 @@ function installNativeSearchInterceptor() {
       if (!section) {
         section = document.createElement('div');
         section.id = 'omniphony-native-amazon-search';
-        section.style.cssText = 'margin:14px 20px;padding:14px;background:#181818;border:1px solid rgba(255,153,0,0.4);border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.6);font-family:inherit;';
+        section.style.cssText = 'margin:14px 0 16px;padding:14px;background:#181818;border:1px solid rgba(255,153,0,0.45);border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.6);font-family:inherit;position:relative;z-index:5;';
         if (tabBar && tabBar.parentElement) {
           tabBar.parentElement.insertBefore(section, tabBar.nextSibling);
         } else {
