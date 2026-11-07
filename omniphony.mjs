@@ -5804,21 +5804,20 @@ function installNativeSearchInterceptor() {
 
   function badgeExistingTidalResults(upgrades = []) {
     try {
-      const rows = document.querySelectorAll('[role="row"], [data-test*="track"], [class*="trackItem"], [class*="trackRow"], [class*="tableRow"], div[class*="item"]');
-      rows.forEach((row) => {
-        if (row.closest('#omniphony-native-amazon-search')) return;
-        if (row.dataset.omniphonyAmzBadged) return;
+      document.querySelectorAll('.omniphony-amz-badge').forEach((b) => {
+        if (!b.closest('#omniphony-native-amazon-search')) b.remove();
+      });
 
-        const links = Array.from(row.querySelectorAll('a[href*="/track/"], a[href*="/album/"], a[href*="/video/"]'));
-        const titleLink = links.find((a) => !a.querySelector('img') && (a.textContent || '').trim().length > 0);
-        if (!titleLink) return;
+      const links = Array.from(document.querySelectorAll('a')).filter((a) => {
+        if (a.closest('#omniphony-native-amazon-search')) return false;
+        if (a.querySelector('img, svg')) return false;
+        const text = (a.textContent || '').trim();
+        return text.length >= 3 && /amazon/i.test(text);
+      });
 
+      links.forEach((titleLink) => {
         const text = (titleLink.textContent || '').trim();
-        const isAmazonText = /amazon/i.test(text);
         const matchingUpgrade = upgrades.find((u) => u.title && text.toLowerCase().includes(u.title.toLowerCase()));
-
-        if (!isAmazonText && !matchingUpgrade) return;
-        row.dataset.omniphonyAmzBadged = 'true';
 
         const badge = document.createElement('span');
         badge.className = 'omniphony-amz-badge';
@@ -5829,7 +5828,7 @@ function installNativeSearchInterceptor() {
           badge.style.cssText = 'display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:6px;vertical-align:middle;line-height:1;gap:3px;flex-shrink:0;width:max-content;max-width:max-content;height:16px;box-sizing:border-box;white-space:nowrap;';
           badge.innerHTML = `${amazonLogoSvg}<span>AMAZON MUSIC</span>`;
         }
-        titleLink.parentNode.insertBefore(badge, titleLink);
+        titleLink.insertAdjacentElement('beforebegin', badge);
       });
     } catch (_) {}
   }
