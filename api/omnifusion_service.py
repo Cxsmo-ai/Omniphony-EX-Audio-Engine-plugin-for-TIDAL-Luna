@@ -38,7 +38,11 @@ if VENDOR_DIR.is_dir() and str(VENDOR_DIR) not in sys.path:
 import requests
 import psutil
 
-STANDALONE_DIR = Path(__file__).resolve().parent.parent
+_cand_root = Path(__file__).resolve().parent.parent
+if not (_cand_root / "mpv").is_dir() and Path(r"C:\OmniFusion-Standalone").is_dir():
+    STANDALONE_DIR = Path(r"C:\OmniFusion-Standalone")
+else:
+    STANDALONE_DIR = _cand_root
 MPV_DIR = STANDALONE_DIR / "mpv"
 OXIDE_DIR = STANDALONE_DIR / "oxideav"
 CACHE_DIR = STANDALONE_DIR / "cache"
@@ -108,6 +112,7 @@ TRACK_STATUS_FIELDS = (
     "requestedQuality",
     "sourceQuality",
     "sourceAudioMode",
+    "sourceProvider",
     "presentation",
     "decodedSampleRate",
     "decodedChannels",
@@ -335,6 +340,10 @@ def configure_mpv_output_profile(
 
     ao_result = send_command(["get_property", "current-ao"])
     active_ao = ao_result.get("data") if mpv_command_succeeded(ao_result) else None
+    if active_ao is None and hasattr(engine, "initialize_audio_params_muted"):
+        engine.initialize_audio_params_muted(timeout=2.0)
+        ao_result = send_command(["get_property", "current-ao"])
+        active_ao = ao_result.get("data") if mpv_command_succeeded(ao_result) else None
     if active_ao != "wasapi":
         raise RuntimeError(
             f"Required WASAPI audio output is not active (current AO: {active_ao or 'unknown'})"
@@ -875,15 +884,18 @@ def get_omniphony_route_status(mpv_pid: int | None = None) -> dict:
 
     checks = {
         "studio": len(studios) == 1,
-        "renderer": True,
+        "renderer": len(renderers) == 1,
         "mpv": len(mpvs) == 1,
-        "rendererPipeConfigured": True,
+        "rendererPipeConfigured": renderer_pipe_configured,
         "orenderModuleLoaded": orender_module_loaded,
-        "studioRendererConnected": len(studios) == 1 and orender_module_loaded,
+        "studioRendererConnected": studio_renderer_connected,
         "processIdentity": process_identity_valid,
         "headphoneBinauralConfigured": studio_binaural_output_is_configured(),
     }
-    ready = (len(studios) == 1 and len(mpvs) == 1 and orender_module_loaded and checks["headphoneBinauralConfigured"] and process_identity_valid)
+    ready = omniphony_route_is_ready(
+        len(studios), len(mpvs), orender_module_loaded, studio_renderer_connected,
+        checks["headphoneBinauralConfigured"],
+    ) and process_identity_valid
     return {
         "ready": ready,
         "checks": checks,
@@ -1545,10 +1557,34 @@ class HeadlessAudioEngine:
 
         deadline = time.monotonic() + timeout
         status = {"ready": False, "checks": {}}
+        restarted_stale_studio = False
         while time.monotonic() < deadline:
             status = get_omniphony_route_status(self.proc.pid if self.proc else None)
             if status.get("ready"):
                 return status
+            checks = status.get("checks", {})
+            if (
+                not restarted_stale_studio
+                and checks.get("studio")
+                and checks.get("mpv")
+                and checks.get("orenderModuleLoaded")
+                and not checks.get("studioRendererConnected")
+                and status.get("studioPid")
+            ):
+                # Check if Studio has a self-loop on 127.0.0.1:9000 -> 127.0.0.1:9000
+                try:
+                    s_conns = psutil.Process(int(status["studioPid"])).net_connections(kind="tcp")
+                    has_self_loop = any(
+                        c.laddr and c.raddr and c.laddr.port == 9000 and c.raddr.port == 9000
+                        for c in s_conns
+                    )
+                    if has_self_loop:
+                        restarted_stale_studio = True
+                        psutil.Process(int(status["studioPid"])).terminate()
+                        time.sleep(0.3)
+                        subprocess.Popen([str(STUDIO_EXE)], cwd=str(STUDIO_EXE.parent))
+                except Exception:
+                    pass
             time.sleep(0.2)
         return status
 
@@ -1794,6 +1830,8 @@ class HeadlessAudioEngine:
                 print(f"[-] MPV command error: {e}")
                 try:
                     self.pipe.close()
+                except Ac4TransportUnavailable:
+                    raise
                 except Exception:
                     pass
                 self.pipe = None
@@ -3364,97 +3402,773 @@ class TidalDashProxy:
             self.server = None
 
 
-def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str) -> dict | None:
+_ECLIPSE_AUTH_LOCK = threading.RLock()
+_ECLIPSE_AUTH_CACHE: dict[str, object] = {
+    "jwt": None,
+    "addon_tokens": {},
+    "search_cache": {},
+    "stream_cache": {},
+    "tido_manifest_url": None,
+}
+ECLIPSE_SESSION_FILE = CONFIG_DIR / "eclipse-session.json"
+DEFAULT_TIDO_ECLIPSE_MANIFEST = "https://tido.tido.tido.rickyaddons.dpdns.org/bd6335b8e3c74a388134bf5f5bc3b3df/manifest.json"
+DEFAULT_TIDO_ECLIPSE_ROOT = "https://tido.tido.tido.rickyaddons.dpdns.org"
+
+
+def _get_eclipse_jwt(force_refresh: bool = False) -> str | None:
+    """Acquire or load cached Eclipse session JWT for addon access."""
+    with _ECLIPSE_AUTH_LOCK:
+        if not force_refresh and isinstance(_ECLIPSE_AUTH_CACHE.get("jwt"), str) and _ECLIPSE_AUTH_CACHE["jwt"]:
+            return str(_ECLIPSE_AUTH_CACHE["jwt"])
+        if not force_refresh and ECLIPSE_SESSION_FILE.is_file():
+            try:
+                saved = json.loads(ECLIPSE_SESSION_FILE.read_text(encoding="utf-8"))
+                token = saved.get("jwt")
+                if isinstance(token, str) and token.strip():
+                    _ECLIPSE_AUTH_CACHE["jwt"] = token.strip()
+                    return token.strip()
+            except Exception:
+                pass
+
+        creds = {
+            "name": "OmniUser",
+            "email": "omni_test_user_7721@test.com",
+            "password": "Password123!",
+        }
+        if ECLIPSE_SESSION_FILE.is_file():
+            try:
+                saved = json.loads(ECLIPSE_SESSION_FILE.read_text(encoding="utf-8"))
+                if isinstance(saved.get("email"), str) and saved.get("email"):
+                    creds["email"] = saved["email"]
+                if isinstance(saved.get("password"), str) and saved.get("password"):
+                    creds["password"] = saved["password"]
+            except Exception:
+                pass
+
+        payload = json.dumps(creds).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        jwt_token = None
+        for auth_ep in (
+            "https://api.eclipsemusic.app/api/auth/mobile/login",
+            "https://api.eclipsemusic.app/api/auth/mobile/signup",
+        ):
+            try:
+                req = urllib.request.Request(auth_ep, data=payload, headers=headers)
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+                    candidate = res.get("token")
+                    if isinstance(candidate, str) and candidate.strip():
+                        jwt_token = candidate.strip()
+                        break
+            except Exception:
+                continue
+
+        if jwt_token:
+            _ECLIPSE_AUTH_CACHE["jwt"] = jwt_token
+            try:
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                ECLIPSE_SESSION_FILE.write_text(
+                    json.dumps({**creds, "jwt": jwt_token}, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        return jwt_token
+
+
+def _get_eclipse_addon_access_token(addon_id: str = "com.yourname.amazonmusic", force_refresh: bool = False) -> str | None:
+    """Mint a short-lived X-Eclipse-Access token for an Eclipse addon."""
+    now = time.time()
+    with _ECLIPSE_AUTH_LOCK:
+        addon_tokens = _ECLIPSE_AUTH_CACHE.setdefault("addon_tokens", {})
+        if not force_refresh and isinstance(addon_tokens, dict):
+            entry = addon_tokens.get(addon_id)
+            if isinstance(entry, dict):
+                token = entry.get("token")
+                expires_at = float(entry.get("expires_at") or 0)
+                if isinstance(token, str) and token and now < expires_at - 20:
+                    return token
+
+        for attempt in range(2):
+            jwt_token = _get_eclipse_jwt(force_refresh=(attempt > 0 or force_refresh))
+            if not jwt_token:
+                return None
+            token_url = f"https://api.eclipsemusic.app/api/addon-access/token?addon={urllib.parse.quote(addon_id)}"
+            req = urllib.request.Request(
+                token_url,
+                data=b"",
+                headers={
+                    "Authorization": f"Bearer {jwt_token}",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    addon_token = data.get("token")
+                    expires_in = float(data.get("expiresIn") or 300)
+                    if isinstance(addon_token, str) and addon_token.strip():
+                        addon_token = addon_token.strip()
+                        if isinstance(addon_tokens, dict):
+                            addon_tokens[addon_id] = {
+                                "token": addon_token,
+                                "expires_at": time.time() + expires_in,
+                            }
+                        return addon_token
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403) and attempt == 0:
+                    continue
+                break
+            except Exception:
+                break
+        return None
+
+
+def _is_tido_eclipse_addon(addon_manifest_url: str) -> bool:
+    """Return True if the manifest URL points to the Tido TIDAL Eclipse addon."""
+    u = (addon_manifest_url or "").strip().lower()
+    return "tido.rickyaddons" in u or "com.yourname.tidal.hifi" in u
+
+
+def _resolve_tido_manifest_url(url_or_root: str) -> str:
+    """Normalize a Tido root URL or manifest URL into a full tokenized manifest URL."""
+    u = (url_or_root or "").strip()
+    if not u:
+        return DEFAULT_TIDO_ECLIPSE_MANIFEST
+    if u.endswith("/manifest.json"):
+        return u
+    u_stripped = u.rstrip("/")
+    if u_stripped.lower() == DEFAULT_TIDO_ECLIPSE_ROOT.lower():
+        cached = _ECLIPSE_AUTH_CACHE.get("tido_manifest_url")
+        if isinstance(cached, str) and cached.endswith("/manifest.json"):
+            return cached
+        return DEFAULT_TIDO_ECLIPSE_MANIFEST
+    return f"{u_stripped}/manifest.json"
+
+
+def _eclipse_worker_base_url(addon_manifest_url: str) -> str:
+    """Resolve the base worker URL for an Eclipse addon.
+
+    AMZM routes work at the domain root (or token prefix), whereas Tido requires
+    the token prefix path segment before /search and /stream/{id}.
+    """
+    u = (addon_manifest_url or "").strip()
+    if _is_tido_eclipse_addon(u):
+        manifest_full = _resolve_tido_manifest_url(u)
+        return manifest_full.rsplit("/manifest.json", 1)[0].rstrip("/")
+    parsed = urllib.parse.urlsplit(u)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    base = u.rsplit("/manifest.json", 1)[0]
+    return base.rstrip("/")
+
+
+def is_main_tidal_api_authorized() -> bool:
+    """Return True when the main EbbLabs python-tidal session is authorized and usable."""
+    for sess_getter in (get_python_tidal_session, get_python_tidal_mobile_session, get_python_tidal_tv_session):
+        try:
+            sess = sess_getter()
+            if sess is not None:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _probe_direct_audio_bitrate(url: str, duration: float, headers: dict[str, str]) -> tuple[int | None, str | None]:
+    """Compute average bitrate from HTTP Content-Range total byte length and duration."""
+    if not url or not duration or duration <= 0:
+        return None, None
     try:
-        base = addon_manifest_url.rsplit('/manifest.json', 1)[0]
-        url = f'{base}/isrc/track/{isrc}.json'
-        req = urllib.request.Request(url, headers={'User-Agent': 'Eclipse/1.0.0'})
-        with urllib.request.urlopen(req, timeout=3) as r:
-            data = json.loads(r.read().decode())
-            for s in data.get('streams', []):
-                if s.get('format') == requested_fmt:
-                    return {
-                        'format': s['format'],
-                        'codec': str(s.get('sourceCodec') or 'flac').lower(),
-                        'label': s.get('title', 'Eclipse Addon Stream'),
-                        'uri': s['url'],
-                        'transport': 'DIRECT',
-                        'sourceCodec': s.get('sourceCodec', 'FLAC'),
-                        'sourceBitrate': s.get('sourceBitrate'),
-                        'sourceSampleRate': s.get('sourceSampleRate', 44100),
-                        'sourceChannels': s.get('sourceChannels', 2),
-                        'sourceBitDepth': s.get('sourceBitDepth', 16),
-                        'sourceProvider': s.get('provider', 'AMAZON'),
-                    }
-    except Exception as e:
+        probe_headers = {**headers, "Range": "bytes=0-0"}
+        req = urllib.request.Request(url, headers=probe_headers)
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            content_range = resp.headers.get("Content-Range") or ""
+            total_bytes = 0
+            if "/" in content_range:
+                tail = content_range.rsplit("/", 1)[-1].strip()
+                if tail.isdigit():
+                    total_bytes = int(tail)
+            if total_bytes <= 0:
+                cl = resp.headers.get("Content-Length") or ""
+                if cl.isdigit():
+                    total_bytes = int(cl)
+            if total_bytes > 1024:
+                bitrate = int(round((total_bytes * 8) / float(duration)))
+                if 32000 <= bitrate <= 25000000:
+                    return bitrate, "HTTP Content-Range average"
+    except Exception:
         pass
+    return None, None
+
+
+def _select_eclipse_search_track(tracks: list[dict], title: str, artist: str, requested_fmt: str, isrc: str = "", duration: int | float = 0) -> dict | None:
+    """Select the best matching track from Eclipse search results."""
+    valid = [t for t in tracks if isinstance(t, dict) and t.get("id")]
+    if not valid:
+        return None
+    norm_title = re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
+    norm_artist = re.sub(r"[^a-z0-9]+", " ", (artist or "").lower()).strip()
+    norm_isrc = (isrc or "").strip().upper()
+    target_dur = float(duration or 0)
+
+    def score(item: dict) -> tuple[int, int, int, int, int]:
+        item_isrc = str(item.get("isrc") or "").strip().upper()
+        isrc_match = 1 if (norm_isrc and item_isrc == norm_isrc) else 0
+        t_title = re.sub(r"[^a-z0-9]+", " ", str(item.get("title") or "").lower()).strip()
+        t_artist = re.sub(r"[^a-z0-9]+", " ", str(item.get("artist") or "").lower()).strip()
+        exact_title = 2 if (norm_title and t_title == norm_title) else (1 if (norm_title and (norm_title in t_title or t_title in norm_title)) else 0)
+        item_dur = float(item.get("duration") or 0)
+        dur_match = 1 if (target_dur > 0 and item_dur > 0 and abs(item_dur - target_dur) <= 6) else 0
+        artist_match = 1 if (norm_artist and (norm_artist in t_artist or t_artist in norm_artist)) else 0
+        atmos_pref = 1 if (requested_fmt == "EAC3_JOC" and (item.get("atmosAvailable") or item.get("isAtmos"))) else 0
+        return (isrc_match, exact_title, dur_match, artist_match, atmos_pref)
+
+    best = max(valid, key=score)
+    return best
+
+
+def resolve_tido_eclipse_addon(
+    addon_manifest_url: str,
+    tidal_track_id: int | str,
+    requested_fmt: str,
+    title: str = "",
+    artist: str = "",
+    isrc: str = "",
+    duration: int | float = 0,
+) -> dict | None:
+    """Resolve TIDAL streams (EAC3_JOC, HI_RES_LOSSLESS, LOSSLESS) via the Tido Eclipse addon when main API is unauthorized."""
+    if requested_fmt == "AC4_IMS":
+        return None
+    try:
+        base = _eclipse_worker_base_url(addon_manifest_url)
+        addon_token = _get_eclipse_addon_access_token("com.yourname.tidal.hifi")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "X-Client-Platform": "web",
+            "Origin": "https://eclipsemusic.app",
+            "Referer": "https://eclipsemusic.app/",
+        }
+        if addon_token:
+            headers["X-Eclipse-Access"] = addon_token
+
+        def _fetch_json(url: str, timeout: float = 6.0) -> dict | list | None:
+            for attempt in range(2):
+                req = urllib.request.Request(url, headers=headers)
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        return json.loads(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as exc:
+                    if exc.code in (401, 403) and attempt == 0:
+                        refreshed = _get_eclipse_addon_access_token("com.yourname.tidal.hifi", force_refresh=True)
+                        if refreshed:
+                            headers["X-Eclipse-Access"] = refreshed
+                            continue
+                    return None
+                except Exception:
+                    return None
+            return None
+
+        quality_map = {
+            "EAC3_JOC": "MAX",
+            "HI_RES_LOSSLESS": "HIRES",
+            "LOSSLESS": "LOSSLESS",
+        }
+        quality_param = quality_map.get(requested_fmt)
+        if not quality_param:
+            return None
+
+        candidate_ids = [str(tidal_track_id)] if tidal_track_id else []
+        if title:
+            now = time.time()
+            search_cache = _ECLIPSE_AUTH_CACHE.setdefault("search_cache", {})
+            lookup_key = f"tido|{base}|{(title or '').strip().lower()}|{(artist or '').strip().lower()}"
+            cached_tracks = None
+            if isinstance(search_cache, dict):
+                entry = search_cache.get(lookup_key)
+                if isinstance(entry, dict) and now < float(entry.get("expires_at") or 0):
+                    cached_tracks = entry.get("tracks")
+            if not isinstance(cached_tracks, list):
+                query = f"{title} {artist}".strip()
+                s_res = _fetch_json(f"{base}/search?q={urllib.parse.quote(query)}", timeout=5.0)
+                cached_tracks = s_res.get("tracks", []) if isinstance(s_res, dict) else (s_res if isinstance(s_res, list) else [])
+                if isinstance(search_cache, dict) and isinstance(cached_tracks, list):
+                    search_cache[lookup_key] = {"tracks": cached_tracks, "expires_at": now + 600.0}
+            if isinstance(cached_tracks, list):
+                norm_title = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+                for item in cached_tracks:
+                    if not isinstance(item, dict) or not item.get("id"):
+                        continue
+                    cid = str(item["id"])
+                    if cid in candidate_ids:
+                        continue
+                    t_title = re.sub(r"[^a-z0-9]+", " ", str(item.get("title") or "").lower()).strip()
+                    if norm_title and (t_title == norm_title or norm_title in t_title):
+                        if requested_fmt == "EAC3_JOC" and item.get("isAtmos"):
+                            candidate_ids.insert(1 if candidate_ids else 0, cid)
+                        else:
+                            candidate_ids.append(cid)
+
+        for cid in candidate_ids[:4]:
+            stream_url = f"{base}/stream/{urllib.parse.quote(cid)}?quality={urllib.parse.quote(quality_param)}&videosEnabled=false"
+            s_data = _fetch_json(stream_url, timeout=8.0)
+            if not isinstance(s_data, dict) or not s_data.get("url"):
+                continue
+
+            raw_codec = str(s_data.get("codec") or "").strip().lower()
+            tier = str(s_data.get("tier") or "").strip().upper()
+            quality_label = str(s_data.get("quality") or s_data.get("format") or "").strip()
+            sample_rate = int(s_data.get("sampleRate") or (48000 if "eac3" in raw_codec or "ec-3" in raw_codec else 44100))
+            bit_depth_raw = s_data.get("bitDepth")
+            bit_depth = int(bit_depth_raw) if isinstance(bit_depth_raw, (int, float)) and int(bit_depth_raw) > 0 else None
+
+            is_atmos = (
+                tier == "EAC3_JOC"
+                or "eac3" in raw_codec
+                or "ec-3" in raw_codec
+                or "joc" in raw_codec
+                or "atmos" in quality_label.lower()
+            )
+            is_hires = not is_atmos and (tier == "FLAC_HIRES" or sample_rate > 48000 or (bit_depth is not None and bit_depth > 16))
+
+            if is_atmos:
+                stream_fmt = "EAC3_JOC"
+            elif is_hires:
+                stream_fmt = "HI_RES_LOSSLESS"
+            else:
+                stream_fmt = "LOSSLESS"
+
+            if requested_fmt and stream_fmt != requested_fmt:
+                continue
+
+            media_url = str(s_data["url"])
+            if ".mpd" in media_url.lower():
+                req_mpd = urllib.request.Request(media_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req_mpd, timeout=8.0) as mpd_resp:
+                    manifest_xml = mpd_resp.read().decode("utf-8-sig")
+                if dash_manifest_contains_content_protection(manifest_xml):
+                    continue
+                dash = get_tidal_dash_audio_metadata(manifest_xml=manifest_xml)
+                validated_xml = dash.get("manifestXml")
+                segment_urls = dash.get("segmentUrls")
+                if not validated_xml or not isinstance(segment_urls, list) or len(segment_urls) < 2:
+                    continue
+
+                if is_atmos:
+                    evidence = verify_eac3_joc_manifest(validated_xml)
+                    return {
+                        "format": "EAC3_JOC",
+                        "codec": "eac3_joc",
+                        "sourceAuthProfile": "tido_eclipse_addon",
+                        "label": "Dolby Atmos (E-AC-3 JOC)",
+                        "uri": segment_urls[0],
+                        "transport": "DASH",
+                        "sourceCodec": evidence["sourceCodec"],
+                        "sourceManifestFormat": evidence["sourceManifestFormat"],
+                        "sourceBitrate": evidence["sourceBitrate"],
+                        "sourceBitrateBasis": dash.get("sourceBitrateBasis"),
+                        "sourceSampleRate": dash.get("sourceSampleRate") or 48000,
+                        "sourceChannels": dash.get("sourceChannels") or 6,
+                        "sourceBitDepth": dash.get("sourceBitDepth"),
+                        "sourceAudioMode": "DOLBY_ATMOS",
+                        "sourceProvider": "TIDAL",
+                        "manifestXml": validated_xml,
+                        "segmentUrls": segment_urls,
+                        "requestSession": requests.Session(),
+                    }
+                else:
+                    label = "Hi-Res FLAC" if stream_fmt == "HI_RES_LOSSLESS" else "Lossless FLAC"
+                    return {
+                        "format": stream_fmt,
+                        "codec": "flac",
+                        "sourceAuthProfile": "tido_eclipse_addon",
+                        "label": label,
+                        "uri": segment_urls[0],
+                        "transport": "DASH",
+                        "sourceCodec": "FLAC",
+                        "sourceManifestFormat": dash.get("sourceManifestFormat"),
+                        "sourceBitrate": dash.get("sourceBitrate"),
+                        "sourceBitrateBasis": dash.get("sourceBitrateBasis"),
+                        "sourceSampleRate": dash.get("sourceSampleRate") or sample_rate,
+                        "sourceChannels": dash.get("sourceChannels") or 2,
+                        "sourceBitDepth": dash.get("sourceBitDepth") or bit_depth or (24 if stream_fmt == "HI_RES_LOSSLESS" else 16),
+                        "sourceQuality": stream_fmt,
+                        "sourceAudioMode": "STEREO",
+                        "sourceProvider": "TIDAL",
+                        "manifestXml": validated_xml,
+                        "segmentUrls": segment_urls,
+                        "requestSession": requests.Session(),
+                    }
+            else:
+                probed_br, br_basis = _probe_direct_audio_bitrate(media_url, float(duration or 0), headers)
+                return {
+                    "format": stream_fmt,
+                    "codec": "eac3_joc" if is_atmos else "flac",
+                    "sourceAuthProfile": "tido_eclipse_addon",
+                    "label": "Dolby Atmos (E-AC-3 JOC)" if is_atmos else ("Hi-Res FLAC" if is_hires else "Lossless FLAC"),
+                    "uri": media_url,
+                    "transport": "DIRECT",
+                    "sourceCodec": "EAC3_JOC" if is_atmos else "FLAC",
+                    "sourceBitrate": probed_br or (768000 if is_atmos else 1411200),
+                    "sourceBitrateBasis": br_basis or "Estimated",
+                    "sourceSampleRate": sample_rate,
+                    "sourceChannels": 6 if is_atmos else 2,
+                    "sourceBitDepth": None if is_atmos else (bit_depth or (24 if is_hires else 16)),
+                    "sourceQuality": quality_label or stream_fmt,
+                    "sourceAudioMode": "DOLBY_ATMOS" if is_atmos else "STEREO",
+                    "sourceProvider": "TIDAL",
+                }
+    except Exception as exc:
+        print(f"[-] Tido Eclipse addon resolution error ({requested_fmt}): {exc}")
     return None
 
-def resolve_with_priority(track_id: int, priority_list: list[str]) -> dict:
+def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str, title: str = "", artist: str = "", duration: int | float = 0) -> dict | None:
+    """Resolve streams from Eclipse Music addons adhering strictly to the official Eclipse specification."""
+    if requested_fmt == "AC4_IMS":
+        return None
+    if _is_tido_eclipse_addon(addon_manifest_url):
+        return resolve_tido_eclipse_addon(addon_manifest_url, isrc, requested_fmt, title=title, artist=artist, isrc=isrc, duration=duration)
+    try:
+        base = _eclipse_worker_base_url(addon_manifest_url)
+        addon_token = _get_eclipse_addon_access_token("com.yourname.amazonmusic")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "X-Client-Platform": "web",
+            "Origin": "https://eclipsemusic.app",
+            "Referer": "https://eclipsemusic.app/",
+        }
+        if addon_token:
+            headers["X-Eclipse-Access"] = addon_token
+
+        def _fetch_json(url: str, timeout: float = 5.0) -> dict | list | None:
+            for attempt in range(2):
+                req = urllib.request.Request(url, headers=headers)
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        return json.loads(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as exc:
+                    if exc.code in (401, 403) and attempt == 0:
+                        refreshed = _get_eclipse_addon_access_token("com.yourname.amazonmusic", force_refresh=True)
+                        if refreshed:
+                            headers["X-Eclipse-Access"] = refreshed
+                            continue
+                    return None
+                except Exception:
+                    return None
+            return None
+
+        now = time.time()
+        search_cache = _ECLIPSE_AUTH_CACHE.setdefault("search_cache", {})
+        stream_cache = _ECLIPSE_AUTH_CACHE.setdefault("stream_cache", {})
+        lookup_key = f"{base}|{isrc or ''}|{(title or '').strip().lower()}|{(artist or '').strip().lower()}"
+
+        track_id = None
+        matched_track_meta: dict = {}
+        cached_lookup = search_cache.get(lookup_key) if isinstance(search_cache, dict) else None
+        if isinstance(cached_lookup, dict) and now < float(cached_lookup.get("expires_at") or 0):
+            track_id = cached_lookup.get("track_id")
+            matched_track_meta = cached_lookup.get("meta") or {}
+
+        # 1. Primary lookup: GET /search?q={query} when title is known (fastest & most reliable on AMZM worker)
+        if not track_id and (title or isrc):
+            query = f"{title} {artist}".strip() if title else isrc
+            search_url = f"{base}/search?q={urllib.parse.quote(query)}"
+            data = _fetch_json(search_url, timeout=5.0)
+            if isinstance(data, dict):
+                tracks = data.get("tracks") or data.get("results") or []
+            elif isinstance(data, list):
+                tracks = data
+            else:
+                tracks = []
+            if isinstance(tracks, list) and tracks:
+                chosen = _select_eclipse_search_track(tracks, title, artist, requested_fmt, isrc=isrc, duration=duration)
+                if chosen:
+                    track_id = chosen.get("id")
+                    matched_track_meta = chosen
+
+        # 2. Fallback Spec 7: ISRC resolution -> GET /resolve-isrc/{isrc}
+        if not track_id and isrc:
+            for isrc_url in (
+                f"{base}/resolve-isrc/{urllib.parse.quote(isrc)}",
+                f"{base}/resolve-isrc?isrc={urllib.parse.quote(isrc)}",
+            ):
+                data = _fetch_json(isrc_url, timeout=4.0)
+                if isinstance(data, dict):
+                    track_id = data.get("trackId") or data.get("id")
+                    if track_id:
+                        break
+
+        # 3. Fallback Spec 11: Universal Resolve -> GET /resolve
+        if not track_id and (isrc or title):
+            params = {"isrc": isrc or "", "title": title or "", "artist": artist or ""}
+            resolve_url = f"{base}/resolve?{urllib.parse.urlencode(params)}"
+            data = _fetch_json(resolve_url, timeout=4.0)
+            if isinstance(data, dict):
+                item = data.get("item")
+                if isinstance(item, dict) and item.get("id"):
+                    track_id = item.get("id")
+                    matched_track_meta = item
+
+        if track_id and isinstance(search_cache, dict):
+            search_cache[lookup_key] = {
+                "track_id": track_id,
+                "meta": matched_track_meta,
+                "expires_at": now + 600.0,
+            }
+
+        # 4. Spec 3: Stream Resolution -> GET /stream/{id}?quality={quality}
+        target_id = track_id or isrc
+        if not target_id:
+            return None
+
+        quality_map = {
+            "EAC3_JOC": "Atmos_EC-3",
+            "HI_RES_LOSSLESS": "Max",
+            "LOSSLESS": "Max",
+        }
+        quality_param = quality_map.get(requested_fmt, "Max")
+        stream_cache_key = f"{base}|{target_id}|{quality_param}"
+        s_data = None
+        if isinstance(stream_cache, dict):
+            cached_s = stream_cache.get(stream_cache_key)
+            if isinstance(cached_s, dict) and now < float(cached_s.get("expires_at") or 0):
+                s_data = cached_s.get("data")
+
+        if not isinstance(s_data, dict):
+            stream_url = f"{base}/stream/{urllib.parse.quote(str(target_id))}?quality={urllib.parse.quote(quality_param)}"
+            s_data = _fetch_json(stream_url, timeout=6.0)
+            if isinstance(s_data, dict) and isinstance(stream_cache, dict):
+                stream_cache[stream_cache_key] = {
+                    "data": s_data,
+                    "expires_at": now + 120.0,
+                }
+                # If Atmos_EC-3 fell back to FLAC on the server, it is identical to the Max FLAC response
+                codec_check = str(s_data.get("codec") or s_data.get("format") or "").lower()
+                if quality_param == "Atmos_EC-3" and "flac" in codec_check and "atmos" not in codec_check:
+                    stream_cache[f"{base}|{target_id}|Max"] = {
+                        "data": s_data,
+                        "expires_at": now + 120.0,
+                    }
+
+        if not isinstance(s_data, dict):
+            return None
+
+        # If LOSSLESS was explicitly requested and Max returned >48kHz/24-bit, request 16-bit/44.1kHz Lossless specifically
+        if requested_fmt == "LOSSLESS":
+            sr_check = int(s_data.get("sampleRate") or 44100)
+            bd_check = int(s_data.get("bitDepth") or 16)
+            if sr_check > 48000 or bd_check > 16:
+                lossless_url = f"{base}/stream/{urllib.parse.quote(str(target_id))}?quality=Lossless"
+                lossless_data = _fetch_json(lossless_url, timeout=6.0)
+                if isinstance(lossless_data, dict):
+                    s_data = lossless_data
+
+        streams = s_data.get("streams") if isinstance(s_data.get("streams"), list) else [s_data]
+        for s in streams:
+            if not isinstance(s, dict) or not s.get("url"):
+                continue
+            raw_codec = str(s.get("codec") or s.get("format") or "flac").strip().lower()
+            quality_label = str(s.get("quality") or s.get("format") or "").strip()
+            sample_rate = int(s.get("sampleRate") or 48000 if "ec-3" in raw_codec or "eac3" in raw_codec else int(s.get("sampleRate") or 44100))
+            is_atmos = (
+                "ec-3" in raw_codec
+                or "eac3" in raw_codec
+                or "joc" in raw_codec
+                or "atmos" in quality_label.lower()
+                or "atmos" in str(s.get("format") or "").lower()
+            )
+            bit_depth_raw = s.get("bitDepth")
+            bit_depth = int(bit_depth_raw) if isinstance(bit_depth_raw, (int, float)) and int(bit_depth_raw) > 0 else (None if is_atmos else (24 if sample_rate > 48000 else 16))
+            is_hires = not is_atmos and (sample_rate > 48000 or (bit_depth is not None and bit_depth > 16))
+
+            if is_atmos:
+                stream_fmt = "EAC3_JOC"
+            elif is_hires:
+                stream_fmt = "HI_RES_LOSSLESS"
+            else:
+                stream_fmt = "LOSSLESS"
+
+            if requested_fmt and stream_fmt != requested_fmt:
+                continue
+
+            duration = float(s.get("duration") or matched_track_meta.get("duration") or 0)
+            probed_bitrate, bitrate_basis = _probe_direct_audio_bitrate(s["url"], duration, headers)
+            explicit_bitrate = s.get("bitrate")
+            if isinstance(explicit_bitrate, (int, float)) and explicit_bitrate > 0:
+                source_bitrate = int(explicit_bitrate)
+                source_bitrate_basis = "Addon reported"
+            elif probed_bitrate:
+                source_bitrate = probed_bitrate
+                source_bitrate_basis = bitrate_basis
+            elif is_atmos:
+                source_bitrate = 768000
+                source_bitrate_basis = "Estimated E-AC-3 JOC"
+            else:
+                channels_est = int(s.get("channels") or 2)
+                depth_est = bit_depth or 16
+                source_bitrate = int(sample_rate * depth_est * channels_est * 0.65)
+                source_bitrate_basis = "Estimated FLAC"
+
+            if is_atmos:
+                human_label = "[AMAZON] Dolby Atmos (E-AC-3 JOC)"
+                norm_codec = "eac3_joc"
+                source_codec = "EAC3_JOC"
+                source_audio_mode = "DOLBY_ATMOS"
+                channels = int(s.get("channels") or 6)
+            elif is_hires:
+                human_label = f"[AMAZON] Hi-Res FLAC ({bit_depth}-bit/{sample_rate / 1000:g}kHz)"
+                norm_codec = "flac"
+                source_codec = "FLAC"
+                source_audio_mode = "STEREO"
+                channels = int(s.get("channels") or 2)
+            else:
+                human_label = "[AMAZON] Lossless FLAC"
+                norm_codec = "flac"
+                source_codec = "FLAC"
+                source_audio_mode = "STEREO"
+                channels = int(s.get("channels") or 2)
+
+            return {
+                "format": stream_fmt,
+                "codec": norm_codec,
+                "label": human_label,
+                "uri": s["url"],
+                "transport": "DIRECT",
+                "sourceCodec": source_codec,
+                "sourceBitrate": source_bitrate,
+                "sourceBitrateBasis": source_bitrate_basis,
+                "sourceSampleRate": sample_rate,
+                "sourceChannels": channels,
+                "sourceBitDepth": bit_depth,
+                "sourceQuality": quality_label or stream_fmt,
+                "sourceAudioMode": source_audio_mode,
+                "sourceProvider": "AMAZON",
+                "sourceAuthProfile": "eclipse_addon",
+            }
+    except Exception as exc:
+        print(f"[-] Eclipse addon resolution error ({requested_fmt}): {exc}")
+    return None
+
+
+def resolve_with_priority(track_id: int, priority_list: list[str], title_hint: str = "", artist_hint: str = "") -> dict:
     resolvers = {
         "EAC3_JOC": lambda tid: resolve_eac3_joc(tid),
         "AC4_IMS": lambda tid: resolve_ac4_ims(tid),
         "HI_RES_LOSSLESS": lambda tid: resolve_hi_res_or_lossless(tid, "HI_RES_LOSSLESS"),
         "LOSSLESS": lambda tid: resolve_hi_res_or_lossless(tid, "LOSSLESS"),
     }
-    
+
     # Track candidate cache: clicked track is always evaluated
     candidate_ids = [track_id]
     settings = load_settings()
-    eclipse_addons = settings.get("eclipse_addons", [])
+    raw_eclipse_addons = settings.get("eclipse_addons", [])
+    amazon_addons = [u for u in raw_eclipse_addons if isinstance(u, str) and u.strip() and not _is_tido_eclipse_addon(u)]
+    configured_tido_addons = [u for u in raw_eclipse_addons if isinstance(u, str) and u.strip() and _is_tido_eclipse_addon(u)]
+    tido_manifest = configured_tido_addons[0] if configured_tido_addons else DEFAULT_TIDO_ECLIPSE_MANIFEST
+
     source_mode = settings.get("realmax_source", "auto")
+    main_api_authorized = is_main_tidal_api_authorized()
     track_isrc = None
-    try:
-        import tidalapi
-        sess = get_python_tidal_mobile_session()
-        t_obj = sess.track(track_id)
-        track_isrc = getattr(t_obj, "isrc", None)
-    except Exception:
-        pass
-    
+    track_title = title_hint or ""
+    track_artist = artist_hint or ""
+    orig = None
+
+    if main_api_authorized:
+        try:
+            import tidalapi
+            for sess_getter in (get_python_tidal_session, get_python_tidal_mobile_session):
+                try:
+                    sess = sess_getter()
+                except Exception:
+                    sess = None
+                if not sess:
+                    continue
+                try:
+                    orig = sess.track(int(track_id))
+                    if orig:
+                        track_isrc = getattr(orig, "isrc", None) or track_isrc
+                        full_name = getattr(orig, "full_name", None)
+                        if isinstance(full_name, str) and full_name.strip():
+                            track_title = full_name.strip()
+                        elif getattr(orig, "name", None):
+                            ver = getattr(orig, "version", None)
+                            track_title = f"{orig.name} ({ver})" if isinstance(ver, str) and ver.strip() and ver.lower() not in orig.name.lower() else orig.name
+                        if getattr(orig, "artist", None) and getattr(orig.artist, "name", None):
+                            track_artist = orig.artist.name
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
     # RealMAX cross-edition discovery: find alternate album releases (Atmos editions, Deluxe Hi-Res, etc.)
-    try:
-        import tidalapi
-        session = get_python_tidal_mobile_session()
-        if session:
-            orig = session.track(track_id)
-            if orig and orig.name:
-                artist_name = getattr(orig.artist, "name", "") if getattr(orig, "artist", None) else ""
-                query = f"{orig.name} {artist_name}".strip()
+    if source_mode != "amazon_only" and main_api_authorized:
+        try:
+            import tidalapi
+            session = None
+            for sess_getter in (get_python_tidal_session, get_python_tidal_mobile_session):
+                try:
+                    session = sess_getter()
+                    if session:
+                        break
+                except Exception:
+                    continue
+            if session and orig and getattr(orig, "name", None):
+                query = f"{track_title} {track_artist}".strip()
                 search_res = session.search(query, models=[tidalapi.media.Track], limit=20)
                 for cand in search_res.get("tracks", []):
                     if cand.id != track_id and cand.name.lower() == orig.name.lower() and abs(cand.duration - orig.duration) <= 6:
                         candidate_ids.append(cand.id)
-    except Exception as exc:
-        print(f"[-] RealMAX candidate search error: {exc}")
+        except Exception as exc:
+            print(f"[-] RealMAX candidate search error: {exc}")
 
     # Evaluate each format in user's strict priority order
     for fmt in priority_list:
         if fmt not in resolvers:
             continue
-        if track_isrc and eclipse_addons and source_mode != "tidal_only":
+        if (track_isrc or track_title) and amazon_addons and source_mode != "tidal_only":
             # Amazon Music does not carry Dolby AC-4 IMS; skip AC4_IMS for Amazon queries
             if fmt != "AC4_IMS":
-                for addon_url in eclipse_addons:
-                    addon_res = resolve_eclipse_addon(addon_url, track_isrc, fmt)
+                for addon_url in amazon_addons:
+                    addon_res = resolve_eclipse_addon(addon_url, track_isrc or "", fmt, track_title, track_artist, duration=getattr(orig, "duration", 0) if orig else 0)
                     if addon_res:
                         print(f"[RealMAX] Selected Eclipse addon {addon_res.get('sourceProvider')} stream for {track_id} ({fmt})")
                         return addon_res
         if source_mode != "amazon_only":
-            for tid in candidate_ids:
-                try:
-                    res = resolvers[fmt](tid)
-                    if res:
-                        if tid == track_id:
-                            print(f"[+] Track {track_id} resolved directly as: {fmt}")
-                        else:
-                            print(f"[RealMAX] Upgraded track {track_id} -> {tid} as: {fmt}")
-                        return res
-                except Exception as e:
-                    pass
+            if main_api_authorized:
+                for tid in candidate_ids:
+                    try:
+                        res = resolvers[fmt](tid)
+                        if res:
+                            if tid == track_id:
+                                print(f"[+] Track {track_id} resolved directly as: {fmt}")
+                            else:
+                                print(f"[RealMAX] Upgraded track {track_id} -> {tid} as: {fmt}")
+                            return res
+                    except Ac4TransportUnavailable:
+                        raise
+                    except Exception:
+                        pass
+            elif fmt != "AC4_IMS":
+                # Main TIDAL API is not authorized: use Tido Eclipse addon for EAC3_JOC, HI_RES_LOSSLESS, and LOSSLESS
+                tido_res = resolve_tido_eclipse_addon(
+                    tido_manifest,
+                    track_id,
+                    fmt,
+                    title=track_title,
+                    artist=track_artist,
+                    isrc=track_isrc or "",
+                )
+                if tido_res:
+                    print(f"[RealMAX] Selected Tido Eclipse fallback stream for {track_id} ({fmt})")
+                    return tido_res
 
     raise RuntimeError(f"Could not resolve any audio stream for track {track_id}")
-
 
 
 active_login_flow = {
@@ -3551,11 +4265,17 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
     def reject_untrusted_origin(self, require_origin=False):
         origin = self.headers.get("Origin")
-        if origin is None:
+        if origin is None and not require_origin:
             return False
-        if origin in ALLOWED_BROWSER_ORIGINS or origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1") or origin.startswith("tidal:") or origin.startswith("file:"):
+        if isinstance(origin, str) and (
+            origin in ALLOWED_BROWSER_ORIGINS
+            or origin.startswith("http://localhost")
+            or origin.startswith("http://127.0.0.1")
+            or origin.startswith("tidal:")
+            or origin.startswith("file:")
+        ):
             return False
-        self.send_json({"error": f"origin {origin} is not allowed"}, status=403)
+        self.send_json({"error": "origin is not allowed"}, status=403)
         return True
 
     def do_OPTIONS(self):
@@ -4069,7 +4789,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             device = settings.get("audio_device", "auto")
 
             try:
-                stream_info = resolve_with_priority(int(track_id), priority)
+                stream_info = resolve_with_priority(int(track_id), priority, title_hint=title, artist_hint=artist)
             except RuntimeError as exc:
                 return self.send_json({
                     "error": str(exc),

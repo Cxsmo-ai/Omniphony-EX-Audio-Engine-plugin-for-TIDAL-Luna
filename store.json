@@ -1,0 +1,10 @@
+{
+  "name": "Omniphony EX Audio Engine",
+  "description": "Ultra-native RealMax stream resolving, deep Web Audio detachment preserving live lyrics, and headless libmpv spatial playback.",
+  "type": "module",
+  "author": "Pickymarker",
+  "version": "2.0.2",
+  "plugins": [
+    "omniphony.mjs"
+  ]
+}

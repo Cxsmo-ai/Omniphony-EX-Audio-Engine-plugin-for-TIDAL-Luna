@@ -5220,15 +5220,26 @@ function toggleSettingsPanel() {
       addonStatus.innerText = "Please enter a valid manifest.json URL.";
       return;
     }
-    addonStatus.innerText = "Probing Eclipse addon manifest...";
+    addonStatus.innerText = "Saving & probing Eclipse addon manifest...";
     try {
+      const saveRes = await requestWithTimeout(`${API_BASE}/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ eclipse_addons: [url] })
+      }, 4000);
+      if (!saveRes.ok) {
+        throw new Error(`Service rejected manifest (${saveRes.status})`);
+      }
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem("omniphony_eclipse_manifest", url);
+      }
+      currentConfig.eclipse_addons = [url];
       const r = await fetch(url).catch(() => null);
       if (r && r.ok) {
         const manifest = await r.json();
-        addonStatus.innerHTML = `<span style="color:#00ff88;font-weight:600;">✓ Loaded ${manifest.name || 'Addon'} v${manifest.version || '1.0'}</span> (${manifest.description || 'Active'})`;
-        addonInput.value = "";
+        addonStatus.innerHTML = `<span style="color:#00ff88;font-weight:600;">✓ Saved & Loaded ${manifest.name || 'Addon'} v${manifest.version || '1.0'}</span> (${manifest.description || 'Active'})`;
       } else {
-        addonStatus.innerText = "Could not load manifest (network error or invalid URL).";
+        addonStatus.innerHTML = `<span style="color:#00ff88;font-weight:600;">✓ Saved Eclipse Manifest to RealMAX Engine</span> (${url})`;
       }
     } catch (err) {
       addonStatus.innerText = `Error: ${err.message}`;
@@ -5311,6 +5322,12 @@ function toggleSettingsPanel() {
     } else {
       currentConfig = { ...currentConfig, ...loaded };
       if (document.getElementById("omniphony-source-select")) document.getElementById("omniphony-source-select").value = loaded?.realmax_source || "auto";
+      if (Array.isArray(loaded?.eclipse_addons) && loaded.eclipse_addons.length > 0) {
+        if (addonInput && !addonInput.value) addonInput.value = loaded.eclipse_addons[0];
+        if (addonStatus) {
+          addonStatus.innerHTML = `<span style="color:#00ff88;font-weight:600;">✓ Active Eclipse Manifest:</span> ${loaded.eclipse_addons[0]}`;
+        }
+      }
       prioritySelect.value = loaded.priority.join(",");
       updatePriorityTitle();
       prioritySelect.disabled = false;
