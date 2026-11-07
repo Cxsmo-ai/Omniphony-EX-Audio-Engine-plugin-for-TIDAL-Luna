@@ -6060,8 +6060,10 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def tidal_process_watchdog(engine):
-    """Monitor TIDAL.exe; if TIDAL closes, pause MPV automatically."""
+    """Monitor TIDAL.exe; shut down mpv and exit when TIDAL is completely closed."""
     import psutil
+    has_seen_tidal = False
+    startup_time = time.monotonic()
     last_tidal_seen = time.monotonic()
     while True:
         time.sleep(2.0)
@@ -6071,18 +6073,24 @@ def tidal_process_watchdog(engine):
                 for p in psutil.process_iter(["name"])
             )
             if tidal_running:
+                has_seen_tidal = True
                 last_tidal_seen = time.monotonic()
-            elif time.monotonic() - last_tidal_seen > 3.0:
-                # TIDAL closed: terminate MPV and shut down service completely
-                print("[*] TIDAL exited: terminating mpv.exe and shutting down OmniFusion service...")
-                with engine.playback_lock:
-                    if engine.proc and engine.proc.poll() is None:
-                        try:
-                            engine.proc.terminate()
-                            engine.proc.wait(timeout=2)
-                        except Exception:
-                            pass
-                os._exit(0)
+            else:
+                now = time.monotonic()
+                if not has_seen_tidal:
+                    if now - startup_time > 90.0:
+                        print("[*] TIDAL not detected within startup grace window. Shutting down service...")
+                        os._exit(0)
+                elif now - last_tidal_seen > 20.0:
+                    print("[*] TIDAL exited: terminating mpv.exe and shutting down OmniFusion service...")
+                    with engine.playback_lock:
+                        if engine.proc and engine.proc.poll() is None:
+                            try:
+                                engine.proc.terminate()
+                                engine.proc.wait(timeout=2)
+                            except Exception:
+                                pass
+                    os._exit(0)
         except Exception:
             pass
 
