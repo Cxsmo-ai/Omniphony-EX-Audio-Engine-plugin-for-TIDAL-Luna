@@ -5804,31 +5804,32 @@ function installNativeSearchInterceptor() {
 
   function badgeExistingTidalResults(upgrades = []) {
     try {
-      const links = Array.from(document.querySelectorAll('a[href*="/track/"], a[href*="/album/"], a[href*="/video/"], a[href*="/search?q="]')).filter(
-        (a) => !a.closest('#omniphony-native-amazon-search')
-      );
+      const rows = document.querySelectorAll('[role="row"], [data-test*="track"], [class*="trackItem"], [class*="trackRow"], [class*="tableRow"], div[class*="item"]');
+      rows.forEach((row) => {
+        if (row.closest('#omniphony-native-amazon-search')) return;
+        if (row.dataset.omniphonyAmzBadged) return;
 
-      links.forEach((link) => {
-        if (link.dataset.omniphonyAmzBadged) return;
-        const text = (link.textContent || '').trim();
-        if (!text || text.length < 3) return;
+        const links = Array.from(row.querySelectorAll('a[href*="/track/"], a[href*="/album/"], a[href*="/video/"]'));
+        const titleLink = links.find((a) => !a.querySelector('img') && (a.textContent || '').trim().length > 0);
+        if (!titleLink) return;
 
+        const text = (titleLink.textContent || '').trim();
         const isAmazonText = /amazon/i.test(text);
         const matchingUpgrade = upgrades.find((u) => u.title && text.toLowerCase().includes(u.title.toLowerCase()));
 
         if (!isAmazonText && !matchingUpgrade) return;
-        link.dataset.omniphonyAmzBadged = 'true';
+        row.dataset.omniphonyAmzBadged = 'true';
 
         const badge = document.createElement('span');
         badge.className = 'omniphony-amz-badge';
         if (matchingUpgrade && matchingUpgrade.isAtmos) {
-          badge.style.cssText = 'display:inline-flex;align-items:center;background:rgba(255,153,0,0.18);border:1px solid #ff9900;color:#ff9900;font-weight:700;font-size:9px;padding:1px 5px;border-radius:3px;margin-right:6px;vertical-align:middle;line-height:1;gap:3px;flex-shrink:0;width:max-content;max-width:max-content;white-space:nowrap;';
+          badge.style.cssText = 'display:inline-flex;align-items:center;background:rgba(255,153,0,0.18);border:1px solid #ff9900;color:#ff9900;font-weight:700;font-size:9px;padding:1px 5px;border-radius:3px;margin-right:6px;vertical-align:middle;line-height:1;gap:3px;flex-shrink:0;width:max-content;max-width:max-content;height:16px;box-sizing:border-box;white-space:nowrap;';
           badge.innerHTML = `${amazonLogoSvg}<span>AMZ ATMOS 5.1</span>`;
         } else {
-          badge.style.cssText = 'display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:6px;vertical-align:middle;line-height:1;gap:3px;flex-shrink:0;width:max-content;max-width:max-content;white-space:nowrap;';
+          badge.style.cssText = 'display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:6px;vertical-align:middle;line-height:1;gap:3px;flex-shrink:0;width:max-content;max-width:max-content;height:16px;box-sizing:border-box;white-space:nowrap;';
           badge.innerHTML = `${amazonLogoSvg}<span>AMAZON MUSIC</span>`;
         }
-        link.parentNode.insertBefore(badge, link);
+        titleLink.parentNode.insertBefore(badge, titleLink);
       });
     } catch (_) {}
   }
@@ -5860,7 +5861,6 @@ function installNativeSearchInterceptor() {
       const allTracks = data?.tracks || [];
       const amazonTracks = allTracks.filter((t) => t.source === 'AMAZON' || t.exclusive || (t.upgrade && t.upgrade.provider === 'AMAZON'));
 
-      // Badge matching tracks on TIDAL list based on actual Eclipse Addon data (Atmos / Amazon)
       badgeExistingTidalResults(amazonTracks);
 
       if (!amazonTracks.length) {
@@ -5930,7 +5930,7 @@ function installNativeSearchInterceptor() {
               ${amazonLogoSvg}
               <span>AMAZON MUSIC</span>
             </span>
-            <span style='font-size:14px;font-weight:700;color:#fff;'>Eclipse Addon Results</span>
+            <span style='font-size:15px;font-weight:700;color:#fff;'>Eclipse Addon Results</span>
             <span style='font-size:11px;color:#888;'>RealMAX Spatial & Hi-Res</span>
           </div>
           <span style='background:rgba(255,153,0,0.15);border:1px solid #ff9900;color:#ff9900;font-weight:700;font-size:10px;padding:2px 8px;border-radius:12px;'>
