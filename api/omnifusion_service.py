@@ -4299,27 +4299,82 @@ def execute_track_download(job_id: str, payload: dict) -> None:
         temp_dest = final_file_path.with_suffix(f".tmp_{uuid.uuid4().hex}.{ext}")
 
         pic_bytes = None
-        if art_url:
+        pic_mime = "image/jpeg"
+        lyrics_text = ""
+        lyrics_synced = ""
+        resolved_cover_url = art_url
+
+        # 1. Primary Metadata & Cover Art Resolution from provider
+        if provider == "AMAZON":
+            # For Amazon Music streams, pull official Amazon album art and metadata
             try:
-                art_req = urllib.request.Request(art_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(art_req, timeout=8) as aresp:
-                    pic_bytes = aresp.read()
+                search_cache = _ECLIPSE_AUTH_CACHE.get("search_cache", {})
+                for entry in search_cache.values():
+                    if isinstance(entry, dict) and isinstance(entry.get("meta"), dict):
+                        m = entry["meta"]
+                        if m.get("artworkURL"):
+                            resolved_cover_url = m["artworkURL"]
+                        if m.get("title"):
+                            title = m["title"]
+                        if m.get("artist"):
+                            artist = m["artist"]
+                        if m.get("album"):
+                            album = m["album"]
+                        break
             except Exception:
                 pass
 
-        lyrics_text = ""
-        lyrics_synced = ""
+        # 2. TIDAL Metadata, Lyrics & High-Res Cover Art enrichment
         try:
             sess = get_python_tidal_session()
             if sess:
                 t_obj = sess.track(int(track_id))
-                if t_obj and hasattr(t_obj, "lyrics"):
-                    lyr = t_obj.lyrics()
-                    if lyr:
-                        lyrics_text = getattr(lyr, "text", "") or ""
-                        lyrics_synced = getattr(lyr, "subtitles", "") or ""
+                if t_obj:
+                    full_name = getattr(t_obj, "full_name", None)
+                    if isinstance(full_name, str) and full_name.strip():
+                        title = full_name.strip()
+                    elif getattr(t_obj, "name", None):
+                        ver = getattr(t_obj, "version", None)
+                        title = f"{t_obj.name} ({ver})" if isinstance(ver, str) and ver.strip() and ver.lower() not in t_obj.name.lower() else t_obj.name
+
+                    if getattr(t_obj, "artist", None) and getattr(t_obj.artist, "name", None):
+                        artist = t_obj.artist.name
+
+                    if getattr(t_obj, "album", None):
+                        if getattr(t_obj.album, "name", None):
+                            album = t_obj.album.name
+                        if getattr(t_obj.album, "release_date", None):
+                            year = str(t_obj.album.release_date)[:4]
+                        # Use TIDAL 1280x1280 cover art if not already set by Amazon
+                        if not resolved_cover_url and hasattr(t_obj.album, "image"):
+                            resolved_cover_url = t_obj.album.image(1280) or t_obj.album.image(640)
+
+                    if getattr(t_obj, "track_num", None):
+                        track_num = t_obj.track_num
+                    if getattr(t_obj, "isrc", None):
+                        isrc = t_obj.isrc
+
+                    if hasattr(t_obj, "lyrics"):
+                        try:
+                            lyr = t_obj.lyrics()
+                            if lyr:
+                                lyrics_text = getattr(lyr, "text", "") or ""
+                                lyrics_synced = getattr(lyr, "subtitles", "") or ""
+                        except Exception:
+                            pass
         except Exception:
             pass
+
+        # 3. Download the resolved Cover Art
+        if resolved_cover_url:
+            try:
+                art_req = urllib.request.Request(resolved_cover_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(art_req, timeout=10) as aresp:
+                    pic_bytes = aresp.read()
+                    ctype = aresp.headers.get("Content-Type", "")
+                    pic_mime = "image/png" if "png" in ctype.lower() else "image/jpeg"
+            except Exception as e:
+                print(f"[-] Cover art download error: {e}")
 
         if lyrics_synced:
             try:
