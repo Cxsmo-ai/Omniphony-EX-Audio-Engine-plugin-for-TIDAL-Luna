@@ -3944,6 +3944,20 @@ function startSyncLoop() {
       }
       if (clockSampleAccepted) commitEngineClockSampleOrdering(status);
       currentStatusData = status;
+      if (status && status.trackId && (status.sourceProvider === 'AMAZON' || typeof status.trackId === 'string' && !/^\d+$/.test(status.trackId))) {
+        if (!activeAmazonTrackMeta || String(activeAmazonTrackMeta.id) !== String(status.trackId)) {
+          activeAmazonTrackMeta = {
+            id: status.trackId,
+            title: status.title || '',
+            artist: status.artist || '',
+            album: status.album || '',
+            cover: status.artworkURL || status.albumArtUrl || status.cover || (activeAmazonTrackMeta ? activeAmazonTrackMeta.cover : ''),
+          };
+          updateFooterTrackDisplayForAmazon(activeAmazonTrackMeta);
+        }
+      } else if (status && status.trackId && /^\d+$/.test(String(status.trackId)) && status.sourceProvider !== 'AMAZON') {
+        activeAmazonTrackMeta = null;
+      }
 
       const tidal = getTidalPlaybackSnapshot();
       const mediaTrackId = tidal?.trackId !== null && tidal?.trackId !== undefined ? String(tidal.trackId) : null;
