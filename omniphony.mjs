@@ -148,6 +148,7 @@ let lastTidalSeekIntent = null;
 let pluginDisposed = false;
 let currentFormatLabel = "Omniphony EX";
 let currentStatusData = {};
+let activeAmazonTrackMeta = null;
 let settingsButtonTimer = null;
 let settingsUiVerified = false;
 let nativePlayerCommandHookInstalled = false;
@@ -1827,8 +1828,50 @@ function isEnginePlayStartupPending(trackId) {
     || (String(enginePlayRequestTrackId ?? "") === key && Boolean(enginePlayRequestId));
 }
 
+
+function updateFooterTrackDisplayForAmazon(meta) {
+  try {
+    const footer = getPlaybackFooter();
+    if (!footer) return;
+    const titleEl = footer.querySelector('[data-test="footer-track-title"], a[href*="/track/"], [class*="trackTitle"]');
+    if (titleEl && meta.title && titleEl.textContent !== meta.title) {
+      titleEl.textContent = meta.title;
+    }
+    const artistEl = footer.querySelector('[data-test="footer-track-artist"], a[href*="/artist/"], [class*="artistName"]');
+    if (artistEl && meta.artist && artistEl.textContent !== meta.artist) {
+      artistEl.textContent = meta.artist;
+    }
+    const imgEl = footer.querySelector('img');
+    if (imgEl && meta.cover && imgEl.src !== meta.cover) {
+      imgEl.src = meta.cover;
+      imgEl.srcset = '';
+    }
+  } catch (_) {}
+}
+
+async function fetchAndProjectLyricsForTrack(title, artist, trackId) {
+  try {
+    const res = await fetch(`${API_BASE}/lyrics?title=${encodeURIComponent(title || '')}&artist=${encodeURIComponent(artist || '')}&trackId=${encodeURIComponent(trackId || '')}`).catch(() => null);
+    if (res && res.ok) {
+      const data = await res.json();
+      if (data && data.data && data.data.length > 0) {
+        projectRadiantApiLyrics(trackId, data);
+      }
+    }
+  } catch (err) {
+    console.debug('[Omniphony EX Lyrics]', err);
+  }
+}
+
 function mirrorEnginePlaybackStateToTidal(status) {
   if (!status) return false;
+  if (activeAmazonTrackMeta) {
+    const isEngPlaying = status.playbackState === "playing" && status.paused === false;
+    const uiState = isEngPlaying ? "PLAYING" : "PAUSED";
+    setTidalUiPlaybackState(uiState);
+    updateFooterTrackDisplayForAmazon(activeAmazonTrackMeta);
+    return true;
+  }
   // /play deliberately prepares libmpv paused. Keep TIDAL's native Play intent
   // visible until triggerEnginePlay confirms that the prepared stream resumed.
   if (isEnginePlayStartupPending(status.trackId)) {
@@ -1860,8 +1903,9 @@ function mirrorEnginePlaybackStateToTidal(status) {
 }
 
 function mirrorEngineClockToTidal(status, tidalTrackId, tidalPosition) {
-  if (!status || !Number.isSafeInteger(Number(tidalTrackId))
-      || Number(status.trackId) !== Number(tidalTrackId)) return false;
+  const isAmz = Boolean(activeAmazonTrackMeta && String(status.trackId) === String(activeAmazonTrackMeta.id));
+  if (!status) return false;
+  if (!isAmz && (!Number.isSafeInteger(Number(tidalTrackId)) || Number(status.trackId) !== Number(tidalTrackId))) return false;
   const position = getEnginePositionAtCurrentTime(status);
   const observedTidalPosition = parsePlaybackPosition(tidalPosition);
   // Publish moving-clock corrections at millisecond resolution. The active
@@ -3190,9 +3234,9 @@ async function handleImmediateTidalSeek(timePos, source = "redux") {
   const seekPlaybackGeneration = status.playbackGeneration;
   const seekRequestId = status.requestId;
   tracePlaybackEvent("tidal-seek-callback", { requestedPosition: targetTime });
-  if (targetTime === null
-      || !Number.isSafeInteger(trackId) || trackId <= 0
-      || Number(status.trackId) !== trackId) return false;
+  const isSameTrack = (Number.isSafeInteger(trackId) && trackId > 0 && Number(status.trackId) === trackId)
+    || (activeAmazonTrackMeta && String(status.trackId) === String(activeAmazonTrackMeta.id));
+  if (targetTime === null || !isSameTrack) return false;
 
   const now = Date.now();
   if (hasRecentTidalSeekIntent(trackId, targetTime, now)
@@ -3263,6 +3307,7 @@ async function handleImmediateTidalSeek(timePos, source = "redux") {
 }
 
 function getCurrentTrackId() {
+  if (activeAmazonTrackMeta && activeAmazonTrackMeta.id) return String(activeAmazonTrackMeta.id);
   const playState = getTidalPlayState();
   // playbackContext.actualProductId is not consistently the queued track ID
   // in current TIDAL builds (it may identify the resolved playback context).
@@ -3332,6 +3377,14 @@ function getTidalPlaybackSnapshot() {
 }
 
 function getCurrentTrackMeta() {
+  if (activeAmazonTrackMeta && (activeAmazonTrackMeta.title || activeAmazonTrackMeta.artist)) {
+    return {
+      title: activeAmazonTrackMeta.title || "",
+      artist: activeAmazonTrackMeta.artist || "",
+      album: activeAmazonTrackMeta.album || "",
+      cover: activeAmazonTrackMeta.cover || "",
+    };
+  }
   let title = "";
   let artist = "";
   const playState = getTidalPlayState();
@@ -3956,7 +4009,8 @@ function startSyncLoop() {
         return;
       }
 
-      if (mediaTrackId > 0 && engineTrackId === mediaTrackId) {
+      const isAmazonActive = Boolean(activeAmazonTrackMeta && String(status.trackId) === String(activeAmazonTrackMeta.id));
+      if ((mediaTrackId > 0 && engineTrackId === mediaTrackId) || isAmazonActive) {
         const holdSeekClock = shouldHoldEngineClockAfterTidalSeek(
           lastTidalSeekIntent, mediaTrackId, status, Date.now()
         );
@@ -5931,7 +5985,7 @@ function installNativeSearchInterceptor() {
             </div>
             <div style='display:flex;align-items:center;gap:8px;flex-shrink:0;'>
               <span style='color:#666;font-size:11px;min-width:32px;text-align:right;'>${durText}</span>
-              <button type='button' class='omniphony-native-play-btn' data-id='${t.id}' data-title='${safeTitle}' data-artist='${safeArtist}' data-album='${safeAlbum}' style='display:inline-flex;align-items:center;gap:4px;background:#232f3e;border:1px solid #ff9900;color:#ff9900;font-weight:700;font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;font-family:inherit;'>
+              <button type='button' class='omniphony-native-play-btn' data-id='${t.id}' data-title='${safeTitle}' data-artist='${safeArtist}' data-album='${safeAlbum}' data-art='${t.cover || ""}' style='display:inline-flex;align-items:center;gap:4px;background:#232f3e;border:1px solid #ff9900;color:#ff9900;font-weight:700;font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;font-family:inherit;'>
                 ▶ Stream RealMAX
               </button>
               <button type='button' class='omniphony-native-dl-btn' data-id='${t.id}' data-title='${safeTitle}' data-artist='${safeArtist}' data-album='${safeAlbum}' data-year='${t.year || ""}' data-isrc='${t.isrc || ""}' data-art='${t.cover || ""}' style='display:inline-flex;align-items:center;gap:4px;background:#1b2820;border:1px solid #00ff88;color:#00ff88;font-weight:700;font-size:11px;padding:6px 9px;border-radius:4px;cursor:pointer;font-family:inherit;'>
@@ -5964,6 +6018,17 @@ function installNativeSearchInterceptor() {
           const orig = btn.innerText;
           btn.innerText = '⏳ Loading...';
           try {
+            const amzMeta = {
+              id: btn.dataset.id,
+              title: btn.dataset.title,
+              artist: btn.dataset.artist,
+              album: btn.dataset.album,
+              cover: btn.dataset.art || '',
+            };
+            activeAmazonTrackMeta = amzMeta;
+            setTidalPlaybackIntent(true);
+            updateFooterTrackDisplayForAmazon(amzMeta);
+            fetchAndProjectLyricsForTrack(amzMeta.title, amzMeta.artist, amzMeta.id);
             await fetch(`${API_BASE}/play`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },

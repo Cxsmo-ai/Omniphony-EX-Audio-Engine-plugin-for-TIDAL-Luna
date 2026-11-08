@@ -3,7 +3,7 @@
   "description": "OmniFusion TIDAL playback with verified Omniphony JOC routing and codec telemetry.",
   "author": "Pickymarker",
   "dependencies": {},
-  "version": "2.1.27",
-  "main": "omniphony.mjs?v=2.1.27",
-  "hash": "7B2CE92ACDB2179C24CA94D3FF9F794F52DEF7955F010CFA70C08B3936ED9D79"
+  "version": "2.1.28",
+  "main": "omniphony.mjs?v=2.1.28",
+  "hash": "CD51ED1E15AFEA082A485AA7579E1F2DC8D8D5C3640E931FCD83AB6F23CCF44B"
 }
