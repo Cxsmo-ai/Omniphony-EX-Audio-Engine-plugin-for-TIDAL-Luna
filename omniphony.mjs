@@ -5914,7 +5914,9 @@ function installNativeSearchInterceptor() {
 
   async function checkAndInjectNativeSearch() {
     try {
-      const isSearchRoute = window.location.pathname.startsWith('/search') || window.location.href.includes('/search') || window.location.hash.includes('/search') || !!document.querySelector('.search-results, [data-test="search-results"], [data-test="search-header"]');
+      const searchInputEl = document.querySelector('input[type="search"], input[data-test="search-input"], input[placeholder*="Search"], header input');
+      const hasActiveQuery = searchInputEl && searchInputEl.value && searchInputEl.value.trim().length >= 2;
+      const isSearchRoute = window.location.pathname.startsWith('/search') || window.location.href.includes('/search') || window.location.hash.includes('/search') || !!document.querySelector('.search-results, [data-test="search-results"], [data-test="search-header"]') || hasActiveQuery;
       if (!isSearchRoute) {
         const existing = document.getElementById('omniphony-native-amazon-search');
         if (existing) existing.remove();
