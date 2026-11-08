@@ -5840,11 +5840,14 @@ function installNativeSearchInterceptor() {
         if (!b.closest('#omniphony-native-amazon-search')) b.remove();
       });
 
+      const amzBrandPattern = /(?:\bAmazon\s+(?:Original|Prime|Exclusive|Music\s+Original|Series|Studios|Motion\s+Picture)\b)|(?:\(Amazon\s+Original\))|(?:\(Amazon\s+Music\s+Original\))/i;
       const links = Array.from(document.querySelectorAll('a')).filter((a) => {
         if (a.closest('#omniphony-native-amazon-search')) return false;
         if (a.querySelector('img, svg')) return false;
         const text = (a.textContent || '').trim();
-        return text.length >= 3 && /amazon/i.test(text);
+        if (text.length < 3) return false;
+        const matchingUpgrade = upgrades.some((u) => u.title && (text.toLowerCase().includes(u.title.toLowerCase()) || u.title.toLowerCase().includes(text.toLowerCase())));
+        return matchingUpgrade || amzBrandPattern.test(text);
       });
 
       links.forEach((titleLink) => {
