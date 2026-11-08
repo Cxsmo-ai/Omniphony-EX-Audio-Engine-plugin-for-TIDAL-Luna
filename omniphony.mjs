@@ -1814,8 +1814,9 @@ function isPausedSelectionDiagnosticsReady(trackId) {
 }
 
 function mirrorEngineStateToTidal(status, tidalTrackId, tidalPosition, suppressClock = false) {
-  if (!status || !Number.isSafeInteger(Number(tidalTrackId))
-      || Number(status.trackId) !== Number(tidalTrackId)) return false;
+  const isAmz = Boolean(activeAmazonTrackMeta && String(status?.trackId) === String(activeAmazonTrackMeta.id));
+  const match = isAmz || (Number.isSafeInteger(Number(tidalTrackId)) && Number(status?.trackId) === Number(tidalTrackId)) || (status && String(status.trackId) === String(tidalTrackId));
+  if (!status || !match) return false;
   mirrorEnginePlaybackStateToTidal(status);
   if (!suppressClock) mirrorEngineClockToTidal(status, tidalTrackId, tidalPosition);
   return true;
@@ -2847,9 +2848,9 @@ function projectEngineClockToNativeTimeline(
   receivedAt = getMonotonicNow(),
   receivedAtUnixMs = Date.now(),
 ) {
-  if (!status
-      || !Number.isSafeInteger(Number(tidalTrackId))
-      || Number(status.trackId) !== Number(tidalTrackId)) {
+  const isAmz = Boolean(activeAmazonTrackMeta && String(status?.trackId) === String(activeAmazonTrackMeta.id));
+  const match = isAmz || (Number.isSafeInteger(Number(tidalTrackId)) && Number(status?.trackId) === Number(tidalTrackId)) || (status && String(status.trackId) === String(tidalTrackId));
+  if (!status || !match) {
     clearNativeTimelineProjection();
     reportNativeTimelineProjection("track-mismatch");
     recordNativeTimelineDiagnostic("skip", { reason: "track-mismatch" }, receivedAt);
@@ -4224,11 +4225,10 @@ function startSyncLoop() {
     if (clockPollBusy || pluginDisposed) return;
     const baseStatus = currentStatusData;
     const tidal = getTidalPlaybackSnapshot();
-    const trackId = Number(tidal?.trackId);
-    if (!baseStatus
-        || !Number.isSafeInteger(trackId)
-        || Number(baseStatus.trackId) !== trackId
-        || baseStatus.playbackState === "unavailable") return;
+    const trackId = tidal?.trackId !== null && tidal?.trackId !== undefined ? String(tidal.trackId) : null;
+    const isAmz = Boolean(activeAmazonTrackMeta && String(baseStatus?.trackId) === String(activeAmazonTrackMeta.id));
+    const match = isAmz || (trackId && String(baseStatus?.trackId) === trackId);
+    if (!baseStatus || !match || baseStatus.playbackState === "unavailable") return;
     clockPollBusy = true;
     try {
       const res = await requestWithTimeout(
