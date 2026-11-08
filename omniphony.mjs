@@ -5890,15 +5890,18 @@ function installNativeSearchInterceptor() {
       }
       lastNativeSearchQuery = query;
 
-      const main = document.querySelector('main, div[data-test="main-content"], [role="main"]');
-      if (!main) return;
+      // Ensure we target the actual scrollable content container on the search page
+      const searchContainer = document.querySelector('[data-test="search-results"], [data-test="search-container"], div[class*="searchView"], div[class*="searchResults"], main, [role="main"]');
+      if (!searchContainer) return;
 
       let section = document.getElementById('omniphony-native-amazon-search');
       if (!section) {
         section = document.createElement('div');
         section.id = 'omniphony-native-amazon-search';
         section.style.cssText = 'margin:14px 20px 18px;padding:14px 16px;background:rgba(24,24,24,0.96);border:1px solid rgba(255,153,0,0.5);border-radius:8px;box-shadow:0 4px 24px rgba(0,0,0,0.7);font-family:inherit;position:relative;z-index:5;box-sizing:border-box;width:calc(100% - 40px);';
-        main.prepend(section);
+        searchContainer.prepend(section);
+      } else if (section.parentElement !== searchContainer) {
+        searchContainer.prepend(section);
       }
 
       let rowsHtml = '';
