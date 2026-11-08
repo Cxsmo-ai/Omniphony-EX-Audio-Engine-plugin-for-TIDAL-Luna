@@ -3153,7 +3153,7 @@ function installPlaybackObservers(onPlaybackChange, onSeek) {
         const currentTrack = getCurrentTrackId();
         if (currentStatusData && String(currentStatusData.trackId) === String(currentTrack) && currentStatusData.paused === true) {
           void sendEngineCommand("resume", {
-            trackId: Number(currentTrack),
+            trackId: currentStatusData.trackId,
             playbackGeneration: currentStatusData.playbackGeneration,
             requestId: currentStatusData.requestId,
           });
@@ -3166,6 +3166,13 @@ function installPlaybackObservers(onPlaybackChange, onSeek) {
           dispatchStack: new Error("TIDAL PAUSE dispatch").stack || null
         });
         setTidalPlaybackIntent(false);
+        if (currentStatusData && currentStatusData.paused === false) {
+          void sendEngineCommand("pause", {
+            trackId: currentStatusData.trackId,
+            playbackGeneration: currentStatusData.playbackGeneration,
+            requestId: currentStatusData.requestId,
+          });
+        }
         onPlaybackChange();
         return true;
       });
@@ -3178,7 +3185,16 @@ function installPlaybackObservers(onPlaybackChange, onSeek) {
       });
       library.redux.intercept("playbackControls/TOGGLE_PLAYBACK", unloads, () => {
         tracePlaybackEvent("tidal-control-toggle");
-        setTidalPlaybackIntent(!(desiredPlaybackIntent ?? false));
+        const nextIntent = !(desiredPlaybackIntent ?? false);
+        setTidalPlaybackIntent(nextIntent);
+        if (currentStatusData) {
+          const endpoint = nextIntent ? "resume" : "pause";
+          void sendEngineCommand(endpoint, {
+            trackId: currentStatusData.trackId,
+            playbackGeneration: currentStatusData.playbackGeneration,
+            requestId: currentStatusData.requestId,
+          });
+        }
         onPlaybackChange();
         return true;
       });
