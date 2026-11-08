@@ -1833,19 +1833,24 @@ function isEnginePlayStartupPending(trackId) {
 function updateFooterTrackDisplayForAmazon(meta) {
   try {
     const footer = getPlaybackFooter();
-    if (!footer) return;
-    const titleEl = footer.querySelector('[data-test="footer-track-title"], a[href*="/track/"], [class*="trackTitle"]');
-    if (titleEl && meta.title && titleEl.textContent !== meta.title) {
-      titleEl.textContent = meta.title;
+    if (!footer || !meta) return;
+    // Update title
+    const titleEl = footer.querySelector('[data-test="footer-track-title"], a[href*="/track/"], [class*="trackTitle"], [data-test="track-title"]');
+    if (titleEl && meta.title) {
+      titleEl.innerText = meta.title;
+      titleEl.title = meta.title;
     }
-    const artistEl = footer.querySelector('[data-test="footer-track-artist"], a[href*="/artist/"], [class*="artistName"]');
-    if (artistEl && meta.artist && artistEl.textContent !== meta.artist) {
-      artistEl.textContent = meta.artist;
+    // Update artist
+    const artistEl = footer.querySelector('[data-test="footer-track-artist"], a[href*="/artist/"], [class*="artistName"], [data-test="artist-title"]');
+    if (artistEl && meta.artist) {
+      artistEl.innerText = meta.artist;
+      artistEl.title = meta.artist;
     }
+    // Update cover art
     const imgEl = footer.querySelector('img');
-    if (imgEl && meta.cover && imgEl.src !== meta.cover) {
+    if (imgEl && meta.cover) {
       imgEl.src = meta.cover;
-      imgEl.srcset = '';
+      imgEl.srcset = meta.cover;
     }
   } catch (_) {}
 }
@@ -3383,7 +3388,7 @@ function getTidalPlaybackSnapshot() {
     // TIDAL's observed PlayState is authoritative. The local intent can remain
     // true after natural EOF, when TIDAL settles to PAUSED/NOT_PLAYING; using
     // that stale intent here repeatedly resumes an already-ended engine.
-    playing: actual === "PLAYING" && desiredPlaybackIntent !== false,
+    playing: (activeAmazonTrackMeta ? (desiredPlaybackIntent !== false) : (actual === "PLAYING" && desiredPlaybackIntent !== false)),
     desired,
     actual,
     position,
@@ -3941,9 +3946,10 @@ function startSyncLoop() {
       currentStatusData = status;
 
       const tidal = getTidalPlaybackSnapshot();
-      const mediaTrackId = Number(tidal?.trackId);
-      const engineTrackId = Number(status.trackId);
-      const tidalIsPlaying = Boolean(tidal?.playing && mediaTrackId > 0);
+      const mediaTrackId = tidal?.trackId !== null && tidal?.trackId !== undefined ? String(tidal.trackId) : null;
+      const engineTrackId = status.trackId !== null && status.trackId !== undefined ? String(status.trackId) : null;
+      const isAmz = Boolean(activeAmazonTrackMeta && engineTrackId === String(activeAmazonTrackMeta.id));
+      const tidalIsPlaying = Boolean(tidal?.playing && (isAmz || (mediaTrackId && Number(mediaTrackId) > 0)));
       const enginePlayStartupPending = isEnginePlayStartupPending(mediaTrackId);
       if (holdSyncForPausedSelection(mediaTrackId, statusObservedAt)) {
         // This path intentionally skips transport reconciliation, but the
