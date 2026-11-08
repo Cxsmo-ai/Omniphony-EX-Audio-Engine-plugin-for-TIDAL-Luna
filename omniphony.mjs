@@ -5666,6 +5666,33 @@ async function queueTrackDownload(trackMeta) {
 }
 
 function installNativeDownloadContextMenu() {
+
+  if (typeof document !== 'undefined' && !document.getElementById('omniphony-dl-btn-css')) {
+    const styleEl = document.createElement('style');
+    styleEl.id = 'omniphony-dl-btn-css';
+    styleEl.textContent = `
+      .download-button {
+        z-index: 1;
+        position: relative;
+        display: inline-block;
+        overflow: hidden;
+        border-radius: 10px;
+      }
+      .download-button::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        bottom: 0;
+        width: var(--progress, 0%);
+        background-color: #9e46ff;
+        z-index: -1;
+        transition: width 0.1s ease-out;
+      }
+    `;
+    document.head.appendChild(styleEl);
+  }
+
   try {
     const ContextMenu = window.luna?.lib?.ContextMenu;
     if (!ContextMenu || typeof ContextMenu.onMediaItem !== "function") {
@@ -5695,6 +5722,8 @@ function installNativeDownloadContextMenu() {
 
         downloadState.active = true;
         downloadState.cancel = false;
+        btn.elem?.classList.add("download-button");
+        btn.elem?.style.setProperty("--progress", "0%");
         try {
           let items = [];
           if (typeof mediaCollection.mediaItems === "function") {
@@ -5731,6 +5760,7 @@ function installNativeDownloadContextMenu() {
                   if (pollRes.ok) {
                     const st = await pollRes.json();
                     btn.text = `${st.status === "rendering" ? "Rendering Binaural" : "Downloading"} ${st.progress || 0}%`;
+                    btn.elem?.style.setProperty("--progress", `${st.progress || 0}%`);
                     if (st.status === "completed" || st.status === "failed") {
                       finished = true;
                       break;
@@ -5746,6 +5776,8 @@ function installNativeDownloadContextMenu() {
           downloadState.active = false;
           downloadState.cancel = false;
           btn.text = defaultText;
+          btn.elem?.classList.remove("download-button");
+          btn.elem?.style.removeProperty("--progress");
         }
       });
 
@@ -5927,7 +5959,7 @@ function installNativeSearchInterceptor() {
           <div style='display:flex;align-items:center;gap:8px;'>
             <span style='display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:11px;padding:3px 7px;border-radius:4px;gap:4px;line-height:1;width:max-content;'>
               ${amazonLogoSvg}
-              <span>AMAZON MUSIC</span>
+              <span>AMAZON</span>
             </span>
             <span style='font-size:15px;font-weight:700;color:#fff;'>Eclipse Addon Results</span>
             <span style='font-size:11px;color:#888;'>RealMAX Spatial & Hi-Res</span>
