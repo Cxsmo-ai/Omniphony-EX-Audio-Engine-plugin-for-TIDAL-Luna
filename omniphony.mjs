@@ -16,7 +16,7 @@
  */
 
 const API_BASE = "http://127.0.0.1:8765";
-const REQUIRED_SERVICE_VERSION = "2.1.25";
+const REQUIRED_SERVICE_VERSION = "2.1.26";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
 const PLUGIN_BUILD = "2.1.26";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
@@ -148,7 +148,6 @@ let lastTidalSeekIntent = null;
 let pluginDisposed = false;
 let currentFormatLabel = "Omniphony EX";
 let currentStatusData = {};
-let activeAmazonTrackMeta = null;
 let settingsButtonTimer = null;
 let settingsUiVerified = false;
 let nativePlayerCommandHookInstalled = false;
@@ -1814,9 +1813,8 @@ function isPausedSelectionDiagnosticsReady(trackId) {
 }
 
 function mirrorEngineStateToTidal(status, tidalTrackId, tidalPosition, suppressClock = false) {
-  const isAmz = Boolean(activeAmazonTrackMeta && String(status?.trackId) === String(activeAmazonTrackMeta.id));
-  const match = isAmz || (Number.isSafeInteger(Number(tidalTrackId)) && Number(status?.trackId) === Number(tidalTrackId)) || (status && String(status.trackId) === String(tidalTrackId));
-  if (!status || !match) return false;
+  if (!status || !Number.isSafeInteger(Number(tidalTrackId))
+      || Number(status.trackId) !== Number(tidalTrackId)) return false;
   mirrorEnginePlaybackStateToTidal(status);
   if (!suppressClock) mirrorEngineClockToTidal(status, tidalTrackId, tidalPosition);
   return true;
@@ -1829,55 +1827,8 @@ function isEnginePlayStartupPending(trackId) {
     || (String(enginePlayRequestTrackId ?? "") === key && Boolean(enginePlayRequestId));
 }
 
-
-function updateFooterTrackDisplayForAmazon(meta) {
-  try {
-    const footer = getPlaybackFooter();
-    if (!footer || !meta) return;
-    // Update title
-    const titleEl = footer.querySelector('[data-test="footer-track-title"], a[href*="/track/"], [class*="trackTitle"], [data-test="track-title"]');
-    if (titleEl && meta.title) {
-      titleEl.innerText = meta.title;
-      titleEl.title = meta.title;
-    }
-    // Update artist
-    const artistEl = footer.querySelector('[data-test="footer-track-artist"], a[href*="/artist/"], [class*="artistName"], [data-test="artist-title"]');
-    if (artistEl && meta.artist) {
-      artistEl.innerText = meta.artist;
-      artistEl.title = meta.artist;
-    }
-    // Update cover art
-    const imgEl = footer.querySelector('img');
-    if (imgEl && meta.cover) {
-      imgEl.src = meta.cover;
-      imgEl.srcset = meta.cover;
-    }
-  } catch (_) {}
-}
-
-async function fetchAndProjectLyricsForTrack(title, artist, trackId) {
-  try {
-    const res = await fetch(`${API_BASE}/lyrics?title=${encodeURIComponent(title || '')}&artist=${encodeURIComponent(artist || '')}&trackId=${encodeURIComponent(trackId || '')}`).catch(() => null);
-    if (res && res.ok) {
-      const data = await res.json();
-      if (data && data.data && data.data.length > 0) {
-        projectRadiantApiLyrics(trackId, data);
-      }
-    }
-  } catch (err) {
-    console.debug('[Omniphony EX Lyrics]', err);
-  }
-}
-
 function mirrorEnginePlaybackStateToTidal(status) {
   if (!status) return false;
-  if (activeAmazonTrackMeta) {
-    const isEngPlaying = status.playbackState === "playing" && status.paused === false;
-    const uiState = isEngPlaying ? "PLAYING" : "PAUSED";
-    setTidalUiPlaybackState(uiState);
-    updateFooterTrackDisplayForAmazon(activeAmazonTrackMeta);
-    return true;
-  }
   // /play deliberately prepares libmpv paused. Keep TIDAL's native Play intent
   // visible until triggerEnginePlay confirms that the prepared stream resumed.
   if (isEnginePlayStartupPending(status.trackId)) {
@@ -1909,9 +1860,8 @@ function mirrorEnginePlaybackStateToTidal(status) {
 }
 
 function mirrorEngineClockToTidal(status, tidalTrackId, tidalPosition) {
-  const isAmz = Boolean(activeAmazonTrackMeta && String(status.trackId) === String(activeAmazonTrackMeta.id));
-  if (!status) return false;
-  if (!isAmz && (!Number.isSafeInteger(Number(tidalTrackId)) || Number(status.trackId) !== Number(tidalTrackId))) return false;
+  if (!status || !Number.isSafeInteger(Number(tidalTrackId))
+      || Number(status.trackId) !== Number(tidalTrackId)) return false;
   const position = getEnginePositionAtCurrentTime(status);
   const observedTidalPosition = parsePlaybackPosition(tidalPosition);
   // Publish moving-clock corrections at millisecond resolution. The active
@@ -2853,9 +2803,9 @@ function projectEngineClockToNativeTimeline(
   receivedAt = getMonotonicNow(),
   receivedAtUnixMs = Date.now(),
 ) {
-  const isAmz = Boolean(activeAmazonTrackMeta && String(status?.trackId) === String(activeAmazonTrackMeta.id));
-  const match = isAmz || (Number.isSafeInteger(Number(tidalTrackId)) && Number(status?.trackId) === Number(tidalTrackId)) || (status && String(status.trackId) === String(tidalTrackId));
-  if (!status || !match) {
+  if (!status
+      || !Number.isSafeInteger(Number(tidalTrackId))
+      || Number(status.trackId) !== Number(tidalTrackId)) {
     clearNativeTimelineProjection();
     reportNativeTimelineProjection("track-mismatch");
     recordNativeTimelineDiagnostic("skip", { reason: "track-mismatch" }, receivedAt);
@@ -3159,7 +3109,7 @@ function installPlaybackObservers(onPlaybackChange, onSeek) {
         const currentTrack = getCurrentTrackId();
         if (currentStatusData && String(currentStatusData.trackId) === String(currentTrack) && currentStatusData.paused === true) {
           void sendEngineCommand("resume", {
-            trackId: currentStatusData.trackId,
+            trackId: Number(currentTrack),
             playbackGeneration: currentStatusData.playbackGeneration,
             requestId: currentStatusData.requestId,
           });
@@ -3172,13 +3122,6 @@ function installPlaybackObservers(onPlaybackChange, onSeek) {
           dispatchStack: new Error("TIDAL PAUSE dispatch").stack || null
         });
         setTidalPlaybackIntent(false);
-        if (currentStatusData && currentStatusData.paused === false) {
-          void sendEngineCommand("pause", {
-            trackId: currentStatusData.trackId,
-            playbackGeneration: currentStatusData.playbackGeneration,
-            requestId: currentStatusData.requestId,
-          });
-        }
         onPlaybackChange();
         return true;
       });
@@ -3191,16 +3134,7 @@ function installPlaybackObservers(onPlaybackChange, onSeek) {
       });
       library.redux.intercept("playbackControls/TOGGLE_PLAYBACK", unloads, () => {
         tracePlaybackEvent("tidal-control-toggle");
-        const nextIntent = !(desiredPlaybackIntent ?? false);
-        setTidalPlaybackIntent(nextIntent);
-        if (currentStatusData) {
-          const endpoint = nextIntent ? "resume" : "pause";
-          void sendEngineCommand(endpoint, {
-            trackId: currentStatusData.trackId,
-            playbackGeneration: currentStatusData.playbackGeneration,
-            requestId: currentStatusData.requestId,
-          });
-        }
+        setTidalPlaybackIntent(!(desiredPlaybackIntent ?? false));
         onPlaybackChange();
         return true;
       });
@@ -3256,9 +3190,9 @@ async function handleImmediateTidalSeek(timePos, source = "redux") {
   const seekPlaybackGeneration = status.playbackGeneration;
   const seekRequestId = status.requestId;
   tracePlaybackEvent("tidal-seek-callback", { requestedPosition: targetTime });
-  const isSameTrack = (Number.isSafeInteger(trackId) && trackId > 0 && Number(status.trackId) === trackId)
-    || (activeAmazonTrackMeta && String(status.trackId) === String(activeAmazonTrackMeta.id));
-  if (targetTime === null || !isSameTrack) return false;
+  if (targetTime === null
+      || !Number.isSafeInteger(trackId) || trackId <= 0
+      || Number(status.trackId) !== trackId) return false;
 
   const now = Date.now();
   if (hasRecentTidalSeekIntent(trackId, targetTime, now)
@@ -3329,7 +3263,6 @@ async function handleImmediateTidalSeek(timePos, source = "redux") {
 }
 
 function getCurrentTrackId() {
-  if (activeAmazonTrackMeta && activeAmazonTrackMeta.id) return String(activeAmazonTrackMeta.id);
   const playState = getTidalPlayState();
   // playbackContext.actualProductId is not consistently the queued track ID
   // in current TIDAL builds (it may identify the resolved playback context).
@@ -3388,7 +3321,7 @@ function getTidalPlaybackSnapshot() {
     // TIDAL's observed PlayState is authoritative. The local intent can remain
     // true after natural EOF, when TIDAL settles to PAUSED/NOT_PLAYING; using
     // that stale intent here repeatedly resumes an already-ended engine.
-    playing: (activeAmazonTrackMeta ? (desiredPlaybackIntent !== false) : (actual === "PLAYING" && desiredPlaybackIntent !== false)),
+    playing: actual === "PLAYING" && desiredPlaybackIntent !== false,
     desired,
     actual,
     position,
@@ -3399,14 +3332,6 @@ function getTidalPlaybackSnapshot() {
 }
 
 function getCurrentTrackMeta() {
-  if (activeAmazonTrackMeta && (activeAmazonTrackMeta.title || activeAmazonTrackMeta.artist)) {
-    return {
-      title: activeAmazonTrackMeta.title || "",
-      artist: activeAmazonTrackMeta.artist || "",
-      album: activeAmazonTrackMeta.album || "",
-      cover: activeAmazonTrackMeta.cover || "",
-    };
-  }
   let title = "";
   let artist = "";
   const playState = getTidalPlayState();
@@ -3944,26 +3869,11 @@ function startSyncLoop() {
       }
       if (clockSampleAccepted) commitEngineClockSampleOrdering(status);
       currentStatusData = status;
-      if (status && status.trackId && (status.sourceProvider === 'AMAZON' || typeof status.trackId === 'string' && !/^\d+$/.test(status.trackId))) {
-        if (!activeAmazonTrackMeta || String(activeAmazonTrackMeta.id) !== String(status.trackId)) {
-          activeAmazonTrackMeta = {
-            id: status.trackId,
-            title: status.title || '',
-            artist: status.artist || '',
-            album: status.album || '',
-            cover: status.artworkURL || status.albumArtUrl || status.cover || (activeAmazonTrackMeta ? activeAmazonTrackMeta.cover : ''),
-          };
-          updateFooterTrackDisplayForAmazon(activeAmazonTrackMeta);
-        }
-      } else if (status && status.trackId && /^\d+$/.test(String(status.trackId)) && status.sourceProvider !== 'AMAZON') {
-        activeAmazonTrackMeta = null;
-      }
 
       const tidal = getTidalPlaybackSnapshot();
-      const mediaTrackId = tidal?.trackId !== null && tidal?.trackId !== undefined ? String(tidal.trackId) : null;
-      const engineTrackId = status.trackId !== null && status.trackId !== undefined ? String(status.trackId) : null;
-      const isAmz = Boolean(activeAmazonTrackMeta && engineTrackId === String(activeAmazonTrackMeta.id));
-      const tidalIsPlaying = Boolean(tidal?.playing && (isAmz || (mediaTrackId && Number(mediaTrackId) > 0)));
+      const mediaTrackId = Number(tidal?.trackId);
+      const engineTrackId = Number(status.trackId);
+      const tidalIsPlaying = Boolean(tidal?.playing && mediaTrackId > 0);
       const enginePlayStartupPending = isEnginePlayStartupPending(mediaTrackId);
       if (holdSyncForPausedSelection(mediaTrackId, statusObservedAt)) {
         // This path intentionally skips transport reconciliation, but the
@@ -4046,8 +3956,7 @@ function startSyncLoop() {
         return;
       }
 
-      const isAmazonActive = Boolean(activeAmazonTrackMeta && String(status.trackId) === String(activeAmazonTrackMeta.id));
-      if ((mediaTrackId > 0 && engineTrackId === mediaTrackId) || isAmazonActive) {
+      if (mediaTrackId > 0 && engineTrackId === mediaTrackId) {
         const holdSeekClock = shouldHoldEngineClockAfterTidalSeek(
           lastTidalSeekIntent, mediaTrackId, status, Date.now()
         );
@@ -4245,10 +4154,11 @@ function startSyncLoop() {
     if (clockPollBusy || pluginDisposed) return;
     const baseStatus = currentStatusData;
     const tidal = getTidalPlaybackSnapshot();
-    const trackId = tidal?.trackId !== null && tidal?.trackId !== undefined ? String(tidal.trackId) : null;
-    const isAmz = Boolean(activeAmazonTrackMeta && String(baseStatus?.trackId) === String(activeAmazonTrackMeta.id));
-    const match = isAmz || (trackId && String(baseStatus?.trackId) === trackId);
-    if (!baseStatus || !match || baseStatus.playbackState === "unavailable") return;
+    const trackId = Number(tidal?.trackId);
+    if (!baseStatus
+        || !Number.isSafeInteger(trackId)
+        || Number(baseStatus.trackId) !== trackId
+        || baseStatus.playbackState === "unavailable") return;
     clockPollBusy = true;
     try {
       const res = await requestWithTimeout(
@@ -5708,7 +5618,7 @@ let downloadButtonRef = null;
 
 function getDownloadSettings() {
   return {
-    destinationFolder: (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_folder") : null) || "C:\OmniFusion-Standalone\downloads",
+    destinationFolder: (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_folder") : null) || "C:\\OmniFusion-Standalone\\downloads",
     pathPattern: (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_pattern") : null) || "{artist}/{album}/{trackNumber} - {title}",
     ac4Format: (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_ac4_format") : null) || "flac",
   };
@@ -5729,15 +5639,38 @@ async function selectDownloadFolderNative() {
 
 async function queueTrackDownload(trackMeta) {
   const cfg = getDownloadSettings();
+  const artistMeta = trackMeta.artist;
+  const albumMeta = trackMeta.album;
+  const artistName = typeof artistMeta === "string"
+    ? artistMeta
+    : artistMeta?.name || trackMeta.artistName ||
+      (Array.isArray(trackMeta.artists) ? trackMeta.artists.map((item) => item?.name).filter(Boolean).join("; ") : "Unknown Artist");
+  const albumName = typeof albumMeta === "string"
+    ? albumMeta
+    : albumMeta?.title || albumMeta?.name || trackMeta.albumTitle || "Unknown Album";
+  const albumCover = typeof albumMeta?.cover === "string" ? albumMeta.cover : "";
+  const albumArtUrl = trackMeta.artworkURL || trackMeta.cover || albumMeta?.artworkURL ||
+    (albumCover.startsWith("http") ? albumCover : albumCover.includes("-")
+      ? `https://resources.tidal.com/images/${albumCover.replace(/-/g, "/")}/1280x1280.jpg`
+      : "");
+  const lyricText = typeof trackMeta.lyrics === "string" ? trackMeta.lyrics : trackMeta.lyrics?.text || trackMeta.plainLyrics || "";
+  const syncedLyrics = typeof trackMeta.syncedLyrics === "string" ? trackMeta.syncedLyrics : trackMeta.subtitles || trackMeta.lrc || "";
   const payload = {
     trackId: trackMeta.id || trackMeta.trackId,
     title: trackMeta.title || trackMeta.name || "Unknown Title",
-    artist: trackMeta.artist || trackMeta.artistName || (typeof trackMeta.artist === "object" ? trackMeta.artist?.name : "Unknown Artist"),
-    album: trackMeta.album || trackMeta.albumTitle || (typeof trackMeta.album === "object" ? trackMeta.album?.title || trackMeta.album?.name : "Unknown Album"),
+    artist: artistName,
+    album: albumName,
+    albumArtist: trackMeta.albumArtist || albumMeta?.artist?.name || "",
     year: trackMeta.year || (trackMeta.releaseDate ? String(trackMeta.releaseDate).slice(0, 4) : ""),
     trackNumber: trackMeta.trackNumber || trackMeta.track_number || "",
+    discNumber: trackMeta.discNumber || trackMeta.disc_number || trackMeta.volumeNumber || "",
     isrc: trackMeta.isrc || "",
-    albumArtUrl: trackMeta.artworkURL || trackMeta.cover || (trackMeta.album?.cover ? `https://resources.tidal.com/images/${trackMeta.album.cover.replace(/-/g, "/")}/640x640.jpg` : ""),
+    genre: Array.isArray(trackMeta.genre) ? trackMeta.genre.join("; ") : trackMeta.genre || "",
+    composer: Array.isArray(trackMeta.composer) ? trackMeta.composer.map((item) => item?.name || item).join("; ") : trackMeta.composer || "",
+    copyright: trackMeta.copyright || "",
+    lyrics: lyricText,
+    syncedLyrics,
+    albumArtUrl,
     destinationFolder: cfg.destinationFolder,
     ac4Format: cfg.ac4Format,
     pathPattern: cfg.pathPattern,
@@ -5756,33 +5689,6 @@ async function queueTrackDownload(trackMeta) {
 }
 
 function installNativeDownloadContextMenu() {
-
-  if (typeof document !== 'undefined' && !document.getElementById('omniphony-dl-btn-css')) {
-    const styleEl = document.createElement('style');
-    styleEl.id = 'omniphony-dl-btn-css';
-    styleEl.textContent = `
-      .download-button {
-        z-index: 1;
-        position: relative;
-        display: inline-block;
-        overflow: hidden;
-        border-radius: 10px;
-      }
-      .download-button::before {
-        content: '';
-        position: absolute;
-        top: 0;
-        left: 0;
-        bottom: 0;
-        width: var(--progress, 0%);
-        background-color: #9e46ff;
-        z-index: -1;
-        transition: width 0.1s ease-out;
-      }
-    `;
-    document.head.appendChild(styleEl);
-  }
-
   try {
     const ContextMenu = window.luna?.lib?.ContextMenu;
     if (!ContextMenu || typeof ContextMenu.onMediaItem !== "function") {
@@ -5812,8 +5718,6 @@ function installNativeDownloadContextMenu() {
 
         downloadState.active = true;
         downloadState.cancel = false;
-        btn.elem?.classList.add("download-button");
-        btn.elem?.style.setProperty("--progress", "0%");
         try {
           let items = [];
           if (typeof mediaCollection.mediaItems === "function") {
@@ -5850,7 +5754,6 @@ function installNativeDownloadContextMenu() {
                   if (pollRes.ok) {
                     const st = await pollRes.json();
                     btn.text = `${st.status === "rendering" ? "Rendering Binaural" : "Downloading"} ${st.progress || 0}%`;
-                    btn.elem?.style.setProperty("--progress", `${st.progress || 0}%`);
                     if (st.status === "completed" || st.status === "failed") {
                       finished = true;
                       break;
@@ -5866,8 +5769,6 @@ function installNativeDownloadContextMenu() {
           downloadState.active = false;
           downloadState.cancel = false;
           btn.text = defaultText;
-          btn.elem?.classList.remove("download-button");
-          btn.elem?.style.removeProperty("--progress");
         }
       });
 
@@ -5917,210 +5818,7 @@ function updatePausedSelectionUi(message = null) {
 // Run only after every module-level observer and state object has initialized.
 onLoad();
 installNativeDownloadContextMenu();
-installNativeSearchInterceptor();
-let lastNativeSearchQuery = '';
-let nativeSearchDebounce = null;
 
-function installNativeSearchInterceptor() {
-  const amazonLogoSvg = `<svg style='width:11px;height:11px;fill:currentColor;flex-shrink:0;vertical-align:-1px;' viewBox='0 0 24 24'><path d='M.045 18.02c.072-.116.187-.124.348-.022 3.636 2.11 7.594 3.166 11.87 3.166 2.852 0 5.668-.533 8.447-1.595l.315-.14c.138-.06.234-.1.293-.13.226-.088.39-.046.525.13.12.174.09.336-.12.48-.256.19-.6.41-1.006.654-1.244.743-2.64 1.316-4.185 1.726a17.617 17.617 0 01-10.951-.577 17.88 17.88 0 01-5.43-3.35c-.1-.074-.151-.15-.151-.22 0-.047.021-.09.051-.13zm6.565-6.218c0-1.005.247-1.863.743-2.577.495-.71 1.17-1.25 2.04-1.615.796-.335 1.756-.575 2.912-.72.39-.046 1.033-.103 1.92-.174v-.37c0-.93-.105-1.558-.3-1.875-.302-.43-.78-.65-1.44-.65h-.182c-.48.046-.896.196-1.246.46-.35.27-.575.63-.675 1.096-.06.3-.206.465-.435.51l-2.52-.315c-.248-.06-.372-.18-.372-.39 0-.046.007-.09.022-.15.247-1.29.855-2.25 1.82-2.88.976-.616 2.1-.975 3.39-1.05h.54c1.65 0 2.957.434 3.888 1.29.135.15.27.3.405.48.12.165.224.314.283.45.075.134.15.33.195.57.06.254.105.42.135.51.03.104.062.3.076.615.01.313.02.493.02.553v5.28c0 .376.06.72.165 1.036.105.313.21.54.315.674l.51.674c.09.136.136.256.136.36 0 .12-.06.226-.18.314-1.2 1.05-1.86 1.62-1.963 1.71-.165.135-.375.15-.63.045a6.062 6.062 0 01-.526-.496l-.31-.347a9.391 9.391 0 01-.317-.42l-.3-.435c-.81.886-1.603 1.44-2.4 1.665-.494.15-1.093.227-1.83.227-1.11 0-2.04-.343-2.76-1.034-.72-.69-1.08-1.665-1.08-2.94l-.05-.076zm3.753-.438c0 .566.14 1.02.425 1.364.285.34.675.512 1.155.512.045 0 .106-.007.195-.02.09-.016.134-.023.166-.023.614-.16 1.08-.553 1.424-1.178.165-.28.285-.58.36-.91.09-.32.12-.59.135-.8.015-.195.015-.54.015-1.005v-.54c-.84 0-1.484.06-1.92.18-1.275.36-1.92 1.17-1.92 2.43l-.035-.02zm9.162 7.027c.03-.06.075-.11.132-.17.362-.243.714-.41 1.05-.5a8.094 8.094 0 011.612-.24c.14-.012.28 0 .41.03.65.06 1.05.168 1.172.33.063.09.099.228.099.39v.15c0 .51-.149 1.11-.424 1.8-.278.69-.664 1.248-1.156 1.68-.073.06-.14.09-.197.09-.03 0-.06 0-.09-.012-.09-.044-.107-.12-.064-.24.54-1.26.806-2.143.806-2.64 0-.15-.03-.27-.087-.344-.145-.166-.55-.257-1.224-.257-.243 0-.533.016-.87.046-.363.045-.7.09-1 .135-.09 0-.148-.014-.18-.044-.03-.03-.036-.047-.02-.077 0-.017.006-.03.02-.063v-.06z'/></svg>`;
-
-  function badgeExistingTidalResults() {
-    try {
-      document.querySelectorAll('.omniphony-amz-badge').forEach((b) => {
-        if (!b.closest('#omniphony-native-amazon-search')) b.remove();
-      });
-    } catch (_) {}
-  }
-
-  async function checkAndInjectNativeSearch() {
-    try {
-      const searchInputEl = document.querySelector('input[type="search"], input[data-test="search-input"], input[placeholder*="Search"], header input');
-      const hasActiveQuery = searchInputEl && searchInputEl.value && searchInputEl.value.trim().length >= 2;
-      const isSearchRoute = window.location.pathname.startsWith('/search') || window.location.href.includes('/search') || window.location.hash.includes('/search') || !!document.querySelector('.search-results, [data-test="search-results"], [data-test="search-header"]') || hasActiveQuery;
-      if (!isSearchRoute) {
-        const existing = document.getElementById('omniphony-native-amazon-search');
-        if (existing) existing.remove();
-        lastNativeSearchQuery = '';
-        return;
-      }
-
-      const searchInput = document.querySelector('input[type="search"], input[data-test="search-input"], input[placeholder*="Search"], header input');
-      let query = (searchInput && searchInput.value ? searchInput.value : '').trim();
-      if (!query && window.location.href.includes('q=')) {
-        try {
-          const u = new URL(window.location.href);
-          query = (u.searchParams.get('q') || '').trim();
-        } catch (_) {}
-      }
-
-      if (!query || query.length < 2) {
-        const existing = document.getElementById('omniphony-native-amazon-search');
-        if (existing) existing.remove();
-        badgeExistingTidalResults();
-        return;
-      }
-
-      const res = await fetch(`${API_BASE}/search/multi?q=${encodeURIComponent(query)}&limit=15`).catch(() => null);
-      if (!res || !res.ok) {
-        badgeExistingTidalResults();
-        return;
-      }
-      const data = await res.json();
-      const allTracks = data?.tracks || [];
-      const amazonTracks = allTracks.filter((t) => t.source === 'AMAZON' || t.exclusive || (t.upgrade && t.upgrade.provider === 'AMAZON'));
-
-      badgeExistingTidalResults(amazonTracks);
-
-      if (!amazonTracks.length) {
-        const existing = document.getElementById('omniphony-native-amazon-search');
-        if (existing) existing.remove();
-        return;
-      }
-
-      if (query === lastNativeSearchQuery && document.getElementById('omniphony-native-amazon-search')) {
-        return;
-      }
-      lastNativeSearchQuery = query;
-
-      // Ensure we target the actual scrollable content container on the search page
-      const searchContainer = document.querySelector('[data-test="search-results"], [data-test="search-container"], div[class*="searchView"], div[class*="searchResults"], main, [role="main"]');
-      if (!searchContainer) return;
-
-      let section = document.getElementById('omniphony-native-amazon-search');
-      if (!section) {
-        section = document.createElement('div');
-        section.id = 'omniphony-native-amazon-search';
-        section.style.cssText = 'margin:14px 20px 18px;padding:14px 16px;background:rgba(24,24,24,0.96);border:1px solid rgba(255,153,0,0.5);border-radius:8px;box-shadow:0 4px 24px rgba(0,0,0,0.7);font-family:inherit;position:relative;z-index:5;box-sizing:border-box;width:calc(100% - 40px);';
-        searchContainer.prepend(section);
-      } else if (section.parentElement !== searchContainer) {
-        searchContainer.prepend(section);
-      }
-
-      let rowsHtml = '';
-      amazonTracks.forEach((t) => {
-        const isAtmos = t.isAtmos || (t.upgrade && t.upgrade.format === 'EAC3_JOC');
-        const atmosPill = isAtmos ? `<span style='display:inline-flex;align-items:center;background:#31d8ff;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;width:max-content;'>ATMOS 5.1</span>` : '';
-        const hiResPill = (t.quality && t.quality.toLowerCase().includes('192')) || (t.quality && t.quality.toLowerCase().includes('hi-res')) ? `<span style='display:inline-flex;align-items:center;background:#00ff88;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;width:max-content;'>192kHz HI-RES</span>` : '';
-        const exclusivePill = t.exclusive ? `<span style='display:inline-flex;align-items:center;background:#7928ca;color:#fff;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;width:max-content;'>EXCLUSIVE</span>` : '';
-        const sourceBadge = `<span style='display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;gap:3px;width:max-content;'>${amazonLogoSvg}<span>AMAZON</span></span>`;
-        const coverImg = t.cover ? `<img src='${t.cover}' style='width:38px;height:38px;border-radius:4px;object-fit:cover;flex-shrink:0;' onerror="this.style.display='none'" alt=''/>` : '';
-        const mins = Math.floor((t.duration || 0) / 60);
-        const secs = String(Math.floor((t.duration || 0) % 60)).padStart(2, '0');
-        const durText = t.duration ? `${mins}:${secs}` : '';
-        const safeTitle = (t.title || '').replace(/'/g, '&#39;');
-        const safeArtist = (t.artist || '').replace(/'/g, '&#39;');
-        const safeAlbum = (t.album || '').replace(/'/g, '&#39;');
-
-        rowsHtml += `
-          <div class='omniphony-amz-row' data-track-id='${t.id}' style='display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-radius:6px;margin-bottom:4px;background:rgba(255,255,255,0.03);gap:12px;'>
-            ${coverImg}
-            <div style='flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>
-              <div style='display:flex;align-items:center;gap:4px;margin-bottom:2px;'>
-                ${sourceBadge}${exclusivePill}${atmosPill}${hiResPill}
-                <strong style='color:#fff;font-size:13px;overflow:hidden;text-overflow:ellipsis;'>${t.title}</strong>
-              </div>
-              <div style='color:#888;font-size:11px;'>${t.artist} · ${t.album}</div>
-            </div>
-            <div style='display:flex;align-items:center;gap:8px;flex-shrink:0;'>
-              <span style='color:#666;font-size:11px;min-width:32px;text-align:right;'>${durText}</span>
-              <button type='button' class='omniphony-native-play-btn' data-id='${t.id}' data-title='${safeTitle}' data-artist='${safeArtist}' data-album='${safeAlbum}' data-art='${t.cover || ""}' style='display:inline-flex;align-items:center;gap:4px;background:#232f3e;border:1px solid #ff9900;color:#ff9900;font-weight:700;font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;font-family:inherit;'>
-                ▶ Stream RealMAX
-              </button>
-              <button type='button' class='omniphony-native-dl-btn' data-id='${t.id}' data-title='${safeTitle}' data-artist='${safeArtist}' data-album='${safeAlbum}' data-year='${t.year || ""}' data-isrc='${t.isrc || ""}' data-art='${t.cover || ""}' style='display:inline-flex;align-items:center;gap:4px;background:#1b2820;border:1px solid #00ff88;color:#00ff88;font-weight:700;font-size:11px;padding:6px 9px;border-radius:4px;cursor:pointer;font-family:inherit;'>
-                ⬇
-              </button>
-            </div>
-          </div>
-        `;
-      });
-
-      section.innerHTML = `
-        <div style='display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;border-bottom:1px solid rgba(255,153,0,0.25);padding-bottom:8px;'>
-          <div style='display:flex;align-items:center;gap:8px;'>
-            <span style='display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:11px;padding:3px 7px;border-radius:4px;gap:4px;line-height:1;width:max-content;'>
-              ${amazonLogoSvg}
-              <span>AMAZON</span>
-            </span>
-            <span style='font-size:15px;font-weight:700;color:#fff;'>Eclipse Addon Results</span>
-            <span style='font-size:11px;color:#888;'>RealMAX Spatial & Hi-Res</span>
-          </div>
-          <span style='background:rgba(255,153,0,0.15);border:1px solid #ff9900;color:#ff9900;font-weight:700;font-size:10px;padding:2px 8px;border-radius:12px;'>
-            ${amazonTracks.length} available
-          </span>
-        </div>
-        <div style='max-height:360px;overflow-y:auto;'>${rowsHtml}</div>
-      `;
-
-      section.querySelectorAll('.omniphony-native-play-btn').forEach((btn) => {
-        btn.onclick = async () => {
-          const orig = btn.innerText;
-          btn.innerText = '⏳ Loading...';
-          try {
-            const amzMeta = {
-              id: btn.dataset.id,
-              title: btn.dataset.title,
-              artist: btn.dataset.artist,
-              album: btn.dataset.album,
-              cover: btn.dataset.art || '',
-            };
-            activeAmazonTrackMeta = amzMeta;
-            setTidalPlaybackIntent(true);
-            updateFooterTrackDisplayForAmazon(amzMeta);
-            fetchAndProjectLyricsForTrack(amzMeta.title, amzMeta.artist, amzMeta.id);
-            await fetch(`${API_BASE}/play`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                trackId: btn.dataset.id,
-                title: btn.dataset.title,
-                artist: btn.dataset.artist,
-                album: btn.dataset.album,
-                timePos: 0,
-                startPaused: false
-              })
-            });
-            btn.innerText = '▶ Playing';
-          } catch (err) {
-            alert('Play error: ' + err.message);
-            btn.innerText = orig;
-          }
-        };
-      });
-
-      section.querySelectorAll('.omniphony-native-dl-btn').forEach((btn) => {
-        btn.onclick = async () => {
-          btn.innerText = '⏳';
-          try {
-            const qRes = await queueTrackDownload({
-              id: btn.dataset.id,
-              title: btn.dataset.title,
-              artist: btn.dataset.artist,
-              album: btn.dataset.album,
-              year: btn.dataset.year,
-              isrc: btn.dataset.isrc,
-              albumArtUrl: btn.dataset.art,
-            });
-            alert(`Queued download for ${btn.dataset.title}! (Job: ${qRes.jobId})`);
-            btn.innerText = '✓';
-          } catch (err) {
-            alert('Download error: ' + err.message);
-            btn.innerText = '⬇';
-          }
-        };
-      });
-    } catch (e) {
-      console.debug('[Omniphony EX Search]', e);
-    }
-  }
-
-  setInterval(checkAndInjectNativeSearch, 800);
-  document.addEventListener('input', (e) => {
-    if (e.target && e.target.matches && e.target.matches('input[type="search"], input[data-test="search-input"], input[placeholder*="Search"], header input')) {
-      if (nativeSearchDebounce) clearTimeout(nativeSearchDebounce);
-      nativeSearchDebounce = setTimeout(checkAndInjectNativeSearch, 300);
-    }
-  });
-}
 
 // Native TidaLuna Settings Modal Component
 export const Settings = () => {

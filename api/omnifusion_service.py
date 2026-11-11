@@ -63,13 +63,13 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.25"
+SERVICE_VERSION = "2.1.26"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 EOF_REWIND_TIMEOUT_SECONDS = 3.0
 
 DEFAULT_SETTINGS = {
     "priority": ["AC4_IMS", "EAC3_JOC", "HI_RES_LOSSLESS", "LOSSLESS"],
-    "audio_device": "auto",
+    "audio_device": "wasapi/{30714dd9-2d0e-4cfb-9b98-558a8c5992da}",
     "volume": 100,
     "eclipse_addons": [],
     "realmax_source": "auto",
@@ -171,6 +171,9 @@ def public_track_status(metadata: dict, playback_state: str) -> dict:
         "artist": metadata.get("artist"),
         "presentationVerified": metadata.get("presentationVerified", False),
         "sourceProvider": metadata.get("sourceProvider", "TIDAL"),
+        "album": metadata.get("album"),
+        "cover": metadata.get("cover") or metadata.get("artworkURL"),
+        "artworkURL": metadata.get("artworkURL") or metadata.get("cover"),
         "lastFailure": last_failure,
     })
     return fields
@@ -1893,6 +1896,8 @@ def load_settings() -> dict:
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     settings = {**DEFAULT_SETTINGS, **json.load(f)}
+                    if settings.get("audio_device") in ("auto", None, ""):
+                        settings["audio_device"] = "wasapi/{30714dd9-2d0e-4cfb-9b98-558a8c5992da}"
                     priority = settings.get("priority")
                     if (not isinstance(priority, list)
                             or len(priority) != len(SUPPORTED_FORMAT_PRIORITY)
@@ -3322,7 +3327,6 @@ class TidalDashProxy:
                         except OSError:
                             pass
                     return
-
                 parsed = urllib.parse.urlsplit(self.path)
                 prefix = f"/{proxy.token}/segment/"
                 if parsed.path == f"/{proxy.token}/init":
@@ -4065,6 +4069,7 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
                 "sourceAudioMode": source_audio_mode,
                 "sourceProvider": "AMAZON",
                 "sourceAuthProfile": "eclipse_addon",
+                "sourceMetadata": dict(matched_track_meta),
             }
     except Exception as exc:
         print(f"[-] Eclipse addon resolution error ({requested_fmt}): {exc}")
@@ -4340,9 +4345,19 @@ def pack_flac_metadata(comments: dict[str, str], picture_bytes: bytes = None, pi
     vendor = "Omniphony EX RealMAX".encode("utf-8")
     b.write(struct.pack("<I", len(vendor)))
     b.write(vendor)
-    b.write(struct.pack("<I", len(comments)))
-    for k, v in comments.items():
-        c_bytes = f"{k.upper()}={v}".encode("utf-8", errors="replace")
+    normalized_comments = []
+    for k, values in comments.items():
+        key = str(k).strip().upper()
+        if not re.fullmatch(r"[A-Z0-9_-]+", key):
+            continue
+        if not isinstance(values, (list, tuple)):
+            values = (values,)
+        for value in values:
+            if value is not None and str(value) != "":
+                normalized_comments.append(f"{key}={str(value).replace(chr(0), ' ')}")
+    b.write(struct.pack("<I", len(normalized_comments)))
+    for item in normalized_comments:
+        c_bytes = item.encode("utf-8", errors="replace")
         b.write(struct.pack("<I", len(c_bytes)))
         b.write(c_bytes)
     blocks.append((4, b.getvalue()))
@@ -4354,34 +4369,78 @@ def pack_flac_metadata(comments: dict[str, str], picture_bytes: bytes = None, pi
         pb.write(struct.pack(">I", len(m_bytes)))
         pb.write(m_bytes)
         pb.write(struct.pack(">I", 0))
-        pb.write(struct.pack(">IIII", 1280, 1280, 24, 0))
+        # Zero means unknown. Never invent image dimensions or bit depth.
+        pb.write(struct.pack(">IIII", 0, 0, 0, 0))
         pb.write(struct.pack(">I", len(picture_bytes)))
         pb.write(picture_bytes)
         blocks.append((6, pb.getvalue()))
 
     return blocks
 
-def inject_flac_metadata(raw_flac_bytes: bytes, comments: dict[str, str], picture_bytes: bytes = None) -> bytes:
+def inject_flac_metadata(raw_flac_bytes: bytes, comments: dict[str, str], picture_bytes: bytes = None, picture_mime: str = "image/jpeg") -> bytes:
     if len(raw_flac_bytes) < 4 or raw_flac_bytes[:4] != b"fLaC":
-        return raw_flac_bytes
+        raise ValueError("download output is not a FLAC stream")
     import io, struct
     f = io.BytesIO(raw_flac_bytes)
     f.seek(4)
     kept_blocks = []
+    old_comments = {}
+    saw_streaminfo = False
+    saw_last = False
     while True:
         h = f.read(4)
-        if len(h) < 4:
-            break
+        if len(h) != 4:
+            raise ValueError("truncated FLAC metadata header")
         is_last = (h[0] & 0x80) != 0
         b_type = h[0] & 0x7F
         length = struct.unpack(">I", b"\x00" + h[1:4])[0]
         data = f.read(length)
+        if len(data) != length:
+            raise ValueError("truncated FLAC metadata block")
+        if not saw_streaminfo:
+            if b_type != 0 or length != 34:
+                raise ValueError("FLAC stream is missing a valid STREAMINFO block")
+            saw_streaminfo = True
         if b_type == 0:
             kept_blocks.append((0, data))
+        elif b_type == 4:
+            if len(data) >= 8:
+                vendor_len = struct.unpack_from("<I", data, 0)[0]
+                pos = 4 + vendor_len
+                if pos + 4 <= len(data):
+                    count = struct.unpack_from("<I", data, pos)[0]
+                    pos += 4
+                    for _ in range(min(count, 100000)):
+                        if pos + 4 > len(data):
+                            break
+                        item_len = struct.unpack_from("<I", data, pos)[0]
+                        pos += 4
+                        if pos + item_len > len(data):
+                            break
+                        item = data[pos:pos + item_len].decode("utf-8", errors="replace")
+                        pos += item_len
+                        if "=" in item:
+                            key, value = item.split("=", 1)
+                            old_comments.setdefault(key.upper(), []).append(value)
+        elif b_type == 6 and picture_bytes:
+            # Replace stale provider artwork with the exact resolved track art.
+            pass
+        else:
+            # Keep seek tables, application blocks, cuesheets and all other
+            # metadata blocks that are not explicitly replaced.
+            kept_blocks.append((b_type, data))
         if is_last:
+            saw_last = True
             break
+    if not saw_streaminfo or not saw_last:
+        raise ValueError("FLAC metadata chain is incomplete")
     audio_stream_data = f.read()
-    new_blocks = pack_flac_metadata(comments, picture_bytes=picture_bytes)
+    if not audio_stream_data:
+        raise ValueError("FLAC stream contains no audio frames")
+    merged_comments = old_comments
+    for key, value in comments.items():
+        merged_comments[str(key).upper()] = value
+    new_blocks = pack_flac_metadata(merged_comments, picture_bytes=picture_bytes, picture_mime=picture_mime)
     all_blocks = kept_blocks + new_blocks
     out = io.BytesIO()
     out.write(b"fLaC")
@@ -4396,6 +4455,248 @@ def sanitize_filename_component(val: str) -> str:
     s = re.sub(r'[\/:*?"<>|]+', '_', str(val or '')).strip()
     return s or "Unknown"
 
+def sanitize_download_component(val: str) -> str:
+    value = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", str(val or "")).strip(" .")
+    if not value:
+        return "Unknown"
+    reserved = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+    if value.split(".", 1)[0].upper() in reserved:
+        value = "_" + value
+    return value[:160].rstrip(" .") or "Unknown"
+
+
+def build_download_output_path(dest_dir: Path, path_pattern: str, replacements: dict[str, str], extension: str) -> Path:
+    """Resolve a user naming template strictly beneath the selected folder."""
+    from pathlib import PureWindowsPath
+    pattern = str(path_pattern or "{artist}/{album}/{trackNumber} - {title}")
+    for key, value in replacements.items():
+        pattern = pattern.replace(key, str(value))
+    if re.search(r"\{[^{}]+\}", pattern):
+        raise ValueError("download path template contains an unknown placeholder")
+    if PureWindowsPath(pattern).is_absolute() or PureWindowsPath(pattern).drive:
+        raise ValueError("download path template must be relative to the selected folder")
+    parts = [part for part in re.split(r"[\\/]+", pattern) if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError("download path template escapes the selected folder")
+    safe_parts = [sanitize_download_component(part) for part in parts]
+    if extension not in {"flac", "wav"}:
+        raise ValueError("unsupported download output extension")
+    safe_parts[-1] = f"{safe_parts[-1]}.{extension}"
+    root = Path(dest_dir).resolve()
+    target = root.joinpath(*safe_parts)
+    if not target.resolve().is_relative_to(root):
+        raise ValueError("download path resolves outside the selected folder")
+    return target
+
+
+def choose_nonconflicting_path(path: Path, companion_suffix: str | None = None) -> Path:
+    """Allocate a numbered name without deleting an existing completed file."""
+    def available(candidate: Path) -> bool:
+        companion = candidate.with_suffix(companion_suffix) if companion_suffix else None
+        return not candidate.exists() and (companion is None or not companion.exists())
+
+    if available(path):
+        return path
+    for index in range(2, 10000):
+        candidate = path.with_name(f"{path.stem} ({index}){path.suffix}")
+        if available(candidate):
+            return candidate
+    raise RuntimeError("could not allocate a unique output filename")
+
+
+def publish_file_without_overwrite(temp_path: Path, target_path: Path) -> Path:
+    """Atomically publish with a unique suffix; never replace an existing file."""
+    for index in range(1, 10000):
+        candidate = target_path if index == 1 else target_path.with_name(f"{target_path.stem} ({index}){target_path.suffix}")
+        try:
+            os.link(temp_path, candidate)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise RuntimeError(f"atomic no-overwrite publication is unavailable at {candidate.parent}: {exc}") from exc
+        temp_path.unlink(missing_ok=True)
+        return candidate
+    raise RuntimeError("could not allocate a unique output filename")
+
+
+def validate_picture_bytes(data: bytes, content_type: str = "") -> tuple[bytes | None, str | None]:
+    """Accept only recognizable image data before writing embedded artwork."""
+    if not data:
+        return None, None
+    if data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9"):
+        return data, "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24 and data[12:16] == b"IHDR":
+        return data, "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")) and data.endswith(b";"):
+        return data, "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return data, "image/webp"
+    return None, None
+
+
+def _id3_synchsafe(value: int) -> bytes:
+    if value < 0 or value > 0x0FFFFFFF:
+        raise ValueError("ID3 frame is too large")
+    return bytes(((value >> 21) & 0x7F, (value >> 14) & 0x7F, (value >> 7) & 0x7F, value & 0x7F))
+
+
+def make_id3_wav_chunk(comments: dict[str, str], picture_bytes: bytes = None, picture_mime: str = "image/jpeg") -> bytes:
+    """Build an ID3v2.4 tag carrying WAV metadata, lyrics and cover art."""
+    def frame(frame_id: str, payload: bytes) -> bytes:
+        return frame_id.encode("ascii") + _id3_synchsafe(len(payload)) + b"\x00\x00" + payload
+
+    field_frames = {
+        "TITLE": "TIT2", "ARTIST": "TPE1", "ALBUM": "TALB", "ALBUMARTIST": "TPE2",
+        "DATE": "TDRC", "TRACKNUMBER": "TRCK", "DISCNUMBER": "TPOS", "GENRE": "TCON",
+        "COMPOSER": "TCOM", "COPYRIGHT": "TCOP", "ISRC": "TSRC",
+    }
+    frames = []
+    for key, frame_id in field_frames.items():
+        value = comments.get(key)
+        if value:
+            frames.append(frame(frame_id, b"\x03" + str(value).encode("utf-8")))
+    reserved = set(field_frames) | {"LYRICS", "SYNCEDLYRICS"}
+    for key, value in comments.items():
+        key = str(key).upper()
+        if key not in reserved and value:
+            frames.append(frame("TXXX", b"\x03" + key.encode("utf-8") + b"\x00" + str(value).encode("utf-8")))
+    if comments.get("LYRICS"):
+        frames.append(frame("USLT", b"\x03eng\x00" + str(comments["LYRICS"]).encode("utf-8")))
+    if comments.get("SYNCEDLYRICS"):
+        body = bytearray(b"\x03eng\x02\x01\x00")
+        found = False
+        for line in str(comments["SYNCEDLYRICS"]).splitlines():
+            match = re.match(r"^\[(\d+):(\d{2})(?:[.:](\d{1,3}))?\](.*)$", line)
+            if not match:
+                continue
+            minutes, seconds, fraction, lyric = match.groups()
+            millis = int((fraction or "0").ljust(3, "0"))
+            stamp = (int(minutes) * 60 + int(seconds)) * 1000 + millis
+            body.extend(lyric.encode("utf-8") + b"\x00" + struct.pack(">I", stamp))
+            found = True
+        if found:
+            frames.append(frame("SYLT", bytes(body)))
+    if picture_bytes:
+        frames.append(frame("APIC", b"\x03" + picture_mime.encode("ascii") + b"\x00\x03\x00" + picture_bytes))
+    payload = b"".join(frames)
+    return b"ID3\x04\x00\x00" + _id3_synchsafe(len(payload)) + payload
+
+
+def tag_wav_bytes(raw_wav_bytes: bytes, comments: dict[str, str], picture_bytes: bytes = None, picture_mime: str = "image/jpeg") -> bytes:
+    """Preserve RIFF audio chunks and add INFO plus ID3 metadata to WAV."""
+    if len(raw_wav_bytes) < 12 or raw_wav_bytes[:4] != b"RIFF" or raw_wav_bytes[8:12] != b"WAVE":
+        raise ValueError("download output is not a RIFF/WAVE file")
+    chunks = []
+    pos = 12
+    while pos + 8 <= len(raw_wav_bytes):
+        chunk_id = raw_wav_bytes[pos:pos + 4]
+        size = struct.unpack_from("<I", raw_wav_bytes, pos + 4)[0]
+        start = pos + 8
+        end = start + size
+        if end > len(raw_wav_bytes):
+            raise ValueError("WAV contains a truncated chunk")
+        data = raw_wav_bytes[start:end]
+        if chunk_id not in {b"id3 ", b"ID3 "} and not (chunk_id == b"LIST" and data.startswith(b"INFO")):
+            chunks.append((chunk_id, data))
+        pos = end + (size & 1)
+    if pos != len(raw_wav_bytes):
+        raise ValueError("WAV chunk table is malformed")
+    if not any(chunk_id == b"fmt " for chunk_id, _ in chunks) or not any(chunk_id == b"data" for chunk_id, _ in chunks):
+        raise ValueError("WAV is missing a format or audio-data chunk")
+
+    info_map = {"TITLE": b"INAM", "ARTIST": b"IART", "ALBUM": b"IPRD", "DATE": b"ICRD", "TRACKNUMBER": b"IPRT", "GENRE": b"IGNR", "COMMENT": b"ICMT", "COMPOSER": b"IENG", "COPYRIGHT": b"ICOP", "ISRC": b"ISRC"}
+    info = bytearray(b"INFO")
+    for key, chunk_id in info_map.items():
+        value = comments.get(key)
+        if not value:
+            continue
+        data = str(value).encode("utf-8") + b"\x00"
+        info.extend(chunk_id + struct.pack("<I", len(data)) + data)
+        if len(data) & 1:
+            info.extend(b"\x00")
+    id3 = make_id3_wav_chunk(comments, picture_bytes, picture_mime)
+
+    out = bytearray(b"RIFF\x00\x00\x00\x00WAVE")
+    inserted_tags = False
+    for chunk_id, data in chunks:
+        if not inserted_tags and chunk_id == b"data":
+            if len(info) > 4:
+                out.extend(b"LIST" + struct.pack("<I", len(info)) + info)
+                if len(info) & 1:
+                    out.extend(b"\x00")
+            out.extend(b"id3 " + struct.pack("<I", len(id3)) + id3)
+            if len(id3) & 1:
+                out.extend(b"\x00")
+            inserted_tags = True
+        out.extend(chunk_id + struct.pack("<I", len(data)) + data)
+        if len(data) & 1:
+            out.extend(b"\x00")
+    if not inserted_tags:
+        raise ValueError("WAV has no audio-data chunk")
+    riff_size = len(out) - 8
+    if riff_size > 0xFFFFFFFF:
+        raise ValueError("WAV output exceeds RIFF's 4 GiB size limit")
+    struct.pack_into("<I", out, 4, riff_size)
+    return bytes(out)
+
+
+def metadata_text(meta: dict, *keys: str) -> str:
+    for key in keys:
+        value = meta.get(key) if isinstance(meta, dict) else None
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("title") or value.get("value")
+        if isinstance(value, (list, tuple)):
+            value = "; ".join(str(item.get("name") or item) if isinstance(item, dict) else str(item) for item in value if item)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def apply_provider_metadata(meta: dict, state: dict) -> None:
+    """Apply fields tied to the resolved provider result, without cache guessing."""
+    for target, keys in {
+        "title": ("title", "name", "fullName"),
+        "artist": ("artist", "artistName", "artists"),
+        "album": ("album", "albumTitle", "albumName"),
+        "album_artist": ("albumArtist", "album_artist", "albumArtistName"),
+        "year": ("year", "releaseYear", "releaseDate"),
+        "track_num": ("trackNumber", "track_number", "trackNum"),
+        "disc_num": ("discNumber", "disc_number", "volumeNumber"),
+        "isrc": ("isrc", "ISRC"),
+        "genre": ("genre", "genres"),
+        "composer": ("composer", "composers"),
+        "copyright": ("copyright", "copyrightLine"),
+        "art_url": ("artworkURL", "artworkUrl", "albumArtUrl", "cover", "image"),
+        "lyrics_text": ("lyrics", "plainLyrics", "unsyncedLyrics"),
+        "lyrics_synced": ("syncedLyrics", "subtitles", "lrc"),
+    }.items():
+        value = metadata_text(meta, *keys)
+        if value:
+            if target == "year":
+                value = value[:4]
+            state[target] = value
+
+
+def inspect_flac_stream(raw_flac_bytes: bytes) -> dict:
+    """Validate FLAC metadata framing and report encoded stream properties."""
+    if len(raw_flac_bytes) < 42 or raw_flac_bytes[:4] != b"fLaC":
+        raise ValueError("render output is not a complete FLAC stream")
+    first = raw_flac_bytes[4:8]
+    if first[0] & 0x7F != 0 or int.from_bytes(first[1:4], "big") != 34:
+        raise ValueError("FLAC stream is missing STREAMINFO")
+    info = raw_flac_bytes[8:42]
+    packed = int.from_bytes(info[10:18], "big")
+    sample_rate = packed >> 44
+    channels = ((packed >> 41) & 0x7) + 1
+    bits_per_sample = ((packed >> 36) & 0x1F) + 1
+    total_samples = packed & ((1 << 36) - 1)
+    if not (8000 <= sample_rate <= 384000) or channels > 8 or bits_per_sample not in range(4, 33):
+        raise ValueError("FLAC STREAMINFO contains invalid sample properties")
+    if len(raw_flac_bytes) <= 42:
+        raise ValueError("FLAC stream contains no audio frames")
+    return {"sampleRate": sample_rate, "channels": channels, "bitsPerSample": bits_per_sample, "totalSamples": total_samples}
+
+
 def execute_track_download(job_id: str, payload: dict) -> None:
     track_id = payload.get("trackId")
     title = payload.get("title") or "Unknown Title"
@@ -4403,19 +4704,28 @@ def execute_track_download(job_id: str, payload: dict) -> None:
     album = payload.get("album") or "Unknown Album"
     year = payload.get("year") or ""
     track_num = payload.get("trackNumber") or ""
+    disc_num = payload.get("discNumber") or ""
+    album_artist = payload.get("albumArtist") or ""
+    genre = payload.get("genre") or ""
+    composer = payload.get("composer") or ""
+    copyright_text = payload.get("copyright") or ""
     isrc = payload.get("isrc") or ""
     art_url = payload.get("albumArtUrl") or ""
-    dest_dir = Path(payload.get("destinationFolder") or str(STANDALONE_DIR / "downloads"))
-    ac4_fmt = (payload.get("ac4Format") or "flac").lower()
-    path_pattern = payload.get("pathPattern") or "{artist}/{album}/{title}"
 
     with DOWNLOAD_QUEUE_LOCK:
         ACTIVE_DOWNLOADS[job_id] = {
             "jobId": job_id, "trackId": track_id, "title": title, "artist": artist,
-            "status": "resolving", "progress": 5, "error": None, "outputPath": None,
+            "status": "resolving", "progress": 5, "error": None, "outputPath": None, "warnings": [],
         }
 
+    temp_dest = None
+    temp_lyrics = None
     try:
+        dest_dir = Path(payload.get("destinationFolder") or str(STANDALONE_DIR / "downloads"))
+        ac4_fmt = str(payload.get("ac4Format") or "flac").lower()
+        path_pattern = str(payload.get("pathPattern") or "{artist}/{album}/{title}")
+        if ac4_fmt not in {"flac", "wav"}:
+            raise ValueError("AC-4 download format must be WAV or FLAC")
         dest_dir.mkdir(parents=True, exist_ok=True)
         settings = load_settings()
         priority = settings.get("priority", DEFAULT_SETTINGS["priority"])
@@ -4430,7 +4740,11 @@ def execute_track_download(job_id: str, payload: dict) -> None:
             raise RuntimeError("Could not resolve audio stream for track")
 
         fmt = stream_info.get("format")
+        if fmt not in {"EAC3_JOC", "AC4_IMS", "HI_RES_LOSSLESS", "LOSSLESS"}:
+            raise RuntimeError(f"resolver returned an unsupported download format: {fmt!r}")
         provider = stream_info.get("sourceProvider") or "TIDAL"
+        if fmt == "AC4_IMS" and provider == "AMAZON":
+            raise RuntimeError("Amazon Music does not provide AC-4 IMS streams")
         stream_uri = stream_info["uri"]
         transport = stream_info.get("transport")
 
@@ -4440,52 +4754,41 @@ def execute_track_download(job_id: str, payload: dict) -> None:
             ACTIVE_DOWNLOADS[job_id]["provider"] = provider
             ACTIVE_DOWNLOADS[job_id]["progress"] = 30
 
-        sub_path = path_pattern
-        replacements = {
-            "{artist}": sanitize_filename_component(artist),
-            "{album}": sanitize_filename_component(album),
-            "{title}": sanitize_filename_component(title),
-            "{trackNumber}": str(track_num).zfill(2) if track_num else "01",
-            "{year}": str(year) if year else "",
-            "{isrc}": sanitize_filename_component(isrc),
-        }
-        for k, v in replacements.items():
-            sub_path = sub_path.replace(k, v)
-
-        ext = "wav" if (fmt == "AC4_IMS" and ac4_fmt == "wav") else "flac"
-        final_file_path = dest_dir / f"{sub_path}.{ext}"
-        final_file_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_dest = final_file_path.with_suffix(f".tmp_{uuid.uuid4().hex}.{ext}")
-
         pic_bytes = None
         pic_mime = "image/jpeg"
-        lyrics_text = ""
-        lyrics_synced = ""
+        lyrics_text = str(payload.get("lyrics") or "")
+        lyrics_synced = str(payload.get("syncedLyrics") or "")
         resolved_cover_url = art_url
 
-        # 1. Primary Metadata & Cover Art Resolution from provider
-        if provider == "AMAZON":
-            # For Amazon Music streams, pull official Amazon album art and metadata
-            try:
-                search_cache = _ECLIPSE_AUTH_CACHE.get("search_cache", {})
-                for entry in search_cache.values():
-                    if isinstance(entry, dict) and isinstance(entry.get("meta"), dict):
-                        m = entry["meta"]
-                        if m.get("artworkURL"):
-                            resolved_cover_url = m["artworkURL"]
-                        if m.get("title"):
-                            title = m["title"]
-                        if m.get("artist"):
-                            artist = m["artist"]
-                        if m.get("album"):
-                            album = m["album"]
-                        break
-            except Exception:
-                pass
+        # Amazon metadata is taken only from the exact resolved stream result.
+        metadata_state = {
+            "title": title, "artist": artist, "album": album, "album_artist": album_artist,
+            "year": year, "track_num": track_num, "disc_num": disc_num, "isrc": isrc,
+            "genre": genre, "composer": composer, "copyright": copyright_text,
+            "art_url": resolved_cover_url, "lyrics_text": lyrics_text, "lyrics_synced": lyrics_synced,
+        }
+        source_metadata = stream_info.get("sourceMetadata")
+        if provider == "AMAZON" and isinstance(source_metadata, dict):
+            apply_provider_metadata(source_metadata, metadata_state)
+        title = metadata_state["title"]
+        artist = metadata_state["artist"]
+        album = metadata_state["album"]
+        album_artist = metadata_state["album_artist"]
+        year = metadata_state["year"]
+        track_num = metadata_state["track_num"]
+        disc_num = metadata_state["disc_num"]
+        isrc = metadata_state["isrc"]
+        genre = metadata_state["genre"]
+        composer = metadata_state["composer"]
+        copyright_text = metadata_state["copyright"]
+        resolved_cover_url = metadata_state["art_url"]
+        lyrics_text = metadata_state["lyrics_text"]
+        lyrics_synced = metadata_state["lyrics_synced"]
 
-        # 2. TIDAL Metadata, Lyrics & High-Res Cover Art enrichment
+        # Enrich TIDAL tracks from python-tidal only. Amazon IDs are unrelated
+        # identifiers and must never be looked up as TIDAL track IDs.
         try:
-            sess = get_python_tidal_session()
+            sess = get_python_tidal_session() if provider != "AMAZON" else None
             if sess and str(track_id).strip().isdigit():
                 t_obj = sess.track(int(track_id))
                 if t_obj:
@@ -4498,20 +4801,29 @@ def execute_track_download(job_id: str, payload: dict) -> None:
 
                     if getattr(t_obj, "artist", None) and getattr(t_obj.artist, "name", None):
                         artist = t_obj.artist.name
+                    artists = [getattr(item, "name", "") for item in (getattr(t_obj, "artists", None) or [])]
+                    if artists:
+                        album_artist = "; ".join(name for name in artists if name) or album_artist
 
                     if getattr(t_obj, "album", None):
                         if getattr(t_obj.album, "name", None):
                             album = t_obj.album.name
                         if getattr(t_obj.album, "release_date", None):
                             year = str(t_obj.album.release_date)[:4]
-                        # Use TIDAL 1280x1280 cover art if not already set by Amazon
+                        # Keep provider art when present; otherwise use TIDAL's largest image.
                         if not resolved_cover_url and hasattr(t_obj.album, "image"):
                             resolved_cover_url = t_obj.album.image(1280) or t_obj.album.image(640)
 
                     if getattr(t_obj, "track_num", None):
                         track_num = t_obj.track_num
+                    disc_num = getattr(t_obj, "volume_num", None) or getattr(t_obj, "disc_num", None) or disc_num
                     if getattr(t_obj, "isrc", None):
                         isrc = t_obj.isrc
+                    if getattr(t_obj, "copyright", None):
+                        copyright_text = t_obj.copyright
+                    album_artist_obj = getattr(getattr(t_obj, "album", None), "artist", None)
+                    if getattr(album_artist_obj, "name", None):
+                        album_artist = album_artist_obj.name
 
                     if hasattr(t_obj, "lyrics"):
                         try:
@@ -4524,42 +4836,66 @@ def execute_track_download(job_id: str, payload: dict) -> None:
         except Exception:
             pass
 
-        # 3. Download the resolved Cover Art
+        replacements = {
+            "{artist}": sanitize_download_component(artist),
+            "{album}": sanitize_download_component(album),
+            "{title}": sanitize_download_component(title),
+            "{trackNumber}": str(track_num).zfill(2) if track_num else "01",
+            "{year}": sanitize_download_component(str(year)) if year else "",
+            "{isrc}": sanitize_download_component(isrc),
+        }
+        ext = "wav" if (fmt == "AC4_IMS" and ac4_fmt == "wav") else "flac"
+        final_file_path = build_download_output_path(dest_dir, path_pattern, replacements, ext)
+        final_file_path.parent.mkdir(parents=True, exist_ok=True)
+        final_file_path = choose_nonconflicting_path(final_file_path, ".lrc" if lyrics_synced else None)
+        temp_dest = final_file_path.with_name(f".{final_file_path.stem}.{uuid.uuid4().hex}.tmp.{ext}")
+
+        # Download only a recognized image payload for the resolved track.
         if resolved_cover_url:
             try:
                 art_req = urllib.request.Request(resolved_cover_url, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(art_req, timeout=10) as aresp:
-                    pic_bytes = aresp.read()
                     ctype = aresp.headers.get("Content-Type", "")
-                    pic_mime = "image/png" if "png" in ctype.lower() else "image/jpeg"
+                    raw_picture = aresp.read()
+                    pic_bytes, detected_mime = validate_picture_bytes(raw_picture, ctype)
+                    if pic_bytes:
+                        pic_mime = detected_mime
+                    else:
+                        print("[-] Cover art response was not a recognized image; skipping artwork")
             except Exception as e:
                 print(f"[-] Cover art download error: {e}")
-
-        if lyrics_synced:
-            try:
-                lrc_path = final_file_path.with_suffix(".lrc")
-                lrc_path.write_text(lyrics_synced, encoding="utf-8")
-            except Exception:
-                pass
 
         comments = {
             "TITLE": title,
             "ARTIST": artist,
             "ALBUM": album,
+            "ALBUMARTIST": album_artist,
             "DATE": str(year) if year else "",
             "TRACKNUMBER": str(track_num) if track_num else "",
+            "DISCNUMBER": str(disc_num) if disc_num else "",
             "ISRC": isrc,
+            "GENRE": genre,
+            "COMPOSER": composer,
+            "COPYRIGHT": copyright_text,
             "PROVIDER": provider,
             "REALMAX_FORMAT": fmt,
+            "SOURCE_QUALITY": str(stream_info.get("sourceQuality") or fmt),
+            "SOURCE_CODEC": str(stream_info.get("sourceCodec") or fmt),
+            "SOURCE_SAMPLE_RATE_HZ": str(stream_info.get("sourceSampleRate") or ""),
+            "SOURCE_CHANNELS": str(stream_info.get("sourceChannels") or ""),
+            "SOURCE_BIT_DEPTH": str(stream_info.get("sourceBitDepth") or ""),
+            "SOURCE_BITRATE_BPS": str(stream_info.get("sourceBitrate") or ""),
+            "SOURCE_BITRATE_BASIS": str(stream_info.get("sourceBitrateBasis") or ""),
             "COMMENT": f"Omniphony EX RealMAX ({fmt}) via {provider}",
         }
+        if lyrics_text:
+            comments["LYRICS"] = lyrics_text
         if lyrics_synced:
-            comments["LYRICS"] = lyrics_synced
-        elif lyrics_text:
-            comments["UNSYNCEDLYRICS"] = lyrics_text
+            comments["SYNCEDLYRICS"] = lyrics_synced
 
         if fmt == "EAC3_JOC":
-            comments["SPATIAL_BINAURAL"] = "Dolby Atmos E-AC-3 JOC 5.1 -> 48kHz 24-bit Binaural (Omniphony Studio SOFA HRIR)"
+            comments["SPATIAL_BINAURAL"] = "Dolby Atmos E-AC-3 JOC rendered to stereo PCM"
+            comments["RENDERER_REQUESTED"] = "mpv --ad=orender"
             mpv_input = stream_uri
             candidate_proxy = None
             if transport == "DASH" and stream_info.get("manifestXml"):
@@ -4591,7 +4927,13 @@ def execute_track_download(job_id: str, payload: dict) -> None:
                     candidate_proxy.close()
 
             flac_bytes = temp_dest.read_bytes()
-            tagged_flac = inject_flac_metadata(flac_bytes, comments, picture_bytes=pic_bytes)
+            rendered_info = inspect_flac_stream(flac_bytes)
+            if rendered_info["channels"] != 2:
+                raise RuntimeError("E-AC-3 JOC render did not produce stereo output")
+            comments["OUTPUT_SAMPLE_RATE_HZ"] = str(rendered_info["sampleRate"])
+            comments["OUTPUT_CHANNELS"] = str(rendered_info["channels"])
+            comments["OUTPUT_BIT_DEPTH"] = str(rendered_info["bitsPerSample"])
+            tagged_flac = inject_flac_metadata(flac_bytes, comments, picture_bytes=pic_bytes, picture_mime=pic_mime)
             temp_dest.write_bytes(tagged_flac)
 
         elif fmt == "AC4_IMS":
@@ -4606,16 +4948,30 @@ def execute_track_download(job_id: str, payload: dict) -> None:
                 conv_res = subprocess.run([str(AC4_CONVERTER), str(temp_ac4), str(temp_wav)], capture_output=True, timeout=120)
                 if conv_res.returncode != 0 or not temp_wav.is_file():
                     raise RuntimeError("OxideAV AC-4 decode failed")
+                wav_info = validate_oxideav_wav(temp_wav)
+                comments["OUTPUT_SAMPLE_RATE_HZ"] = str(wav_info["sampleRate"])
+                comments["OUTPUT_CHANNELS"] = str(wav_info["channels"])
+                comments["OUTPUT_BIT_DEPTH"] = str(wav_info["sampleWidth"] * 8)
+                comments["SPATIAL_BINAURAL"] = "Dolby AC-4 IMS decoded to stereo PCM by OxideAV"
 
                 if ac4_fmt == "wav":
                     shutil.move(temp_wav, temp_dest)
+                    tagged_wav = tag_wav_bytes(temp_dest.read_bytes(), comments, picture_bytes=pic_bytes, picture_mime=pic_mime)
+                    temp_dest.write_bytes(tagged_wav)
+                    validate_oxideav_wav(temp_dest)
                 else:
                     cmd = [str(MPV_EXE), str(temp_wav), "--vid=no", "--vo=null", f"-o={temp_dest}", "--oac=flac", "--ytdl=no"]
                     c_res = subprocess.run(cmd, capture_output=True, timeout=120)
                     if c_res.returncode != 0:
                         raise RuntimeError("Failed to encode AC-4 WAV to FLAC")
                     flac_bytes = temp_dest.read_bytes()
-                    tagged_flac = inject_flac_metadata(flac_bytes, comments, picture_bytes=pic_bytes)
+                    flac_info = inspect_flac_stream(flac_bytes)
+                    if flac_info["channels"] != 2:
+                        raise RuntimeError("AC-4 FLAC output did not preserve stereo decoded PCM")
+                    comments["OUTPUT_SAMPLE_RATE_HZ"] = str(flac_info["sampleRate"])
+                    comments["OUTPUT_CHANNELS"] = str(flac_info["channels"])
+                    comments["OUTPUT_BIT_DEPTH"] = str(flac_info["bitsPerSample"])
+                    tagged_flac = inject_flac_metadata(flac_bytes, comments, picture_bytes=pic_bytes, picture_mime=pic_mime)
                     temp_dest.write_bytes(tagged_flac)
             finally:
                 temp_ac4.unlink(missing_ok=True)
@@ -4643,23 +4999,70 @@ def execute_track_download(job_id: str, payload: dict) -> None:
                 finally:
                     candidate_proxy.close()
 
-            tagged_flac = inject_flac_metadata(flac_bytes, comments, picture_bytes=pic_bytes)
+            flac_info = inspect_flac_stream(flac_bytes)
+            source_rate = stream_info.get("sourceSampleRate")
+            source_depth = stream_info.get("sourceBitDepth")
+            if source_rate and flac_info["sampleRate"] != int(source_rate):
+                raise RuntimeError(f"FLAC output sample rate {flac_info['sampleRate']} Hz does not match source {source_rate} Hz")
+            if source_depth and flac_info["bitsPerSample"] != int(source_depth):
+                raise RuntimeError(f"FLAC output bit depth {flac_info['bitsPerSample']} does not match source {source_depth}")
+            comments["OUTPUT_SAMPLE_RATE_HZ"] = str(flac_info["sampleRate"])
+            comments["OUTPUT_CHANNELS"] = str(flac_info["channels"])
+            comments["OUTPUT_BIT_DEPTH"] = str(flac_info["bitsPerSample"])
+            tagged_flac = inject_flac_metadata(flac_bytes, comments, picture_bytes=pic_bytes, picture_mime=pic_mime)
             temp_dest.write_bytes(tagged_flac)
 
-        if final_file_path.exists():
-            final_file_path.unlink()
-        os.replace(temp_dest, final_file_path)
+        if ext == "wav":
+            validate_oxideav_wav(temp_dest)
+
+        warnings = []
+        if lyrics_synced:
+            temp_lyrics = final_file_path.with_name(f".{final_file_path.stem}.{uuid.uuid4().hex}.tmp.lrc")
+            temp_lyrics.write_text(lyrics_synced, encoding="utf-8", newline="\n")
+
+        final_file_path = publish_file_without_overwrite(temp_dest, final_file_path)
+        if temp_lyrics:
+            try:
+                lrc_path = final_file_path.with_suffix(".lrc")
+                os.link(temp_lyrics, lrc_path)
+                temp_lyrics.unlink(missing_ok=True)
+                temp_lyrics = None
+            except Exception as lyrics_exc:
+                warnings.append(f"audio saved, but synced-lyrics sidecar could not be published: {lyrics_exc}")
 
         with DOWNLOAD_QUEUE_LOCK:
             ACTIVE_DOWNLOADS[job_id]["status"] = "completed"
             ACTIVE_DOWNLOADS[job_id]["progress"] = 100
             ACTIVE_DOWNLOADS[job_id]["outputPath"] = str(final_file_path)
+            ACTIVE_DOWNLOADS[job_id]["warnings"] = warnings
+            ACTIVE_DOWNLOADS[job_id]["metadata"] = {
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "albumArtist": album_artist or None,
+                "trackNumber": str(track_num) if track_num else None,
+                "discNumber": str(disc_num) if disc_num else None,
+                "year": str(year) if year else None,
+                "isrc": isrc or None,
+                "artworkEmbedded": bool(pic_bytes),
+                "lyricsEmbedded": bool(lyrics_text or lyrics_synced),
+                "syncedLyricsSidecar": str(final_file_path.with_suffix(".lrc")) if lyrics_synced and not warnings else None,
+                "outputFormat": fmt,
+            }
 
     except Exception as exc:
         print(f"[-] Download error for {title}: {exc}")
         with DOWNLOAD_QUEUE_LOCK:
             ACTIVE_DOWNLOADS[job_id]["status"] = "failed"
             ACTIVE_DOWNLOADS[job_id]["error"] = str(exc)
+            ACTIVE_DOWNLOADS[job_id]["errorType"] = type(exc).__name__
+    finally:
+        for leftover in (temp_dest, temp_lyrics):
+            if leftover:
+                try:
+                    Path(leftover).unlink(missing_ok=True)
+                except OSError as cleanup_exc:
+                    print(f"[-] Could not clean temporary download file: {cleanup_exc}")
 
 
 active_login_flow = {
@@ -4795,8 +5198,13 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+            # The client disconnected while receiving the response. Do not
+            # retry or attempt another response on this dead connection.
+            self.close_connection = True
 
     def do_GET(self):
         if self.reject_untrusted_origin():
@@ -4988,6 +5396,57 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"error": clock_error}, status=clock_error_status)
                 return
             self.send_json(clock_response)
+
+        elif parsed.path == "/lyrics":
+            query_params = urllib.parse.parse_qs(parsed.query)
+            title_val = query_params.get("title", [""])[0].strip()
+            artist_val = query_params.get("artist", [""])[0].strip()
+            track_id_val = query_params.get("trackId", [""])[0].strip()
+            lyrics_data = None
+            try:
+                sess = get_python_tidal_session()
+                t_obj = None
+                if sess and track_id_val.isdigit():
+                    try:
+                        t_obj = sess.track(int(track_id_val))
+                    except Exception:
+                        pass
+                if sess and not t_obj and title_val:
+                    import tidalapi
+                    q_str = f"{artist_val} {title_val}".strip()
+                    search_res = sess.search(q_str, models=[tidalapi.media.Track], limit=3)
+                    for cand in search_res.get("tracks", []):
+                        if cand and getattr(cand, "name", None):
+                            t_obj = cand
+                            break
+                if t_obj and hasattr(t_obj, "lyrics"):
+                    lyr = t_obj.lyrics()
+                    if lyr and (getattr(lyr, "subtitles", None) or getattr(lyr, "text", None)):
+                        sub = getattr(lyr, "subtitles", "") or ""
+                        txt = getattr(lyr, "text", "") or ""
+                        lines = []
+                        if sub:
+                            for line in sub.splitlines():
+                                m = re.match(r"\[(\d+):(\d+(?:\.\d+)?)\s*\]\s*(.*)", line)
+                                if m:
+                                    sec = int(m.group(1)) * 60 + float(m.group(2))
+                                    lines.append({"startTime": sec, "text": m.group(3).strip()})
+                        if not lines and txt:
+                            for idx, line in enumerate(txt.splitlines()):
+                                if line.strip():
+                                    lines.append({"startTime": idx * 4.0, "text": line.strip()})
+                        if lines:
+                            lyrics_data = {
+                                "type": "Line",
+                                "data": lines,
+                                "trackId": str(t_obj.id),
+                            }
+            except Exception as exc:
+                print(f"[-] Service /lyrics resolution error: {exc}")
+            if lyrics_data:
+                self.send_json(lyrics_data)
+            else:
+                self.send_json({"error": "lyrics unavailable"}, status=404)
 
         elif parsed.path == "/search/multi":
             query_params = urllib.parse.parse_qs(parsed.query)
@@ -5181,7 +5640,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         try:
             length = int(self.headers.get("Content-Length", 0))
-            if length < 0 or length > 65536:
+            if length < 0 or length > 5000000:
                 return self.send_json({"error": "request body too large or invalid"}, status=400)
             if length:
                 self.connection.settimeout(5.0)
@@ -5200,6 +5659,11 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
             return self.send_json({"error": f"invalid JSON request: {exc}"}, status=400)
+
+        if parsed.path == "/diag":
+            with open("C:/OmniFusion-Standalone/scratch/tidal_redux_dump.json", "w", encoding="utf-8") as f:
+                json.dump(body, f, indent=2, default=str)
+            return self.send_json({"ok": True})
 
         if parsed.path == "/config":
             if not isinstance(body, dict) or not set(body).issubset({"priority", "eclipse_addons", "realmax_source"}):
@@ -5734,6 +6198,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                         "audioProfile": audio_profile,
                         "title": title,
                         "artist": artist,
+                        "album": body.get("album") or stream_info.get("album", ""),
+                        "cover": body.get("cover") or body.get("art") or stream_info.get("cover", ""),
+                        "artworkURL": body.get("cover") or body.get("art") or stream_info.get("cover", ""),
                         "requestId": request_id,
                     }
                     engine.active_generation = 0 if start_paused else generation
@@ -5769,18 +6236,12 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             })
 
         elif parsed.path == "/shutdown":
-            def do_exit():
-                time.sleep(0.5)
-                with engine.playback_lock:
-                    if engine.proc and engine.proc.poll() is None:
-                        try:
-                            engine.proc.terminate()
-                            engine.proc.wait(timeout=2)
-                        except Exception:
-                            pass
-                os._exit(0)
-            threading.Thread(target=do_exit, daemon=True).start()
-            return self.send_json({"status": "shutting_down"})
+            # Let the normal serve_forever/finally path stop owned mpv and close
+            # proxies. os._exit() here skipped cleanup and could leave children
+            # or files behind. shutdown() must run off the serving thread.
+            self.send_json({"status": "shutting_down"})
+            schedule_server_shutdown(self.server)
+            return
 
         elif parsed.path == "/pause":
             with engine.playback_lock:
@@ -6096,7 +6557,14 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
-def tidal_process_watchdog(engine):
+def schedule_server_shutdown(server):
+    """Request orderly HTTP shutdown without blocking a request worker."""
+    worker = threading.Thread(target=server.shutdown, daemon=True)
+    worker.start()
+    return worker
+
+
+def tidal_process_watchdog(engine, server):
     """Monitor TIDAL.exe; shut down mpv and exit when TIDAL is completely closed."""
     import psutil
     has_seen_tidal = False
@@ -6117,17 +6585,12 @@ def tidal_process_watchdog(engine):
                 if not has_seen_tidal:
                     if now - startup_time > 90.0:
                         print("[*] TIDAL not detected within startup grace window. Shutting down service...")
-                        os._exit(0)
+                        server.shutdown()
+                        return
                 elif now - last_tidal_seen > 20.0:
-                    print("[*] TIDAL exited: terminating mpv.exe and shutting down OmniFusion service...")
-                    with engine.playback_lock:
-                        if engine.proc and engine.proc.poll() is None:
-                            try:
-                                engine.proc.terminate()
-                                engine.proc.wait(timeout=2)
-                            except Exception:
-                                pass
-                    os._exit(0)
+                    print("[*] TIDAL exited: stopping OmniFusion service and its owned mpv process...")
+                    server.shutdown()
+                    return
         except Exception:
             pass
 
@@ -6159,6 +6622,10 @@ def ensure_single_instance() -> bool:
 
             global _SINGLE_INSTANCE_MUTEX
             _SINGLE_INSTANCE_MUTEX = CreateMutexW(None, True, "Local\\OmniFusion_Audio_Engine_Port8765_Mutex")
+            if not _SINGLE_INSTANCE_MUTEX:
+                error = ctypes.get_last_error()
+                print(f"[-] Could not create the service single-instance mutex (Windows error {error}); refusing a potentially duplicate launch.")
+                return False
             if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
                 print("[*] Single-instance mutex already held by another process. Verifying health on port...")
                 for _ in range(4):
@@ -6167,11 +6634,18 @@ def ensure_single_instance() -> bool:
                         with urllib.request.urlopen(req, timeout=1.0) as resp:
                             if resp.status == 200:
                                 print(f"[+] Active instance confirmed healthy on port {PORT}. Exiting cleanly.")
+                                kernel32.CloseHandle(_SINGLE_INSTANCE_MUTEX)
+                                _SINGLE_INSTANCE_MUTEX = None
                                 return False
                     except Exception:
                         time.sleep(0.5)
+                print("[-] Another service process owns the instance mutex but has not become healthy; refusing to start a duplicate.")
+                kernel32.CloseHandle(_SINGLE_INSTANCE_MUTEX)
+                _SINGLE_INSTANCE_MUTEX = None
+                return False
         except Exception as exc:
-            print(f"[-] Single-instance mutex check: {exc}")
+            print(f"[-] Single-instance mutex check failed; refusing a potentially duplicate launch: {exc}")
+            return False
     return True
 
 def run():
@@ -6193,7 +6667,7 @@ def run():
         sys.exit(1)
 
     print(f"[+] OmniFusion Standalone Audio Service listening on http://127.0.0.1:{PORT}")
-    threading.Thread(target=tidal_process_watchdog, args=(engine,), daemon=True).start()
+    threading.Thread(target=tidal_process_watchdog, args=(engine, server), daemon=True).start()
     settings = load_settings()
     save_settings(settings)
     threading.Thread(target=engine.ensure_mpv, kwargs={"device": settings.get("audio_device", "auto")}, daemon=True).start()
@@ -6207,8 +6681,13 @@ def run():
             engine.stream_proxy = None
         if engine.pipe:
             engine.pipe.close()
-        if engine.proc:
-            engine.proc.terminate()
+        if engine.proc and engine.proc.poll() is None:
+            try:
+                engine.proc.terminate()
+                engine.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                engine.proc.kill()
+                engine.proc.wait(timeout=3)
 
 if __name__ == "__main__":
     run()

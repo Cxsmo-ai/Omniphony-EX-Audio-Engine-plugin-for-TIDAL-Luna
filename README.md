@@ -4,11 +4,11 @@
 
 <br />
 
-[![Plugin Version](https://img.shields.io/badge/Plugin-v2.1.19-00d2c4?style=for-the-badge&logo=tidal&logoColor=white)](https://github.com/Cxsmo-ai/omniphony-tidal-luna-plugin)
-[![Engine Release](https://img.shields.io/badge/OmniFusion_Engine-v2.1.25-31d8ff?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Cxsmo-ai/omniphony-tidal-luna-plugin/releases/tag/v2.1.25)
+[![Plugin Version](https://img.shields.io/badge/Plugin-v2.1.26-00d2c4?style=for-the-badge&logo=tidal&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna)
+[![Engine Release](https://img.shields.io/badge/OmniFusion_Engine-v2.1.26-31d8ff?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases)
 [![Dolby Atmos](https://img.shields.io/badge/Dolby_Atmos-AC--4_IMS_%7C_E--AC--3_JOC-f5c400?style=for-the-badge)](docs/ARCHITECTURE.md)
 [![Hi-Res Audio](https://img.shields.io/badge/FLAC-24--bit_%2F_192_kHz-00ff88?style=for-the-badge)](docs/ARCHITECTURE.md)
-[![Tests Passing](https://img.shields.io/badge/Tests-227_Passing-00ff88?style=for-the-badge)](docs/ARCHITECTURE.md)
+[![Tests Passing](https://img.shields.io/badge/Tests-243_Passing-00ff88?style=for-the-badge)](docs/ARCHITECTURE.md)
 
 </div>
 
@@ -169,7 +169,7 @@ flowchart TD
 ## Installation & Setup Guide
 
 ### Step 1 — Download the Standalone Engine Binary Pack
-1. Go to [**Releases → v2.1.25**](https://github.com/Cxsmo-ai/omniphony-tidal-luna-plugin/releases/tag/v2.1.25) and download **`OmniFusion-Engine-win64.zip`**.
+1. Go to [**Releases**](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases) and download `OmniFusion-Engine-win64.zip` for plugin version **2.1.26**. The plugin rejects a service reporting a different version; verify `/health` before playback.
 2. Extract it to `C:\OmniFusion-Standalone` (or any custom directory of your choice). It contains:
    - `mpv/` — `mpv.exe`, `libmpv-2.dll`, and in-process `orender` spatial hooks
    - `studio/` — `omniphony-studio-egui.exe`, `orender.exe`, all speaker layout presets (`2.0` through `5.1.2`, `7.1.2`, `7.1.4`, `9.1.6`, `22.2`, and custom layouts), and the bundled Meta Audio SDK SOFA HRIR (`Meta_Universal_HRTF_192k_16384pts_512tap_32bit_Omniphony.sofa`)
@@ -177,11 +177,11 @@ flowchart TD
 
 ### Step 2 — Install the Plugin in TidaLuna
 - **Option A — TidaLuna Plugin Store / GitHub Install:**
-  Add `https://github.com/Cxsmo-ai/omniphony-tidal-luna-plugin` in TidaLuna's Plugin Manager.
+  Add `https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna` in TidaLuna's Plugin Manager.
 - **Option B — Direct Local Folder Install:**
   Clone or copy this repository into `%APPDATA%\TIDAL\plugins\omniphony-tidal-luna-plugin`:
   ```powershell
-  git clone https://github.com/Cxsmo-ai/omniphony-tidal-luna-plugin.git "$env:APPDATA\TIDAL\plugins\omniphony-tidal-luna-plugin"
+  git clone https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna.git "$env:APPDATA\TIDAL\plugins\omniphony-tidal-luna-plugin"
   ```
 - Reload TIDAL Desktop (`Ctrl+R`). The bundled Python 3.14 runtime (`api/runtime/python.exe`) starts `omnifusion_service.py` automatically when TIDAL opens and shuts it down cleanly when TIDAL closes.
 
