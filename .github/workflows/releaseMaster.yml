@@ -1,0 +1,38 @@
+name: Publish latest TidaLuna plugin store package
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**/*.md"
+      - ".vscode/**"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified Luna store package
+        uses: actions/download-artifact@v4
+        with:
+          name: omniphony-luna-release
+          path: ./release
+
+      - name: Publish latest GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          target_commitish: ${{ github.sha }}
+          name: Latest Omniphony EX
+          prerelease: false
+          overwrite_files: true
+          files: ./release/*

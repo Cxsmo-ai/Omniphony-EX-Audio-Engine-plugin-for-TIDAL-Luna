@@ -170,7 +170,15 @@ flowchart TD
 ## Installation & Setup Guide
 
 ### Step 1 — Install Omniphony EX
-Install the Omniphony EX release through the TidaLuna plugin store. For a local development install, place the repository in `%APPDATA%\TIDAL\plugins\omniphony-tidal-luna-plugin` and reload TIDAL. The store plugin is one `.mjs` entry; on first launch it downloads the version-pinned API runtime archive from this repository's GitHub release and verifies its SHA-256 before extraction.
+Install the plugin from the TidaLuna Plugin Store using the repository's latest store catalog:
+
+```text
+https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/latest/store.json
+```
+
+The store installs one bundled TidaLuna module plus its package metadata. On first launch, the module fetches the version-pinned API runtime archive from the matching GitHub release and checks its SHA-256 before extraction. Users do not install Python, `python-tidal`, or a separate API service.
+
+For local development, run `pnpm install` and `pnpm run watch` from the repository. TidaLuna exposes the loopback DEV store on port `3000`; install the Omniphony EX entry from Plugin Store. The server binds only to `127.0.0.1` and serves the generated catalog and the plugin's `.json`/`.mjs` pair.
 
 The plugin-managed API archive includes the embedded Python runtime, EbbLabs `python-tidal`, its dependencies, and the licensed AC-4 and Harletty support binaries. It does not contain account tokens. Plugin settings, TIDAL auth sessions, logs, cache, and downloads are written under the TIDAL user-data plugin directory in `data/` and survive plugin code updates.
 
@@ -196,6 +204,11 @@ MPV and Omniphony Studio remain separate user-provided applications. The Python 
 ```text
 omniphony-tidal-luna-plugin/
 ├── README.md                          # Flagship documentation, architecture & live UI gallery
+├── package.json                       # Reproducible Luna builder and workspace commands
+├── pnpm-lock.yaml                     # Pinned JavaScript dependency graph
+├── pnpm-workspace.yaml                # Luna plugin workspace definition
+├── esbuild.config.ts                  # Official luna/buildPlugins entry
+├── plugins/OmniphonyEX/               # Luna plugin package metadata and source entry
 ├── index.js                           # TidaLuna lifecycle entry point (auto-spawns/stops bundled service)
 ├── omniphony.mjs                      # Frontend engine: Web Audio detachment, 50ms clock sync, UI & Settings
 ├── manifest.json                      # TidaLuna plugin manifest & SHA-256 module integrity hash
@@ -222,6 +235,8 @@ omniphony-tidal-luna-plugin/
     ├── runtime/                       # Embedded portable Python 3.14 Windows runtime
     └── vendor/                        # Bundled dependencies (tidalapi, mpegdash, psutil, requests)
 ```
+
+`pnpm run build` writes TidaLuna's generated `store.json` and plugin `.json`/`.mjs` pair to `dist/`. GitHub Actions validates that package, builds and verifies the API runtime archive, then publishes the dotted plugin asset names expected by TidaLuna's remote-store URL resolver. `tools/verify-luna-store.py` checks that every catalog entry has both artifacts and valid metadata.
 
 For deep protocol details, loopback HTTP endpoints, and verification gates, see [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md).
 

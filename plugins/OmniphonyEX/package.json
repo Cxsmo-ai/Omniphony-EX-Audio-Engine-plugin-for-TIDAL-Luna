@@ -1,0 +1,12 @@
+{
+  "name": "Omniphony EX Audio Engine",
+  "description": "RealMAX playback for TIDAL with AC-4 IMS, E-AC-3 JOC, lossless audio, and native TIDAL transport controls.",
+  "version": "2.1.39",
+  "homepage": "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna",
+  "author": {
+    "name": "Pickymarker",
+    "url": "https://github.com/Cxsmo-ai"
+  },
+  "main": "./src/index.ts",
+  "type": "module"
+}

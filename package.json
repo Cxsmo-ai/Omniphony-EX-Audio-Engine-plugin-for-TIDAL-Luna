@@ -1,0 +1,34 @@
+{
+  "name": "@cxsmo-ai/omniphony-ex",
+  "description": "Omniphony EX Audio Engine for TidaLuna",
+  "version": "2.1.39",
+  "type": "module",
+  "author": {
+    "name": "Pickymarker",
+    "url": "https://github.com/Cxsmo-ai"
+  },
+  "homepage": "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna.git"
+  },
+  "scripts": {
+    "build": "rimraf ./dist && tsx esbuild.config.ts",
+    "watch:build": "rimraf ./dist && tsx esbuild.config.ts --watch",
+    "serve": "python tools/serve_luna_dev.py --port 3000",
+    "watch": "concurrently \"pnpm:watch:build\" \"pnpm:serve\""
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.9",
+    "@types/react": "^19.2.8",
+    "@types/react-dom": "^19.2.3",
+    "concurrently": "^9.2.1",
+    "http-server": "^14.1.1",
+    "luna": "github:Inrixia/TidaLuna#19b83373cacd55caddaa656e2481283d4ce06fd1",
+    "oby": "^15.1.2",
+    "rimraf": "^6.1.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "packageManager": "pnpm@9.13.2"
+}

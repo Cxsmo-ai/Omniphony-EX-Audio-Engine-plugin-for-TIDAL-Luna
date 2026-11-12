@@ -1,0 +1,84 @@
+name: Build and verify TidaLuna plugin store package
+
+on:
+  workflow_call:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - "codex/**"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.13.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install build dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run plugin lifecycle tests
+        run: node --test tests/*.test.mjs
+
+      - name: Build plugin modules and store catalog
+        run: pnpm run build
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Run embedded API and downloader tests
+        shell: pwsh
+        run: |
+          Push-Location api
+          try {
+            python -m unittest test_downloader test_playback_transport test_service_lifecycle
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Build and verify the bundled API runtime
+        shell: pwsh
+        run: |
+          $archive = Join-Path $PWD 'dist/OmniphonyEX-API-win-x64.tar.gz'
+          python tools/package-runtime.py --output $archive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/verify-runtime-package.py --archive $archive --plugin-module 'dist/Omniphony EX Audio Engine.mjs'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/verify-luna-store.py --dist dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prepare official release filenames
+        shell: pwsh
+        run: |
+          $release = Join-Path $PWD 'dist/release'
+          New-Item -ItemType Directory -Path $release -Force | Out-Null
+          Copy-Item 'dist/store.json' $release
+          Copy-Item 'dist/Omniphony EX Audio Engine.mjs' (Join-Path $release 'Omniphony.EX.Audio.Engine.mjs')
+          Copy-Item 'dist/Omniphony EX Audio Engine.json' (Join-Path $release 'Omniphony.EX.Audio.Engine.json')
+          Copy-Item 'dist/OmniphonyEX-API-win-x64.tar.gz' $release
+          Copy-Item 'LICENSE' $release
+          Copy-Item 'THIRD-PARTY-NOTICES.md' $release
+
+      - name: Upload release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: omniphony-luna-release
+          path: dist/release/*
+          if-no-files-found: error
