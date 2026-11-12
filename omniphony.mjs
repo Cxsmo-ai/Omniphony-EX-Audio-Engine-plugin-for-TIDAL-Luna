@@ -18,7 +18,7 @@
 const API_BASE = "http://127.0.0.1:8765";
 const REQUIRED_SERVICE_VERSION = "2.1.27";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.38";
+const PLUGIN_BUILD = "2.1.39";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -120,22 +120,58 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
 
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.38");
+    const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.39");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.38/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.39/OmniphonyEX-API-win-x64.tar.gz";
     const bundleSha256 = "D742B3E4956B514832FE3609419A3377CC35733F13A28F8EB3064EF9D2B484E3";
-    const mpvDir = String(runtimeConfig?.mpvDir || "").trim()
-      ? path.resolve(String(runtimeConfig.mpvDir).trim())
+    const readPersistedRuntimePaths = () => {
+      try {
+        const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
+        return {
+          mpvDir: typeof saved?.mpvDir === "string" ? saved.mpvDir.trim() : "",
+          studioExe: typeof saved?.studioExe === "string" ? saved.studioExe.trim() : "",
+        };
+      } catch (_) {
+        return { mpvDir: "", studioExe: "" };
+      }
+    };
+    const savedRuntimePaths = readPersistedRuntimePaths();
+    const requestedMpvDir = String(runtimeConfig?.mpvDir || savedRuntimePaths.mpvDir || "").trim();
+    const requestedStudioExe = String(runtimeConfig?.studioExe || savedRuntimePaths.studioExe || "").trim();
+    const mpvDir = requestedMpvDir
+      ? path.resolve(requestedMpvDir)
       : path.join(pluginRoot, "external", "mpv");
-    const configuredStudio = String(runtimeConfig?.studioExe || "").trim();
-    const studioExe = configuredStudio
-      ? path.resolve(configuredStudio)
+    const studioExe = requestedStudioExe
+      ? path.resolve(requestedStudioExe)
       : path.join(pluginRoot, "external", "omniphony-studio-egui.exe");
     const samePath = (left, right) => {
       if (!left || !right) return false;
       return path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase();
     };
+    const runtimeFiles = [
+      path.join(mpvDir, "mpv.exe"),
+      path.join(mpvDir, "orender.dll"),
+      studioExe,
+      path.join(path.dirname(studioExe), "orender.exe"),
+    ];
+    const missingRuntimeFiles = runtimeFiles.filter((file) => !fs.existsSync(file));
+    if (missingRuntimeFiles.length) {
+      return {
+        ready: false,
+        reason: "runtime_paths_invalid",
+        missingFiles: missingRuntimeFiles,
+      };
+    }
+    try {
+      fs.mkdirSync(path.dirname(runtimePathsFile), { recursive: true });
+      const temporaryRuntimePathsFile = runtimePathsFile + "." + process.pid + "." + Date.now() + ".tmp";
+      fs.writeFileSync(temporaryRuntimePathsFile, JSON.stringify({ mpvDir, studioExe }, null, 2), "utf8");
+      fs.renameSync(temporaryRuntimePathsFile, runtimePathsFile);
+    } catch (error) {
+      return { ready: false, reason: "runtime_paths_persist_failed", message: String(error) };
+    }
 
     const hasApiBundle = (root) => [
       "runtime/python.exe",
@@ -152,7 +188,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.38"
+        return marker.pluginVersion === "2.1.39"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -221,7 +257,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.38", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.39", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -265,6 +301,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const stopOwnedService = () => new Promise((resolve) => {
       const request = http.request({
         hostname: "127.0.0.1", port: 8765, path: "/shutdown", method: "POST", timeout: 1500,
+        headers: { Origin: "http://127.0.0.1:8765" },
       }, (response) => {
         response.resume();
         response.on("end", () => resolve(true));
@@ -304,7 +341,13 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         const settingsMatch = samePath(existing.mpvDirectory, mpvDir)
           && samePath(existing.studioExecutable, studioExe);
         if (existing.version === requiredVersion && settingsMatch) {
-          return { ready: true, version: existing.version, alreadyRunning: true };
+          return {
+            ready: true,
+            version: existing.version,
+            alreadyRunning: true,
+            mpvDirectory: existing.mpvDirectory,
+            studioExecutable: existing.studioExecutable,
+          };
         }
         await stopOwnedService();
         if (!(await waitUntilStopped())) {
@@ -354,7 +397,13 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
               || !samePath(health.studioExecutable, studioExe)) {
             return { ready: false, reason: "incompatible_service", version: health.version || null };
           }
-          return { ready: true, version: health.version, alreadyRunning: false };
+          return {
+            ready: true,
+            version: health.version,
+            alreadyRunning: false,
+            mpvDirectory: health.mpvDirectory,
+            studioExecutable: health.studioExecutable,
+          };
         }
       }
       return { ready: false, reason: "health_timeout" };
@@ -569,6 +618,14 @@ async function ensureLocalOmniFusionService() {
         getConfiguredRuntimePaths(),
       );
       if (result?.ready === true) {
+        try {
+          if (typeof result.mpvDirectory === "string") {
+            localStorage.setItem("omniphony_mpv_path", result.mpvDirectory);
+          }
+          if (typeof result.studioExecutable === "string") {
+            localStorage.setItem("omniphony_studio_path", result.studioExecutable);
+          }
+        } catch (_) {}
         console.info(`[Omniphony EX] OmniFusion service ${result.version} is healthy${result.alreadyRunning ? " (already running)" : " (started)"}.`);
         return true;
       }
