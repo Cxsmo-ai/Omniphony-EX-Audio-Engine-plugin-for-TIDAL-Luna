@@ -19,6 +19,7 @@
 **Omniphony EX** upgrades the official Windows **TIDAL Desktop** client (running **TidaLuna**) with a dedicated, multi-source spatial and Hi-Res audio engine (**OmniFusion Standalone Audio Engine**) while preserving 100% of native TIDAL UI behavior.
 
 - **True Bit-Accurate & Spatial Playback:** Routes audio through headless **`libmpv`**, **OxideAV** (`AC-4 IMS` binaural stereo decoder), and in-process **`orender.dll`** connected to **Omniphony Studio** (`E-AC-3 JOC` 3D object spatializer with SOFA HRIR binaural headphone rendering).
+- **WAV-Free AC-4 Playback:** OxideAV decodes the compressed AC-4 MP4 into a seekable stereo PCM stream for `libmpv`; playback does not write an intermediate WAV. Inactive encoded-source cache entries are pruned toward a 256 MiB limit. WAV remains an explicit downloader output choice.
 - **Deep Web Audio Detachment (No OS Muting):** Detaches TIDAL's internal Chromium media output cleanly without muting your Windows mixer or breaking TIDAL's internal player state.
 - **Sub-Millisecond UI & Lyrics Sync:** Polls `libmpv` IPC at 50 ms cadence and reconciles TIDAL Redux / Radiant player clocks every 100 ms—keeping word-by-word synced lyrics, click-to-seek lyrics, waveform scrubbing, and seamless queue auto-advance 1:1 with the audio engine.
 - **RealMAX Native Song, Album & Playlist Downloader:** Directly integrated into TIDAL's native right-click context menu and settings surfaces.
@@ -122,7 +123,7 @@ flowchart TD
     EBB -->|"AC-4 IMS MP4"| OXIDE
     EBB -->|"E-AC-3 JOC or FLAC MPD"| DASH
     TIDO -->|"E-AC-3 JOC or FLAC MPD"| DASH
-    AMZM -->|"Direct HTTPS Audio"| MPV
+    AMZM -->|"Direct HTTPS MP4 (lavf/mov)"| MPV
 
     OXIDE -->|"Verified 48kHz Binaural PCM"| MPV
     DASH -->|"HTTP Audio Segments"| MPV

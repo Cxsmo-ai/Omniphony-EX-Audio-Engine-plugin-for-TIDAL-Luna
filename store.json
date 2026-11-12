@@ -1,6 +1,6 @@
 {
   "name": "Omniphony EX Audio Engine",
-  "description": "RealMAX multi-source playback for TIDAL Luna with AC-4 IMS, E-AC-3 JOC routing, FLAC quality selection, and native transport controls.",
+  "description": "RealMAX playback for TIDAL and Eclipse Amazon Music with AC-4 IMS, E-AC-3 JOC routing, FLAC quality selection, and native transport controls.",
   "type": "module",
   "author": "Pickymarker",
   "version": "2.1.39",

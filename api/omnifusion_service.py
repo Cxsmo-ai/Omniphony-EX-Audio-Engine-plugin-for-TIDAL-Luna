@@ -53,6 +53,9 @@ MPV_DIR = configured_path("OMNIFUSION_MPV_DIR", PLUGIN_DIR / "external" / "mpv")
 OXIDE_DIR = configured_path("OMNIFUSION_OXIDE_DIR", SERVICE_DIR / "oxideav")
 CACHE_DIR = DATA_DIR / "cache"
 DOWNLOAD_DIR = DATA_DIR / "downloads"
+AC4_PLAYBACK_CACHE_MAX_BYTES = 256 * 1024 * 1024
+AC4_PLAYBACK_CACHE_MIN_AGE_SECONDS = 600
+AC4_PARTIAL_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 AC4_CONVERTER = OXIDE_DIR / "adapter-v0.1.71" / "ac4-to-wav.exe"
 STUDIO_EXE = configured_path(
     "OMNIFUSION_STUDIO_EXE",
@@ -87,6 +90,76 @@ PORT = 8765
 SERVICE_VERSION = "2.1.27"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 EOF_REWIND_TIMEOUT_SECONDS = 3.0
+
+
+def prune_ac4_playback_cache(
+    cache_dir: Path,
+    protected_paths=(),
+    max_bytes: int = AC4_PLAYBACK_CACHE_MAX_BYTES,
+    min_age_seconds: float = AC4_PLAYBACK_CACHE_MIN_AGE_SECONDS,
+    partial_max_age_seconds: float = AC4_PARTIAL_CACHE_MAX_AGE_SECONDS,
+) -> dict:
+    """Bound the service-owned compressed AC-4 playback cache without touching downloads."""
+    if max_bytes < 0 or min_age_seconds < 0 or partial_max_age_seconds < 0:
+        raise ValueError("AC-4 cache limits must be nonnegative")
+    cache_dir = Path(cache_dir)
+    if not cache_dir.is_dir():
+        return {"removedFiles": 0, "removedBytes": 0, "remainingBytes": 0}
+
+    now = time.time()
+    protected = set()
+    for item in protected_paths:
+        if item:
+            try:
+                protected.add(Path(item).resolve())
+            except (OSError, RuntimeError, TypeError):
+                continue
+
+    cached = []
+    removed_files = 0
+    removed_bytes = 0
+    cache_pattern = re.compile(r"^ac4_[A-Za-z0-9_-]+_[0-9a-f]{20}\.mp4$", re.IGNORECASE)
+    partial_pattern = re.compile(r"^\.ac4_[A-Za-z0-9_-]+_[0-9a-f]{32}\.download$", re.IGNORECASE)
+    try:
+        entries = list(cache_dir.iterdir())
+    except OSError:
+        return {"removedFiles": 0, "removedBytes": 0, "remainingBytes": 0}
+
+    for path in entries:
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            stat = path.stat()
+            if partial_pattern.fullmatch(path.name):
+                if now - stat.st_mtime >= partial_max_age_seconds:
+                    path.unlink()
+                    removed_files += 1
+                    removed_bytes += stat.st_size
+                continue
+            if cache_pattern.fullmatch(path.name):
+                cached.append((stat.st_mtime, stat.st_size, path))
+        except OSError:
+            continue
+
+    remaining_bytes = sum(size for _, size, _ in cached)
+    for modified, size, path in sorted(cached):
+        if remaining_bytes <= max_bytes:
+            break
+        if now - modified < min_age_seconds or path.resolve() in protected:
+            continue
+        try:
+            path.unlink()
+            remaining_bytes -= size
+            removed_files += 1
+            removed_bytes += size
+        except OSError:
+            continue
+
+    return {
+        "removedFiles": removed_files,
+        "removedBytes": removed_bytes,
+        "remainingBytes": remaining_bytes,
+    }
 
 DEFAULT_SETTINGS = {
     "priority": ["AC4_IMS", "EAC3_JOC", "HI_RES_LOSSLESS", "LOSSLESS"],
@@ -334,11 +407,14 @@ def prepare_mpv_output_channel_mode(fmt: str, command) -> str:
 
 
 def prepare_mpv_demuxer_format(fmt: str, command, transport: str | None = None) -> str:
-    """Select DASH explicitly for TIDAL MPDs before loading them in libmpv.
+    """Select a concrete libavformat demuxer for proxied DASH and audio MP4.
 
-    A local HTTP ``.mpd`` URL is otherwise claimed by mpv's ytdl hook and/or
-    fails demuxer auto-detection before the DASH proxy is contacted.
+    ``demuxer-lavf-format`` selects the container only after libavformat is
+    selected. Leaving ``demuxer=auto`` made extensionless loopback MPD URLs
+    fail before MPV contacted the DASH proxy.
     """
+    demuxer_format = ""
+    demuxer = "auto"
     if transport is None:
         # Preserve the resolver's historical format defaults for direct callers
         # and tests. Playback passes the resolved transport explicitly below.
@@ -347,13 +423,27 @@ def prepare_mpv_demuxer_format(fmt: str, command, transport: str | None = None) 
         normalized_transport = str(transport).strip().upper().replace("-", "_")
         if normalized_transport in {"DASH", "MPEG_DASH", "MPD"}:
             is_dash = True
-        elif normalized_transport in {"DIRECT", "HTTP", "MP4", "FILE"}:
+            demuxer = "lavf"
+        elif normalized_transport == "MP4":
+            # Eclipse providers may return an extensionless signed URL. Their
+            # audio/mp4 body needs FFmpeg's ISO-BMFF demuxer explicitly, and
+            # MPV must select lavf before applying the container override.
+            demuxer_format = "mov"
+            demuxer = "lavf"
+            is_dash = False
+        elif normalized_transport in {"DIRECT", "HTTP", "FILE"}:
             is_dash = False
         elif normalized_transport == "BTS" and fmt == "AC4_IMS":
             is_dash = False
         else:
             raise RuntimeError(f"Unsupported stream transport for {fmt}: {transport!r}")
-    demuxer_format = "dash" if is_dash else ""
+    if demuxer_format != "mov":
+        demuxer_format = "dash" if is_dash else ""
+    result = command(["set_property", "options/demuxer", demuxer])
+    if not mpv_command_succeeded(result):
+        raise RuntimeError(
+            f"MPV rejected demuxer selection for {fmt}: {result.get('error')}"
+        )
     result = command(["set_property", "demuxer-lavf-format", demuxer_format])
     if not mpv_command_succeeded(result):
         raise RuntimeError(
@@ -3951,6 +4041,70 @@ def _probe_direct_audio_bitrate(url: str, duration: float, headers: dict[str, st
     return None, None
 
 
+def _probe_direct_media_transport(url: str, headers: dict[str, str]) -> str:
+    """Identify extensionless ISO-BMFF streams without downloading the media."""
+    if not url:
+        return "DIRECT"
+    try:
+        probe_headers = {**headers, "Range": "bytes=0-63"}
+        req = urllib.request.Request(url, headers=probe_headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            status = getattr(resp, "status", 200)
+            content_range = resp.headers.get("Content-Range") or ""
+            if status not in {200, 206}:
+                return "DIRECT"
+            total_length = None
+            range_end = None
+            if status == 206:
+                match = re.fullmatch(r"bytes\s+0-(\d+)/(\d+|\*)", content_range.strip(), re.IGNORECASE)
+                if not match:
+                    return "DIRECT"
+                range_end = int(match.group(1))
+                if range_end > 63:
+                    return "DIRECT"
+                if match.group(2) != "*":
+                    total_length = int(match.group(2))
+                    if total_length <= range_end:
+                        return "DIRECT"
+            content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            content_length = resp.headers.get("Content-Length") or ""
+            expected_range_bytes = range_end + 1 if status == 206 else None
+            if (
+                expected_range_bytes is not None
+                and content_length.isdigit()
+                and int(content_length) != expected_range_bytes
+            ):
+                return "DIRECT"
+            prefix = resp.read(64)
+            if expected_range_bytes is not None and len(prefix) != expected_range_bytes:
+                return "DIRECT"
+            is_mp4_mime = content_type in {"audio/mp4", "video/mp4", "application/mp4"}
+            # The first ISO-BMFF box must be a structurally plausible ftyp
+            # box; searching for the word anywhere in the sample can mislabel
+            # unrelated payloads. Extended-size boxes carry a 64-bit size.
+            if len(prefix) < 16 or prefix[4:8] != b"ftyp":
+                continue_probe = False
+            else:
+                box_size = int.from_bytes(prefix[:4], "big")
+                if box_size == 1:
+                    box_size = int.from_bytes(prefix[8:16], "big") if len(prefix) >= 24 else 0
+                    continue_probe = len(prefix) >= 24 and box_size >= 24
+                else:
+                    continue_probe = box_size >= 16
+                known_length = total_length if status == 206 else None
+                if known_length is None and status == 200 and content_length.isdigit():
+                    known_length = int(content_length)
+                if known_length is not None and box_size > known_length:
+                    continue_probe = False
+            if is_mp4_mime and continue_probe:
+                return "MP4"
+    except Exception:
+        # Container probing is advisory for ordinary streams. Playback keeps
+        # its existing transport path when the provider cannot be probed.
+        pass
+    return "DIRECT"
+
+
 def _select_eclipse_search_track(tracks: list[dict], title: str, artist: str, requested_fmt: str, isrc: str = "", duration: int | float = 0) -> dict | None:
     """Select the best matching track from Eclipse search results."""
     valid = [t for t in tracks if isinstance(t, dict) and t.get("id")]
@@ -4352,6 +4506,7 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
 
             duration = float(s.get("duration") or matched_track_meta.get("duration") or 0)
             probed_bitrate, bitrate_basis = _probe_direct_audio_bitrate(s["url"], duration, headers)
+            detected_transport = _probe_direct_media_transport(s["url"], headers)
             explicit_bitrate = s.get("bitrate")
             if isinstance(explicit_bitrate, (int, float)) and explicit_bitrate > 0:
                 source_bitrate = int(explicit_bitrate)
@@ -4392,7 +4547,7 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
                 "codec": norm_codec,
                 "label": human_label,
                 "uri": s["url"],
-                "transport": "DIRECT",
+                "transport": detected_transport,
                 "sourceCodec": source_codec,
                 "sourceBitrate": source_bitrate,
                 "sourceBitrateBasis": source_bitrate_basis,
@@ -6194,6 +6349,17 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 # Cache only the encoded source MP4. OxideAV decodes it into a
                 # seekable local raw-PCM endpoint; playback never writes a WAV.
                 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                active_proxy = engine.stream_proxy
+                cache_result = prune_ac4_playback_cache(
+                    CACHE_DIR,
+                    protected_paths=(getattr(active_proxy, "input_path", None),),
+                )
+                if cache_result["removedFiles"]:
+                    print(
+                        "[+] Pruned AC-4 playback cache: "
+                        f"{cache_result['removedFiles']} files, "
+                        f"{cache_result['removedBytes']} bytes removed"
+                    )
                 download_temp = CACHE_DIR / f".ac4_{track_id}_{uuid.uuid4().hex}.download"
                 try:
                     print(f"[*] Downloading AC-4 IMS stream for {track_id}...")

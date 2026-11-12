@@ -12,7 +12,7 @@ import tarfile
 from pathlib import Path
 
 
-EXCLUDED_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+EXCLUDED_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "tests"}
 FORBIDDEN_NAMES = {".env", "token.json", "tidal-session.json"}
 REQUIRED_FILES = (
     "api/omnifusion_service.py",
@@ -40,6 +40,8 @@ def included_files(api_root: Path) -> list[Path]:
         for filename in sorted(filenames):
             path = current_path / filename
             if filename.endswith((".pyc", ".pyo")):
+                continue
+            if current_path == api_root and filename.startswith("test_") and filename.endswith(".py"):
                 continue
             lower_name = filename.casefold()
             if lower_name in FORBIDDEN_NAMES or lower_name.startswith(".env."):
