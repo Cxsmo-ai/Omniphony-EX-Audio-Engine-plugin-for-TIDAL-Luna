@@ -47,7 +47,7 @@ jobs:
         run: |
           Push-Location api
           try {
-            python -m unittest test_downloader test_playback_transport test_service_lifecycle
+            python -m unittest test_downloader test_package_runtime test_playback_transport test_service_lifecycle
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } finally {
             Pop-Location

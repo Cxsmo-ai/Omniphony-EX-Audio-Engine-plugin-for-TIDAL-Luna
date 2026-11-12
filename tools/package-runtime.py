@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import io
 import os
 import stat
 import tarfile
@@ -56,6 +57,18 @@ def included_files(api_root: Path) -> list[Path]:
     return sorted(result, key=lambda path: path.relative_to(api_root.parent).as_posix())
 
 
+def stable_file_bytes(path: Path) -> bytes:
+    """Normalize text newlines so Git's Windows checkout mode cannot change the archive digest."""
+    data = path.read_bytes()
+    if b"\x00" in data:
+        return data
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+    return data.replace(b"\r\n", b"\n")
+
+
 def write_archive(repo_root: Path, output: Path) -> str:
     api_root = repo_root / "api"
     if not api_root.is_dir():
@@ -87,14 +100,14 @@ def write_archive(repo_root: Path, output: Path) -> str:
                 archive.addfile(api_info)
                 for path in files:
                     arcname = path.relative_to(repo_root).as_posix()
+                    payload = stable_file_bytes(path)
                     info = tarfile.TarInfo(arcname)
-                    info.size = path.stat().st_size
+                    info.size = len(payload)
                     info.mode = stat.S_IMODE(path.stat().st_mode) or 0o644
                     info.mtime = 0
                     info.uid = info.gid = 0
                     info.uname = info.gname = ""
-                    with path.open("rb") as source:
-                        archive.addfile(info, source)
+                    archive.addfile(info, io.BytesIO(payload))
     return digest.hexdigest().upper()
 
 

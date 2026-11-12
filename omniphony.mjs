@@ -125,7 +125,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
     const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.39/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "8E4CD8CF7F6BEA73AE285F1545980ACF022527082091F271EFF023F7B8519832";
+    const bundleSha256 = "97A958363092DA636FD862B4C76366589319B4FA26024C4A74F7C67278074D38";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
