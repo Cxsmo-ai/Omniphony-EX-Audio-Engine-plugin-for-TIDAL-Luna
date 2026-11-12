@@ -88,7 +88,7 @@ class DownloaderTests(unittest.TestCase):
                     service.build_download_output_path(root, pattern, {"{title}": "Song"}, "flac")
             path = service.build_download_output_path(root, "{artist}/{title}",
                                                       {"{artist}": "CON", "{title}": "song."}, "flac")
-            self.assertEqual(path, root / "_CON" / "song.flac")
+            self.assertEqual(path.resolve(), (root / "_CON" / "song.flac").resolve())
 
     def test_publication_allocates_unique_name_without_overwriting(self):
         with tempfile.TemporaryDirectory() as temp:
