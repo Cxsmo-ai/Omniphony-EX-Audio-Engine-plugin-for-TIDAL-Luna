@@ -4,11 +4,11 @@
 
 <br />
 
-[![Plugin Version](https://img.shields.io/badge/Plugin-v2.1.19-00d2c4?style=for-the-badge&logo=tidal&logoColor=white)](https://github.com/Cxsmo-ai/omniphony-tidal-luna-plugin)
-[![Engine Release](https://img.shields.io/badge/OmniFusion_Engine-v2.1.25-31d8ff?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Cxsmo-ai/omniphony-tidal-luna-plugin/releases/tag/v2.1.25)
+[![Plugin Version](https://img.shields.io/badge/Plugin-v2.1.38-00d2c4?style=for-the-badge&logo=tidal&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna)
+[![API Service](https://img.shields.io/badge/API_Service-v2.1.27-31d8ff?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases)
 [![Dolby Atmos](https://img.shields.io/badge/Dolby_Atmos-AC--4_IMS_%7C_E--AC--3_JOC-f5c400?style=for-the-badge)](docs/ARCHITECTURE.md)
 [![Hi-Res Audio](https://img.shields.io/badge/FLAC-24--bit_%2F_192_kHz-00ff88?style=for-the-badge)](docs/ARCHITECTURE.md)
-[![Tests Passing](https://img.shields.io/badge/Tests-227_Passing-00ff88?style=for-the-badge)](docs/ARCHITECTURE.md)
+[![Bundled API](https://img.shields.io/badge/API-Python%20%2B%20python--tidal-00ff88?style=for-the-badge)](docs/ARCHITECTURE.md)
 
 </div>
 
@@ -168,29 +168,25 @@ flowchart TD
 
 ## Installation & Setup Guide
 
-### Step 1 — Download the Standalone Engine Binary Pack
-1. Go to [**Releases → v2.1.25**](https://github.com/Cxsmo-ai/omniphony-tidal-luna-plugin/releases/tag/v2.1.25) and download **`OmniFusion-Engine-win64.zip`**.
-2. Extract it to `C:\OmniFusion-Standalone` (or any custom directory of your choice). It contains:
-   - `mpv/` — `mpv.exe`, `libmpv-2.dll`, and in-process `orender` spatial hooks
-   - `studio/` — `omniphony-studio-egui.exe`, `orender.exe`, all speaker layout presets (`2.0` through `5.1.2`, `7.1.2`, `7.1.4`, `9.1.6`, `22.2`, and custom layouts), and the bundled Meta Audio SDK SOFA HRIR (`Meta_Universal_HRTF_192k_16384pts_512tap_32bit_Omniphony.sofa`)
-   - `oxideav/` — `ac4-to-wav.exe` (`adapter-v0.1.71`) for Dolby AC-4 IMS verification & decoding
+### Step 1 — Install Omniphony EX
+Install the Omniphony EX release through the TidaLuna plugin store. For a local development install, place the repository in `%APPDATA%\TIDAL\plugins\omniphony-tidal-luna-plugin` and reload TIDAL. The store plugin is one `.mjs` entry; on first launch it downloads the version-pinned API runtime archive from this repository's GitHub release and verifies its SHA-256 before extraction.
 
-### Step 2 — Install the Plugin in TidaLuna
-- **Option A — TidaLuna Plugin Store / GitHub Install:**
-  Add `https://github.com/Cxsmo-ai/omniphony-tidal-luna-plugin` in TidaLuna's Plugin Manager.
-- **Option B — Direct Local Folder Install:**
-  Clone or copy this repository into `%APPDATA%\TIDAL\plugins\omniphony-tidal-luna-plugin`:
-  ```powershell
-  git clone https://github.com/Cxsmo-ai/omniphony-tidal-luna-plugin.git "$env:APPDATA\TIDAL\plugins\omniphony-tidal-luna-plugin"
-  ```
-- Reload TIDAL Desktop (`Ctrl+R`). The bundled Python 3.14 runtime (`api/runtime/python.exe`) starts `omnifusion_service.py` automatically when TIDAL opens and shuts it down cleanly when TIDAL closes.
+The plugin-managed API archive includes the embedded Python runtime, EbbLabs `python-tidal`, its dependencies, and the licensed AC-4 and Harletty support binaries. It does not contain account tokens. Plugin settings, TIDAL auth sessions, logs, cache, and downloads are written under the TIDAL user-data plugin directory in `data/` and survive plugin code updates.
 
-### Step 3 — Configure Paths, Audio Device & Providers
-1. Click the **Omniphony EX** badge in the bottom-right corner of TIDAL's player bar (or open **TIDAL Settings → Plugins → Omniphony EX**).
-2. Confirm your **MPV Engine Folder** (`C:\OmniFusion-Standalone\mpv`) and **Omniphony Studio Path** (`C:\OmniFusion-Standalone\studio\omniphony-studio-egui.exe`).
-3. Select your **WASAPI Audio Output Device** (e.g., `Voicemeeter Input (VB-Audio Voicemeeter VAIO)` or your dedicated DAC/headphone endpoint).
-4. Click **Link / Authenticate TIDAL Account** to authorize the bundled `python-tidal` API for full Dolby AC-4 IMS + E-AC-3 JOC support.
-5. *(Optional)* Paste your personal Eclipse `manifest.json` URL under **Eclipse Addon Providers** and click **+ Add Eclipse Manifest / Provider** to enable multi-source TIDAL + Amazon Music RealMAX resolution.
+### Step 2 — Select the two external engine paths
+In **TIDAL Settings → Plugins → Omniphony EX**, set:
+
+1. **MPV Engine Folder** to the folder containing the `mpv.exe` and compatible `orender.dll` build you use.
+2. **Omniphony Studio Path** to `omniphony-studio-egui.exe`.
+3. **WASAPI Audio Output Device** to the intended endpoint, such as Voicemeeter Input.
+
+MPV and Omniphony Studio remain separate user-provided applications. The Python API, TIDAL authentication flow, OxideAV adapter, and Harletty bridge libraries are managed by the plugin. No ASIO output selection is required for the configured WASAPI route.
+
+### Step 3 — Authenticate and choose sources
+1. Click **Link / Authenticate TIDAL Account** to authorize the bundled `python-tidal` API.
+2. Set the RealMAX format order and source mode in plugin settings.
+3. Optionally paste an Eclipse addon `manifest.json` URL under **Eclipse Addon Providers** for Amazon Music/Eclipse resolution.
+4. Apply the engine paths and confirm the service health and selected output device before starting a track.
 
 ---
 

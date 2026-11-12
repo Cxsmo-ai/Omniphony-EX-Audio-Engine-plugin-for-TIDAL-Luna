@@ -16,9 +16,9 @@
  */
 
 const API_BASE = "http://127.0.0.1:8765";
-const REQUIRED_SERVICE_VERSION = "2.1.25";
+const REQUIRED_SERVICE_VERSION = "2.1.27";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.25";
+const PLUGIN_BUILD = "2.1.38";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -102,6 +102,271 @@ const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
     return { installed: false, restored: true };
   },
 };`;
+const NATIVE_SERVICE_SUPERVISOR_MODULE_ID = "OmniphonyEX/service-supervisor.native.js";
+const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
+  async ensureService(requiredVersion, runtimeConfig = {}) {
+    const fs = require("fs");
+    const path = require("path");
+    const http = require("http");
+    const { spawn, spawnSync } = require("child_process");
+    const app = require("electron").app;
+    const stateKey = Symbol.for("omniphony-ex.native-service-supervisor");
+    const shared = globalThis[stateKey] ||
+      (globalThis[stateKey] = { startPromise: null, child: null });
+
+    if (!app || typeof app.getPath !== "function") {
+      return { ready: false, reason: "electron_user_data_unavailable" };
+    }
+
+    const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
+    const dataRoot = path.join(pluginRoot, "data");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.38");
+    const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
+    const localApiRoot = path.join(pluginRoot, "api");
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.38/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "D742B3E4956B514832FE3609419A3377CC35733F13A28F8EB3064EF9D2B484E3";
+    const mpvDir = String(runtimeConfig?.mpvDir || "").trim()
+      ? path.resolve(String(runtimeConfig.mpvDir).trim())
+      : path.join(pluginRoot, "external", "mpv");
+    const configuredStudio = String(runtimeConfig?.studioExe || "").trim();
+    const studioExe = configuredStudio
+      ? path.resolve(configuredStudio)
+      : path.join(pluginRoot, "external", "omniphony-studio-egui.exe");
+    const samePath = (left, right) => {
+      if (!left || !right) return false;
+      return path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase();
+    };
+
+    const hasApiBundle = (root) => [
+      "runtime/python.exe",
+      "omnifusion_service.py",
+      "vendor/tidalapi/__init__.py",
+      "oxideav/adapter-v0.1.71/ac4-to-wav.exe",
+      "oxideav/adapter-v0.1.71/omnifusion_ac4_adapter.dll",
+      "oxideav/adapter-v0.1.71/LICENSE",
+      "harletty/v0.9.0/harletty_dolby_bridge.dll",
+      "harletty/v0.9.0/harletty_dts_bridge.dll",
+      "harletty/v0.9.0/harletty_iamf_bridge.dll",
+      "harletty/v0.9.0/LICENSE",
+    ].every((relative) => fs.existsSync(path.join(root, ...relative.split("/"))));
+    const hasVerifiedRuntimeBundle = () => {
+      try {
+        const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
+        return marker.pluginVersion === "2.1.38"
+          && marker.serviceVersion === requiredVersion
+          && marker.sha256 === bundleSha256;
+      } catch (_) {
+        return false;
+      }
+    };
+
+    const downloadBundle = (url, outputPath, redirects = 0) => new Promise((resolve, reject) => {
+      if (redirects > 6) return reject(new Error("too many release redirects"));
+      let parsed;
+      try { parsed = new URL(url); } catch (error) { return reject(error); }
+      if (parsed.protocol !== "https:") return reject(new Error("runtime bundle URL must use HTTPS"));
+      const https = require("https");
+      const crypto = require("crypto");
+      const request = https.get(parsed, (response) => {
+        if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
+          response.resume();
+          return downloadBundle(new URL(response.headers.location, parsed).toString(), outputPath, redirects + 1)
+            .then(resolve, reject);
+        }
+        if (response.statusCode !== 200) {
+          response.resume();
+          return reject(new Error("runtime bundle download returned HTTP " + response.statusCode));
+        }
+        const hash = crypto.createHash("sha256");
+        const output = fs.createWriteStream(outputPath, { flags: "wx" });
+        let bytes = 0;
+        response.on("data", (chunk) => {
+          bytes += chunk.length;
+          if (bytes > 512 * 1024 * 1024) request.destroy(new Error("runtime bundle exceeded 512 MiB"));
+          else hash.update(chunk);
+        });
+        response.on("error", (error) => output.destroy(error));
+        output.on("error", reject);
+        output.on("finish", () => resolve({ bytes, sha256: hash.digest("hex").toUpperCase() }));
+        response.pipe(output);
+      });
+      request.setTimeout(30000, () => request.destroy(new Error("runtime bundle download timed out")));
+      request.on("error", reject);
+    });
+
+    const installRuntimeBundle = async () => {
+      if (hasApiBundle(bundledApiRoot) && hasVerifiedRuntimeBundle()) return bundledApiRoot;
+      fs.mkdirSync(path.dirname(bundledRuntimeRoot), { recursive: true });
+      const archive = path.join(pluginRoot, ".omniphony-runtime-" + process.pid + "-" + Date.now() + ".tar.gz");
+      const staging = path.join(path.dirname(bundledRuntimeRoot), ".stage-" + process.pid + "-" + Date.now());
+      try {
+        const downloaded = await downloadBundle(bundleUrl, archive);
+        if (downloaded.sha256 !== bundleSha256) throw new Error("runtime bundle SHA-256 did not match the pinned release digest");
+        const tarExe = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe");
+        if (!fs.existsSync(tarExe)) throw new Error("Windows tar.exe is unavailable for runtime bundle extraction");
+        const listing = spawnSync(tarExe, ["-tzf", archive], {
+          encoding: "utf8", windowsHide: true, timeout: 120000, maxBuffer: 4 * 1024 * 1024,
+        });
+        if (listing.error || listing.status !== 0) throw new Error("runtime bundle archive validation failed: " + (listing.error || listing.stderr));
+        const entries = String(listing.stdout || "").split(/\r?\n/).filter(Boolean);
+        if (!entries.length || entries.some((entry) => {
+          const normalized = entry.replace(/\\/g, "/");
+          return normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized)
+            || normalized.split("/").some((part) => part === "..")
+            || !(normalized === "api" || normalized.startsWith("api/"));
+        })) throw new Error("runtime bundle contains an unexpected path");
+        fs.mkdirSync(staging, { recursive: true });
+        const extracted = spawnSync(tarExe, ["-xzf", archive, "-C", staging], {
+          encoding: "utf8", windowsHide: true, timeout: 120000, maxBuffer: 4 * 1024 * 1024,
+        });
+        if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
+        if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
+        const marker = { pluginVersion: "2.1.38", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
+        if (fs.existsSync(bundledRuntimeRoot)) {
+          const backup = bundledRuntimeRoot + ".previous-" + Date.now();
+          fs.renameSync(bundledRuntimeRoot, backup);
+        }
+        fs.renameSync(staging, bundledRuntimeRoot);
+        return bundledApiRoot;
+      } finally {
+        try { fs.rmSync(archive, { force: true }); } catch (_) {}
+        try { fs.rmSync(staging, { recursive: true, force: true }); } catch (_) {}
+      }
+    };
+
+    const readHealth = () => new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      const request = http.get({ hostname: "127.0.0.1", port: 8765, path: "/health", timeout: 1200 }, (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > 16384) request.destroy(new Error("health response too large"));
+        });
+        response.on("end", () => {
+          try {
+            const health = JSON.parse(body);
+            finish(response.statusCode === 200 ? health : null);
+          } catch (_) {
+            finish(null);
+          }
+        });
+      });
+      request.on("error", () => finish(null));
+      request.on("timeout", () => request.destroy(new Error("health request timed out")));
+    });
+
+    const stopOwnedService = () => new Promise((resolve) => {
+      const request = http.request({
+        hostname: "127.0.0.1", port: 8765, path: "/shutdown", method: "POST", timeout: 1500,
+      }, (response) => {
+        response.resume();
+        response.on("end", () => resolve(true));
+      });
+      request.on("error", () => resolve(false));
+      request.on("timeout", () => request.destroy(new Error("shutdown request timed out")));
+      request.end();
+    });
+
+    const waitUntilStopped = async () => {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        if (!(await readHealth())) return true;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      return false;
+    };
+
+    if (shared.startPromise) return shared.startPromise;
+    shared.startPromise = (async () => {
+      fs.mkdirSync(pluginRoot, { recursive: true });
+      let apiRoot = fs.existsSync(path.join(pluginRoot, ".git")) && hasApiBundle(localApiRoot)
+        ? localApiRoot
+        : (hasApiBundle(bundledApiRoot) && hasVerifiedRuntimeBundle() ? bundledApiRoot : null);
+      if (!apiRoot) apiRoot = await installRuntimeBundle();
+      const pythonExe = path.join(apiRoot, "runtime", "python.exe");
+      const serviceScript = path.join(apiRoot, "omnifusion_service.py");
+      let existing = await readHealth();
+      if (existing?.status === "ok") {
+        if (!samePath(existing.pluginRoot, pluginRoot)) {
+          return {
+            ready: false,
+            reason: "service_owned_elsewhere",
+            version: existing.version || null,
+            servicePid: existing.servicePid || null,
+          };
+        }
+        const settingsMatch = samePath(existing.mpvDirectory, mpvDir)
+          && samePath(existing.studioExecutable, studioExe);
+        if (existing.version === requiredVersion && settingsMatch) {
+          return { ready: true, version: existing.version, alreadyRunning: true };
+        }
+        await stopOwnedService();
+        if (!(await waitUntilStopped())) {
+          return { ready: false, reason: "owned_service_would_not_stop", version: existing.version || null };
+        }
+      }
+
+      if (!fs.existsSync(pythonExe) || !fs.existsSync(serviceScript)) {
+        return { ready: false, reason: "service_bundle_missing", pluginRoot };
+      }
+      fs.mkdirSync(dataRoot, { recursive: true });
+
+      let spawnError = null;
+      let child;
+      try {
+        child = spawn(pythonExe, [serviceScript], {
+          cwd: apiRoot,
+          detached: true,
+          windowsHide: true,
+          stdio: "ignore",
+          env: {
+            ...process.env,
+            OMNIFUSION_PLUGIN_DIR: pluginRoot,
+            OMNIFUSION_DATA_DIR: dataRoot,
+            OMNIFUSION_MPV_DIR: mpvDir,
+            OMNIFUSION_STUDIO_EXE: studioExe,
+            OMNIFUSION_OXIDE_DIR: path.join(apiRoot, "oxideav"),
+            OMNIFUSION_HARLETTY_DIR: path.join(apiRoot, "harletty", "v0.9.0"),
+          },
+        });
+        child.once("error", (error) => { spawnError = error; });
+        child.unref();
+        shared.child = child;
+      } catch (error) {
+        return { ready: false, reason: "spawn_failed", message: String(error) };
+      }
+
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        if (spawnError) {
+          return { ready: false, reason: "spawn_failed", message: String(spawnError) };
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const health = await readHealth();
+        if (health?.status === "ok") {
+          if (health.version !== requiredVersion || !samePath(health.pluginRoot, pluginRoot)
+              || !samePath(health.dataRoot, dataRoot) || !samePath(health.mpvDirectory, mpvDir)
+              || !samePath(health.studioExecutable, studioExe)) {
+            return { ready: false, reason: "incompatible_service", version: health.version || null };
+          }
+          return { ready: true, version: health.version, alreadyRunning: false };
+        }
+      }
+      return { ready: false, reason: "health_timeout" };
+    })();
+
+    try {
+      return await shared.startPromise;
+    } finally {
+      shared.startPromise = null;
+    }
+  },
+};`;
 const SYNC_POLL_INTERVAL_MS = 100;
 const CLOCK_POLL_INTERVAL_MS = 50;
 const PLAY_INTENT_RECONCILIATION_WINDOW_MS = 1000;
@@ -137,7 +402,8 @@ const transportCommandQueues = new Map();
 const transportCommandsInFlight = new Map();
 let prepareNextSelectionPaused = false;
 let autoAdvanceEnabled = true;
-let lastAutoAdvancedTrackId = null;
+let lastAutoAdvancedPlaybackIdentity = null;
+let lastAutoAdvanceUnavailableIdentity = null;
 let pausedSelectionPending = null;
 let pausedSelectionConfirmedTrackId = null;
 let pausedSelectionUserPlayAuthorization = null;
@@ -145,6 +411,9 @@ let lastMirroredUiTime = null;
 let lastEngineStateCommandAt = 0;
 let previousEngineSample = null;
 let lastTidalSeekIntent = null;
+let seekToEndPlaybackIdentity = null;
+let seekToEndTargetPosition = null;
+let seekToEndProgressObserved = false;
 let pluginDisposed = false;
 let currentFormatLabel = "Omniphony EX";
 let currentStatusData = {};
@@ -258,9 +527,73 @@ function isRadiantLyricsObserverGenerationCurrent(generation) {
   return Number(globalThis[key]) === generation;
 }
 
+const SERVICE_STARTUP_STATE_KEY = Symbol.for("omniphony-ex.service-startup-state");
+
+function getConfiguredRuntimePaths() {
+  try {
+    return {
+      mpvDir: String(localStorage.getItem("omniphony_mpv_path") || "").trim(),
+      studioExe: String(localStorage.getItem("omniphony_studio_path") || "").trim(),
+    };
+  } catch (_) {
+    return { mpvDir: "", studioExe: "" };
+  }
+}
+
+async function ensureLocalOmniFusionService() {
+  const sharedState = globalThis[SERVICE_STARTUP_STATE_KEY] ||
+    (globalThis[SERVICE_STARTUP_STATE_KEY] = { starting: false, promise: null });
+  if (sharedState.starting && sharedState.promise) return sharedState.promise;
+
+  sharedState.starting = true;
+  sharedState.promise = (async () => {
+    const ipc = window?.__ipcRenderer;
+    if (typeof ipc?.invoke !== "function") {
+      console.error("[Omniphony EX] Cannot auto-start OmniFusion: TidaLuna native IPC is unavailable.");
+      return false;
+    }
+
+    try {
+      const channel = await ipc.invoke(
+        "__Luna.registerNative",
+        NATIVE_SERVICE_SUPERVISOR_MODULE_ID,
+        NATIVE_SERVICE_SUPERVISOR_MODULE_CODE,
+      );
+      if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) {
+        throw new Error("TidaLuna did not return the native service-supervisor IPC channel");
+      }
+      const result = await ipc.invoke(
+        channel,
+        "ensureService",
+        REQUIRED_SERVICE_VERSION,
+        getConfiguredRuntimePaths(),
+      );
+      if (result?.ready === true) {
+        console.info(`[Omniphony EX] OmniFusion service ${result.version} is healthy${result.alreadyRunning ? " (already running)" : " (started)"}.`);
+        return true;
+      }
+      console.error("[Omniphony EX] Native service supervisor could not start OmniFusion:", result);
+      return false;
+    } catch (error) {
+      console.error("[Omniphony EX] Native service startup request failed:", error);
+      return false;
+    }
+  })();
+
+  try {
+    return await sharedState.promise;
+  } finally {
+    sharedState.starting = false;
+    sharedState.promise = null;
+  }
+}
+
 function onLoad() {
   pluginDisposed = false;
   console.log(`[Omniphony EX] Initializing ultra-native TidaLuna audio bridge (${PLUGIN_BUILD})...`);
+  void ensureLocalOmniFusionService().catch((error) => {
+    console.error("[Omniphony EX] Unexpected local service startup failure:", error);
+  });
   tracePlaybackEvent("plugin-initialized");
   try {
     if (window.Syllables && typeof window.Syllables === "object") {
@@ -405,9 +738,6 @@ async function checkPlaybackReadiness() {
   if (!Array.from(controls).some((control) => hasVisibleLayout(control))) {
     return { ready: false, reason: "TIDAL playback controls are present but not visibly laid out." };
   }
-  if (!settingsUiVerified) {
-    return { ready: false, reason: "Open the Omniphony controls once and verify priority, playback status, and the requested output device before playback." };
-  }
   if (!nativePlayerCommandHookInstalled) {
     return {
       ready: false,
@@ -416,9 +746,10 @@ async function checkPlaybackReadiness() {
   }
 
   try {
-    const [healthResponse, config] = await Promise.all([
+    const [healthResponse, config, devicesResponse] = await Promise.all([
       requestWithTimeout(`${API_BASE}/health`, { cache: "no-store" }, 2500),
-      fetchConfig()
+      fetchConfig(),
+      requestWithTimeout(`${API_BASE}/devices`, { cache: "no-store" }, 2500)
     ]);
     if (!healthResponse.ok) {
       return { ready: false, reason: `OmniFusion health check returned HTTP ${healthResponse.status}.` };
@@ -441,9 +772,21 @@ async function checkPlaybackReadiness() {
     if (config.audio_device !== REQUIRED_AUDIO_DEVICE) {
       return { ready: false, reason: "The configured audio device does not match the required WASAPI endpoint." };
     }
+    if (!devicesResponse.ok) {
+      return { ready: false, reason: `OmniFusion device check returned HTTP ${devicesResponse.status}.` };
+    }
+    const devicesPayload = await devicesResponse.json();
+    if (!Array.isArray(devicesPayload?.devices)) {
+      return { ready: false, reason: "OmniFusion returned an invalid audio device list." };
+    }
+    if (!devicesPayload.devices.some((device) => device?.name === config.audio_device)) {
+      return { ready: false, reason: "The configured WASAPI endpoint is not present in OmniFusion's active device list." };
+    }
     return { ready: true, config };
   } catch (error) {
-    return { ready: false, reason: `Playback preflight failed: ${error?.name || "Error"}.` };
+    const summary = localRequestFailureSummary("playback preflight", error);
+    console.warn(`[Omniphony EX] Playback preflight failed: ${summary}`);
+    return { ready: false, reason: `Playback preflight failed (${summary}).` };
   }
 }
 
@@ -641,7 +984,7 @@ function restoreNativeMediaPlayback() {
 
 function handleNativePlayerPlay(onPlaybackChange) {
   const queueTrackId = getQueuedTrackId();
-  tracePlaybackEvent("native-player-play-blocked", {
+  tracePlaybackEvent("native-player-play-request", {
     queuedTrackId: queueTrackId,
     armedPausedSelection: prepareNextSelectionPaused,
     pendingPausedSelection: pausedSelectionPending?.trackId ?? null,
@@ -685,27 +1028,39 @@ function handleNativePlayerPlay(onPlaybackChange) {
       onPlaybackChange();
       return;
     }
-    const playState = getTidalPlayState();
-    const state = String(playState?.state || "").toUpperCase();
-    const desired = String(playState?.desiredState || "").toUpperCase();
-    if (state === "PLAYING" || desired === "PLAYING") {
-      pausedSelectionConfirmedTrackId = null;
-      pausedSelectionUserPlayAuthorization = null;
-      updatePausedSelectionUi();
-      setTidalPlaybackIntent(true);
-      onPlaybackChange();
-    }
+    pausedSelectionConfirmedTrackId = null;
+    pausedSelectionUserPlayAuthorization = null;
+    updatePausedSelectionUi();
+    setTidalPlaybackIntent(true);
+    onPlaybackChange();
   } else {
-    const playState = getTidalPlayState();
-    const state = String(playState?.state || "").toUpperCase();
-    const desired = String(playState?.desiredState || "").toUpperCase();
-    if (state === "PLAYING" || desired === "PLAYING") {
-      pausedSelectionConfirmedTrackId = null;
-      pausedSelectionUserPlayAuthorization = null;
-      updatePausedSelectionUi();
-      setTidalPlaybackIntent(true);
+    // The native media.play request is intercepted before TIDAL updates its
+    // PlayState, so this request itself is the authoritative user play intent.
+    pausedSelectionConfirmedTrackId = null;
+    pausedSelectionUserPlayAuthorization = null;
+    updatePausedSelectionUi();
+    setTidalPlaybackIntent(true);
+    const snapshot = getTidalPlaybackSnapshot();
+    const requestedTrackId = Number(queueTrackId ?? snapshot?.trackId);
+    if (!Number.isSafeInteger(requestedTrackId) || requestedTrackId <= 0) {
+      tracePlaybackEvent("native-player-play-missing-track", { queuedTrackId: queueTrackId });
+      setTidalPlaybackIntent(false);
+      updatePausedSelectionUi("TIDAL queue identity is unavailable. Playback could not be started.");
       onPlaybackChange();
+      return;
     }
+    const engineOwnsTrack = Number(currentStatusData?.trackId) === requestedTrackId
+      && Boolean(currentStatusData?.requestId)
+      && ["prepared", "playing", "paused"].includes(String(currentStatusData?.playbackState || "").toLowerCase());
+    if (!engineOwnsTrack) {
+      const playState = getTidalPlayState();
+      const position = getTidalPosition(playState) ?? snapshot?.position ?? 0;
+      void triggerEnginePlay(requestedTrackId, position, {
+        title: snapshot?.title || "",
+        artist: snapshot?.artist || "",
+      });
+    }
+    onPlaybackChange();
   }
 }
 
@@ -2991,17 +3346,49 @@ function installPlaybackObservers(onPlaybackChange, onSeek) {
     });
   }
   if (typeof document?.addEventListener === "function" && typeof onSeek === "function") {
-    const onNativeTimelineInput = (event) => {
-      const position = getNativeTimelinePosition(event.target);
+    let nativeTimelinePointerTarget = null;
+    const forwardNativeTimelineSeek = (target, source = "native-ui") => {
+      const position = getNativeTimelinePosition(target);
       if (position === null) return;
-      tracePlaybackEvent("native-timeline-seek", { requestedPosition: position });
-      onSeek(position, "native-ui");
+      tracePlaybackEvent("native-timeline-seek", { requestedPosition: position, source });
+      onSeek(position, source);
+    };
+    const onNativeTimelineInput = (event) => forwardNativeTimelineSeek(event.target);
+    const onNativeTimelinePointerDown = (event) => {
+      if (getNativeTimelinePosition(event.target) !== null) {
+        nativeTimelinePointerTarget = event.target;
+      }
+    };
+    const onNativeTimelinePointerUp = (event) => {
+      const target = getNativeTimelinePosition(event.target) !== null
+        ? event.target : nativeTimelinePointerTarget;
+      nativeTimelinePointerTarget = null;
+      if (!target) return;
+      // TIDAL's current custom range commits aria-valuenow on pointer release
+      // without reliably emitting input/change or Redux SEEK. Read it after
+      // React's pointer handlers commit, then forward the final target once.
+      queueMicrotask(() => forwardNativeTimelineSeek(target, "native-ui"));
+    };
+    const onNativeTimelinePointerCancel = () => { nativeTimelinePointerTarget = null; };
+    const onNativeTimelineKeyUp = (event) => {
+      if (!/^(ArrowLeft|ArrowRight|ArrowUp|ArrowDown|Home|End|PageUp|PageDown)$/.test(String(event?.key ?? ""))) return;
+      const target = event.target;
+      if (getNativeTimelinePosition(target) === null) return;
+      queueMicrotask(() => forwardNativeTimelineSeek(target, "native-ui"));
     };
     document.addEventListener("input", onNativeTimelineInput, true);
     document.addEventListener("change", onNativeTimelineInput, true);
+    document.addEventListener("pointerdown", onNativeTimelinePointerDown, true);
+    document.addEventListener("pointerup", onNativeTimelinePointerUp, true);
+    document.addEventListener("pointercancel", onNativeTimelinePointerCancel, true);
+    document.addEventListener("keyup", onNativeTimelineKeyUp, true);
     unloads.add(() => {
       document.removeEventListener("input", onNativeTimelineInput, true);
       document.removeEventListener("change", onNativeTimelineInput, true);
+      document.removeEventListener("pointerdown", onNativeTimelinePointerDown, true);
+      document.removeEventListener("pointerup", onNativeTimelinePointerUp, true);
+      document.removeEventListener("pointercancel", onNativeTimelinePointerCancel, true);
+      document.removeEventListener("keyup", onNativeTimelineKeyUp, true);
     });
   }
   if (typeof library?.PlayState?.onState === "function") {
@@ -3107,12 +3494,31 @@ function installPlaybackObservers(onPlaybackChange, onSeek) {
         pausedSelectionUserPlayAuthorization = null;
         setTidalPlaybackIntent(true);
         const currentTrack = getCurrentTrackId();
-        if (currentStatusData && String(currentStatusData.trackId) === String(currentTrack) && currentStatusData.paused === true) {
-          void sendEngineCommand("resume", {
-            trackId: Number(currentTrack),
-            playbackGeneration: currentStatusData.playbackGeneration,
-            requestId: currentStatusData.requestId,
-          });
+        if (currentStatusData && String(currentStatusData.trackId) === String(currentTrack)
+            && currentStatusData.paused === true) {
+          const completedInstance = isAtNaturalEnd(
+            true, currentStatusData, currentTrack, currentStatusData.trackId,
+          ) || String(currentStatusData.playbackState || "").toLowerCase() === "ended";
+          if (completedInstance) {
+            const replay = getTidalPlaybackSnapshot();
+            tracePlaybackEvent("explicit-replay-requested-at-end", {
+              trackId: String(currentTrack),
+              playbackGeneration: currentStatusData.playbackGeneration ?? null,
+            });
+            // A completed DASH instance must be reopened with a fresh request
+            // identity. /resume would otherwise rewind or reattach the stale
+            // ended stream instead of creating a new queue playback instance.
+            void triggerEnginePlay(currentTrack, 0, {
+              title: replay?.title || "",
+              artist: replay?.artist || "",
+            });
+          } else {
+            void sendEngineCommand("resume", {
+              trackId: Number(currentTrack),
+              playbackGeneration: currentStatusData.playbackGeneration,
+              requestId: currentStatusData.requestId,
+            });
+          }
         }
         onPlaybackChange();
         return true;
@@ -3243,6 +3649,18 @@ async function handleImmediateTidalSeek(timePos, source = "redux") {
   }
   seekIntent.pending = false;
   seekIntent.settledAt = Date.now();
+  const latestDuration = parsePlaybackPosition(latestStatus.duration);
+  const newSeekIdentity = getPlaybackInstanceIdentity(latestStatus, trackId);
+  if (newSeekIdentity && latestDuration !== null && latestDuration > 0
+      && targetTime > 0 && latestDuration - targetTime <= 1) {
+    seekToEndPlaybackIdentity = newSeekIdentity;
+    seekToEndTargetPosition = targetTime;
+    seekToEndProgressObserved = false;
+  } else if (seekToEndPlaybackIdentity === newSeekIdentity) {
+    seekToEndPlaybackIdentity = null;
+    seekToEndTargetPosition = null;
+    seekToEndProgressObserved = false;
+  }
   if (sent && !pluginDisposed && String(getCurrentTrackId()) === String(trackId)) {
     // TidaLuna's intercepted SEEK action does not update PlayState itself,
     // and native range input can leave its clock stale while libmpv seeks.
@@ -3256,7 +3674,12 @@ async function handleImmediateTidalSeek(timePos, source = "redux") {
       });
     }
     if (previousEngineSample?.trackId === trackId) {
-      previousEngineSample = { ...previousEngineSample, at: now, tidalPosition: targetTime };
+      previousEngineSample = {
+        ...previousEngineSample,
+        at: now,
+        tidalPosition: targetTime,
+        enginePosition: targetTime,
+      };
     }
   }
   return sent;
@@ -3537,6 +3960,17 @@ async function triggerEnginePlay(trackId, timePos = 0, meta = {}, options = {}) 
     } catch (e) {
       if (pluginDisposed || generation !== enginePlayGeneration || e?.name === "AbortError") return false;
       console.error("[Omniphony EX] Engine play dispatch failed:", e);
+      if (allowPaused) {
+        // A failed diagnostics-only preparation must not immediately retry on
+        // every status poll. Require an explicit re-arm or a new track.
+        pausedSelectionConfirmedTrackId = null;
+        pausedSelectionUserPlayAuthorization = null;
+        setTidalPlaybackIntent(false);
+        const statusCode = /\bHTTP\s+(\d{3})\b/i.exec(String(e?.message || ""))?.[1];
+        updatePausedSelectionUi(
+          `Paused stream preparation failed${statusCode ? ` (HTTP ${statusCode})` : ""}. Playback remains paused. Press Prepare to retry.`
+        );
+      }
       cancelPendingEnginePlay();
       return false;
     }
@@ -3730,6 +4164,132 @@ function shouldResumeEngine(
   return true;
 }
 
+function isAtNaturalEnd(tidalIsPlaying, status, tidalTrackId, engineTrackId) {
+  if (!tidalIsPlaying) return false;
+  const selectedTrackId = Number(tidalTrackId);
+  const activeTrackId = Number(engineTrackId);
+  const reportedTrackId = Number(status?.trackId);
+  const duration = Number(status?.duration);
+  const position = Number(status?.timePos);
+  if (!Number.isSafeInteger(selectedTrackId) || selectedTrackId <= 0
+      || selectedTrackId !== activeTrackId || selectedTrackId !== reportedTrackId
+      || !Number.isFinite(duration) || duration <= 0
+      || !Number.isFinite(position) || position <= 0
+      || position > duration + 0.6) return false;
+  return duration - position <= 0.6;
+}
+
+function getPlaybackInstanceIdentity(status, trackId) {
+  const trackKey = String(Number(trackId));
+  const reportedTrackId = Number(status?.trackId);
+  const playbackGeneration = Number(status?.playbackGeneration);
+  const requestId = String(status?.requestId ?? "");
+  const serviceInstanceId = String(status?.serviceInstanceId ?? "");
+  const mpvInstanceId = String(status?.mpvInstanceId ?? "");
+  if (!Number.isSafeInteger(Number(trackKey)) || Number(trackKey) <= 0
+      || reportedTrackId !== Number(trackKey)
+      || !Number.isSafeInteger(playbackGeneration) || playbackGeneration <= 0
+      || !requestId || !serviceInstanceId || !mpvInstanceId) return null;
+  return JSON.stringify([
+    serviceInstanceId,
+    mpvInstanceId,
+    trackKey,
+    playbackGeneration,
+    requestId,
+  ]);
+}
+
+function getStableNaturalEndIdentity(identity, previousObservation, status, now, intentRevision) {
+  const sequence = Number(status?.timePosSampleSequence);
+  const position = Number(status?.timePos);
+  const duration = Number(status?.duration);
+  if (!identity || !Number.isSafeInteger(sequence) || sequence < 0
+      || !Number.isFinite(position) || !Number.isFinite(duration) || duration <= 0
+      || position <= 0 || position > duration + 0.6) {
+    return { identity: null, observation: null };
+  }
+
+  const matchingObservation = previousObservation?.identity === identity
+    && previousObservation?.intentRevision === intentRevision;
+  const sequenceAdvanced = matchingObservation
+    && Number.isSafeInteger(previousObservation.sequence)
+    && sequence > previousObservation.sequence;
+  const positionStable = matchingObservation
+    && Number.isFinite(previousObservation.position)
+    && Math.abs(position - previousObservation.position) <= 0.6;
+  if (!sequenceAdvanced || !positionStable) {
+    return {
+      identity: null,
+      observation: { identity, intentRevision, startedAt: now, sequence, position },
+    };
+  }
+
+  const observation = { ...previousObservation, sequence, position };
+  return {
+    identity: now - previousObservation.startedAt >= 750 ? identity : null,
+    observation,
+  };
+}
+
+function getNaturalEndPlaybackIdentity(
+  tidalIsPlaying,
+  status,
+  tidalTrackId,
+  engineTrackId,
+  previousSample,
+  now,
+  explicitPause,
+  trackReplacementPending,
+  seekPending,
+  clockSampleCurrent,
+) {
+  if (explicitPause || trackReplacementPending || seekPending || !clockSampleCurrent
+      || !isAtNaturalEnd(tidalIsPlaying, status, tidalTrackId, engineTrackId)) return null;
+  if (!new Set(["playing", "paused"]).has(String(status?.playbackState || "").toLowerCase())
+      || typeof status?.paused !== "boolean") return null;
+
+  const identity = getPlaybackInstanceIdentity(status, tidalTrackId);
+  const previousIdentity = getPlaybackInstanceIdentity(previousSample, tidalTrackId);
+  const previousPosition = Number(previousSample?.enginePosition);
+  const previousAt = Number(previousSample?.at);
+  const currentPosition = Number(status?.timePos);
+  const elapsedSeconds = (Number(now) - previousAt) / 1000;
+  const advancedSeconds = currentPosition - previousPosition;
+  if (previousIdentity !== identity
+      || !Number.isFinite(previousPosition)
+      || !Number.isFinite(previousAt)
+      || !Number.isFinite(elapsedSeconds)
+      || elapsedSeconds < 0 || elapsedSeconds > 2.5
+      || !Number.isFinite(advancedSeconds)
+      || advancedSeconds <= 0.01
+      || advancedSeconds > elapsedSeconds + 1.25) return null;
+
+  // Generation/request identity permits a replay of the same catalog track
+  // to advance again, while repeated polls of one EOF remain deduped.
+  return identity;
+}
+
+function getNaturalEndHandoffAction(handoff, trackId, queueIndex, desiredPlaybackIntent, now = Date.now()) {
+  if (!handoff) return { action: "none" };
+  if (desiredPlaybackIntent === false) return { action: "cancel", reason: "explicit-pause" };
+  if (!Number.isFinite(Number(handoff.expiresAt)) || now >= Number(handoff.expiresAt)) {
+    return { action: "cancel", reason: "timeout" };
+  }
+  const selectedTrackId = String(trackId ?? "");
+  const selectedQueueIndex = Number(queueIndex);
+  const queueAdvanced = Number.isSafeInteger(selectedQueueIndex)
+    && selectedQueueIndex !== handoff.sourceQueueIndex;
+  if (!selectedTrackId
+      || (selectedTrackId === handoff.sourceTrackId && !queueAdvanced)) {
+    return { action: "wait" };
+  }
+  return {
+    action: "start",
+    trackId: selectedTrackId,
+    queueIndex: Number.isSafeInteger(selectedQueueIndex) ? selectedQueueIndex : null,
+  };
+}
+
 function hasTidalClockDiscontinuity(
   previousSample, currentTrackId, currentPosition, elapsedSeconds, currentTidalIsPlaying
 ) {
@@ -3790,6 +4350,8 @@ function startSyncLoop() {
   let syncRequested = false;
   let syncScheduled = false;
   let clockPollBusy = false;
+  let naturalEndObservation = null;
+  let naturalEndHandoff = null;
   let lastSyncDiagnosticKey = null;
   let lastLyricsReduxDiagnosticKey = null;
   let lastSyncError = null;
@@ -3844,6 +4406,7 @@ function startSyncLoop() {
         && String(status.mpvInstanceId ?? "") === activeClockMpvInstanceId
         && Number.isSafeInteger(statusSequence)
         && statusSequence <= clockOrderingSequence;
+      let clockSampleCurrent = clockSampleAccepted;
       if (staleStatusSample) {
         const mergedStatus = mergeStatusWithLatestFastClockSample(
           status, lastFastClockSample, statusReceivedMonotonicAt,
@@ -3858,6 +4421,10 @@ function startSyncLoop() {
           return;
         }
         status = mergedStatus;
+        // The merged status now carries the newest fast-clock sample already
+        // accepted by the ordering gate. The original /status sample remains
+        // stale, but its merged replacement is current for EOF confirmation.
+        clockSampleCurrent = true;
         engineSampleAnchor = resolveEngineSampleAnchor(
           status, statusReceivedMonotonicAt, statusObservedAt,
         );
@@ -3924,6 +4491,62 @@ function startSyncLoop() {
         return;
       }
 
+      // TIDAL's queue can select the next item while its native player remains
+      // NOT_PLAYING because our native audio guard intercepted media.play().
+      // Carry the natural-end autoplay intent across that one queue transition
+      // and start the matching libmpv stream. A deliberate Pause cancels it;
+      // the deadline prevents a stale handoff from starting a later selection.
+      if (naturalEndHandoff) {
+        const queueIndex = Number(getTidalPlayState()?.playQueue?.currentIndex);
+        const handoffAction = getNaturalEndHandoffAction(
+          naturalEndHandoff, mediaTrackId, queueIndex, desiredPlaybackIntent, Date.now(),
+        );
+        if (handoffAction.action === "cancel") {
+          tracePlaybackEvent("natural-end-handoff-cancelled", {
+            sourceTrackId: naturalEndHandoff.sourceTrackId,
+            selectedTrackId: mediaTrackId,
+            reason: handoffAction.reason,
+          });
+          naturalEndHandoff = null;
+        } else if (handoffAction.action === "start" && mediaTrackId > 0) {
+            const selectionChanged = naturalEndHandoff.targetTrackId !== handoffAction.trackId
+              || naturalEndHandoff.targetQueueIndex !== handoffAction.queueIndex;
+            if (selectionChanged) {
+              naturalEndHandoff.targetTrackId = handoffAction.trackId;
+              naturalEndHandoff.targetQueueIndex = handoffAction.queueIndex;
+              naturalEndHandoff.intentGranted = false;
+              tracePlaybackEvent("natural-end-handoff-selected", {
+                sourceTrackId: naturalEndHandoff.sourceTrackId,
+                targetTrackId: mediaTrackId,
+                queueIndex: Number.isSafeInteger(queueIndex) ? queueIndex : null,
+              });
+            }
+            if (engineTrackId === Number(handoffAction.trackId) && status.paused === false) {
+              naturalEndHandoff = null;
+            } else if (!naturalEndHandoff.intentGranted) {
+              setTidalPlaybackIntent(true);
+              naturalEndHandoff.intentGranted = true;
+            }
+            if (naturalEndHandoff
+                && engineTrackId !== Number(handoffAction.trackId)
+                && (!enginePlayPending || enginePlayPendingTrackId !== String(mediaTrackId))
+                && (lastPlayAttempt.trackId !== String(mediaTrackId)
+                  || Date.now() - lastPlayAttempt.at > 5000)) {
+              lastPlayAttempt = { trackId: String(mediaTrackId), at: Date.now() };
+              tracePlaybackEvent("natural-end-handoff-play-request", {
+                sourceTrackId: naturalEndHandoff.sourceTrackId,
+                targetTrackId: mediaTrackId,
+                tidalIsPlaying,
+              });
+              void triggerEnginePlay(mediaTrackId, tidal.position, {
+                title: tidal.title,
+                artist: tidal.artist,
+              });
+              return;
+            }
+        }
+      }
+
       // TidaLuna PlayState is the playback authority. HTML media elements are
       // not required: current TIDAL builds can keep their player outside DOM.
       // Retry a failed request even when it is the same selected track.
@@ -3960,6 +4583,112 @@ function startSyncLoop() {
         const holdSeekClock = shouldHoldEngineClockAfterTidalSeek(
           lastTidalSeekIntent, mediaTrackId, status, Date.now()
         );
+        const recentSeekToCurrentPosition = hasRecentTidalSeekIntent(
+          mediaTrackId, tidal.tidalPosition, Date.now()
+        );
+        const currentPlaybackIdentity = getPlaybackInstanceIdentity(status, mediaTrackId);
+        if (seekToEndPlaybackIdentity !== null
+            && seekToEndPlaybackIdentity !== currentPlaybackIdentity) {
+          seekToEndPlaybackIdentity = null;
+          seekToEndTargetPosition = null;
+          seekToEndProgressObserved = false;
+        } else if (seekToEndPlaybackIdentity === currentPlaybackIdentity
+            && Number.isFinite(seekToEndTargetPosition)
+            && clockSampleAccepted && isCurrentEngineClockSample(status)
+            && Number(status.timePos) > seekToEndTargetPosition + 0.01) {
+          seekToEndProgressObserved = true;
+        }
+        const atNaturalEnd = isAtNaturalEnd(
+          tidalIsPlaying, status, mediaTrackId, engineTrackId
+        );
+        let naturalEndIdentity = atNaturalEnd
+          ? getNaturalEndPlaybackIdentity(
+            tidalIsPlaying,
+            status,
+            mediaTrackId,
+            engineTrackId,
+            previousEngineSample,
+            Date.now(),
+            desiredPlaybackIntent === false,
+            Boolean(enginePlayPending),
+            holdSeekClock || recentSeekToCurrentPosition,
+            clockSampleCurrent && isCurrentEngineClockSample(status),
+          )
+          : null;
+        if (naturalEndIdentity !== null || !atNaturalEnd) {
+          naturalEndObservation = null;
+        } else if (desiredPlaybackIntent === false || enginePlayPending
+            || holdSeekClock || recentSeekToCurrentPosition
+            || (seekToEndPlaybackIdentity === currentPlaybackIdentity
+              && !seekToEndProgressObserved)
+            || !clockSampleCurrent || !isCurrentEngineClockSample(status)) {
+          naturalEndObservation = null;
+        } else {
+          const stableEnd = getStableNaturalEndIdentity(
+            currentPlaybackIdentity,
+            naturalEndObservation,
+            status,
+            Date.now(),
+            transportIntentRevision,
+          );
+          naturalEndObservation = stableEnd.observation;
+          naturalEndIdentity = stableEnd.identity;
+          if (naturalEndIdentity !== null) {
+            tracePlaybackEvent("natural-end-confirmed-by-stable-eof", {
+              trackId: mediaTrackId,
+              playbackGeneration: status.playbackGeneration,
+            });
+          }
+        }
+        if (naturalEndIdentity !== null) {
+          // Never reconcile a completed engine back to /resume while TIDAL's
+          // queue transition is pending (including when auto-advance is off).
+          if (!autoAdvanceEnabled || naturalEndIdentity === lastAutoAdvancedPlaybackIdentity) {
+            return;
+          }
+          const playState = window.luna?.lib?.PlayState;
+          if (typeof playState?.next !== "function") {
+            if (lastAutoAdvanceUnavailableIdentity !== naturalEndIdentity) {
+              console.warn("[Omniphony EX] Natural-end auto-advance waiting for TIDAL PlayState.next.");
+              lastAutoAdvanceUnavailableIdentity = naturalEndIdentity;
+            }
+            return;
+          }
+          lastAutoAdvanceUnavailableIdentity = null;
+          lastAutoAdvancedPlaybackIdentity = naturalEndIdentity;
+          naturalEndObservation = null;
+          const sourceQueueIndex = Number(playState.playQueue?.currentIndex);
+          naturalEndHandoff = {
+            sourceTrackId: String(mediaTrackId),
+            sourceQueueIndex: Number.isSafeInteger(sourceQueueIndex) ? sourceQueueIndex : null,
+            targetTrackId: null,
+            targetQueueIndex: null,
+            intentGranted: false,
+            expiresAt: Date.now() + EXPLICIT_PLAY_HANDOFF_TIMEOUT_MS,
+          };
+          const remainingSec = Number(status.duration) - Number(status.timePos);
+          console.info(`[Omniphony EX] Track ${mediaTrackId} reached natural end (remaining: ${remainingSec.toFixed(2)}s). Advancing TIDAL queue.`);
+          try {
+            const advanceResult = playState.next();
+            if (advanceResult && typeof advanceResult.then === "function") {
+              void Promise.resolve(advanceResult).catch((err) => {
+                naturalEndHandoff = null;
+                tracePlaybackEvent("natural-end-next-rejected", {
+                  trackId: mediaTrackId,
+                  playbackGeneration: status.playbackGeneration,
+                  message: String(err?.message || err),
+                });
+                console.warn("[Omniphony EX] TIDAL queue advance rejected:", err);
+              });
+            }
+          } catch (err) {
+            naturalEndHandoff = null;
+            console.warn("[Omniphony EX] Error triggering next track on natural end:", err);
+          }
+          if (!pluginDisposed) scheduleImmediateSync();
+          return;
+        }
+        if (atNaturalEnd) return;
         if (holdSeekClock && !lastTidalSeekIntent.holdLogged) {
           lastTidalSeekIntent.holdLogged = true;
           tracePlaybackEvent("seek-clock-reconciliation-hold", {
@@ -4087,6 +4816,10 @@ function startSyncLoop() {
         currentStatusData.engineClockAdvancing = Boolean(advancing);
         previousEngineSample = {
           trackId: mediaTrackId,
+          playbackGeneration: status.playbackGeneration,
+          requestId: status.requestId,
+          serviceInstanceId: status.serviceInstanceId,
+          mpvInstanceId: status.mpvInstanceId,
           at: now,
           tidalPlaying: tidalIsPlaying,
           tidalPosition: trustedTidalPosition === null
@@ -4116,19 +4849,6 @@ function startSyncLoop() {
         // Clock advancement is plugin-local evidence, not hardware-output proof.
         // Refresh only after comparing consecutive samples of the same track.
         updateBadgeUI(currentFormatLabel);
-        // Auto-advance to next track when playback finishes naturally
-        if (autoAdvanceEnabled && status.duration > 0 && status.timePos > 0) {
-          const remainingSec = status.duration - status.timePos;
-          if (remainingSec <= 0.6 && String(mediaTrackId) !== String(lastAutoAdvancedTrackId)) {
-            lastAutoAdvancedTrackId = String(mediaTrackId);
-            console.info(`[Omniphony EX] Track ${mediaTrackId} reached end (remaining: ${remainingSec.toFixed(2)}s). Advancing to next track seamlessly...`);
-            try {
-              window.luna?.lib?.PlayState?.next?.();
-            } catch (err) {
-              console.warn('[Omniphony EX] Error triggering next track on end:', err);
-            }
-          }
-        }
       } else {
         currentStatusData.engineClockAdvancing = false;
         previousEngineSample = null;
@@ -5171,7 +5891,7 @@ function toggleSettingsPanel() {
   const dlFolderInput = document.createElement("input");
   dlFolderInput.id = "omniphony-dl-folder-input";
   dlFolderInput.type = "text";
-  dlFolderInput.value = (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_folder") : null) || "C:\OmniFusion-Standalone\downloads";
+  dlFolderInput.value = (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_folder") : null) || "";
   dlFolderInput.style.cssText = "width:100%;box-sizing:border-box;background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:6px 8px;margin-bottom:6px;font:inherit;font-size:11px;";
   dlFolderInput.onchange = () => {
     if (typeof localStorage !== "undefined") localStorage.setItem("omniphony_download_folder", dlFolderInput.value.trim());
@@ -5406,7 +6126,7 @@ function toggleSettingsPanel() {
   const mpvInput = document.createElement("input");
   mpvInput.id = "omniphony-mpv-path-input";
   mpvInput.type = "text";
-  mpvInput.value = (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_mpv_path") : null) || "C:\\OmniFusion-Standalone\\mpv";
+  mpvInput.value = (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_mpv_path") : null) || "";
   mpvInput.style.cssText = "width:100%;box-sizing:border-box;background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:6px 8px;margin-bottom:8px;font:inherit;font-size:11px;";
   mpvInput.onchange = () => {
     if (typeof localStorage !== "undefined") localStorage.setItem("omniphony_mpv_path", mpvInput.value.trim());
@@ -5422,7 +6142,7 @@ function toggleSettingsPanel() {
   const studioInput = document.createElement("input");
   studioInput.id = "omniphony-studio-path-input";
   studioInput.type = "text";
-  studioInput.value = (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_studio_path") : null) || "C:\\OmniFusion-Standalone\\studio\\omniphony-studio-egui.exe";
+  studioInput.value = (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_studio_path") : null) || "";
   studioInput.style.cssText = "width:100%;box-sizing:border-box;background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:6px 8px;margin-bottom:12px;font:inherit;font-size:11px;";
   studioInput.onchange = () => {
     if (typeof localStorage !== "undefined") localStorage.setItem("omniphony_studio_path", studioInput.value.trim());
@@ -5594,7 +6314,7 @@ function toggleSettingsPanel() {
     deviceLoadStatus.style.color = devicesLoaded && selectedDeviceDetected ? "#aaa" : "#ff7272";
     settingsUiVerified = verifySettingsPanelControls(panel);
     if (loaded && !settingsUiVerified) {
-      prioritySaveStatus.innerText = "Playback disabled: priority, playback status, or output device could not be verified.";
+      prioritySaveStatus.innerText = "Settings controls could not be fully verified; playback checks the saved priority and output device before starting.";
       prioritySaveStatus.style.color = "#ff7272";
     }
   });
@@ -5618,7 +6338,7 @@ let downloadButtonRef = null;
 
 function getDownloadSettings() {
   return {
-    destinationFolder: (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_folder") : null) || "C:\OmniFusion-Standalone\downloads",
+    destinationFolder: (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_folder") : null) || "",
     pathPattern: (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_pattern") : null) || "{artist}/{album}/{trackNumber} - {title}",
     ac4Format: (typeof localStorage !== "undefined" ? localStorage.getItem("omniphony_download_ac4_format") : null) || "flac",
   };
@@ -5639,15 +6359,38 @@ async function selectDownloadFolderNative() {
 
 async function queueTrackDownload(trackMeta) {
   const cfg = getDownloadSettings();
+  const artistMeta = trackMeta.artist;
+  const albumMeta = trackMeta.album;
+  const artistName = typeof artistMeta === "string"
+    ? artistMeta
+    : artistMeta?.name || trackMeta.artistName ||
+      (Array.isArray(trackMeta.artists) ? trackMeta.artists.map((item) => item?.name).filter(Boolean).join("; ") : "Unknown Artist");
+  const albumName = typeof albumMeta === "string"
+    ? albumMeta
+    : albumMeta?.title || albumMeta?.name || trackMeta.albumTitle || "Unknown Album";
+  const albumCover = typeof albumMeta?.cover === "string" ? albumMeta.cover : "";
+  const albumArtUrl = trackMeta.artworkURL || trackMeta.cover || albumMeta?.artworkURL ||
+    (albumCover.startsWith("http") ? albumCover : albumCover.includes("-")
+      ? `https://resources.tidal.com/images/${albumCover.replace(/-/g, "/")}/1280x1280.jpg`
+      : "");
+  const lyricText = typeof trackMeta.lyrics === "string" ? trackMeta.lyrics : trackMeta.lyrics?.text || trackMeta.plainLyrics || "";
+  const syncedLyrics = typeof trackMeta.syncedLyrics === "string" ? trackMeta.syncedLyrics : trackMeta.subtitles || trackMeta.lrc || "";
   const payload = {
     trackId: trackMeta.id || trackMeta.trackId,
     title: trackMeta.title || trackMeta.name || "Unknown Title",
-    artist: trackMeta.artist || trackMeta.artistName || (typeof trackMeta.artist === "object" ? trackMeta.artist?.name : "Unknown Artist"),
-    album: trackMeta.album || trackMeta.albumTitle || (typeof trackMeta.album === "object" ? trackMeta.album?.title || trackMeta.album?.name : "Unknown Album"),
+    artist: artistName,
+    album: albumName,
+    albumArtist: trackMeta.albumArtist || albumMeta?.artist?.name || "",
     year: trackMeta.year || (trackMeta.releaseDate ? String(trackMeta.releaseDate).slice(0, 4) : ""),
     trackNumber: trackMeta.trackNumber || trackMeta.track_number || "",
+    discNumber: trackMeta.discNumber || trackMeta.disc_number || trackMeta.volumeNumber || "",
     isrc: trackMeta.isrc || "",
-    albumArtUrl: trackMeta.artworkURL || trackMeta.cover || (trackMeta.album?.cover ? `https://resources.tidal.com/images/${trackMeta.album.cover.replace(/-/g, "/")}/640x640.jpg` : ""),
+    genre: Array.isArray(trackMeta.genre) ? trackMeta.genre.join("; ") : trackMeta.genre || "",
+    composer: Array.isArray(trackMeta.composer) ? trackMeta.composer.map((item) => item?.name || item).join("; ") : trackMeta.composer || "",
+    copyright: trackMeta.copyright || "",
+    lyrics: lyricText,
+    syncedLyrics,
+    albumArtUrl,
     destinationFolder: cfg.destinationFolder,
     ac4Format: cfg.ac4Format,
     pathPattern: cfg.pathPattern,
@@ -5809,15 +6552,37 @@ export const Settings = () => {
   const { LunaSettings, LunaSwitchSetting, LunaSelectSetting, LunaSelectItem, LunaTextSetting, LunaButtonSetting } = LunaUi;
   
   const [priority, setPriority] = React.useState(currentConfig.priority.join(","));
+  const priorityTouched = React.useRef(false);
   const [device, setDevice] = React.useState(currentConfig.audio_device);
   const [sourceMode, setSourceMode] = React.useState(localStorage.getItem("omniphony_realmax_source") || "auto");
-  const [mpvPath, setMpvPath] = React.useState(localStorage.getItem("omniphony_mpv_path") || "C:\\OmniFusion-Standalone\\mpv");
-  const [studioPath, setStudioPath] = React.useState(localStorage.getItem("omniphony_studio_path") || "C:\\OmniFusion-Standalone\\studio\\omniphony-studio-egui.exe");
+  const [mpvPath, setMpvPath] = React.useState(localStorage.getItem("omniphony_mpv_path") || "");
+  const [studioPath, setStudioPath] = React.useState(localStorage.getItem("omniphony_studio_path") || "");
   const [addonUrl, setAddonUrl] = React.useState("");
   const [authStatus, setAuthStatus] = React.useState("Ready");
-  const [dlFolder, setDlFolder] = React.useState(localStorage.getItem("omniphony_download_folder") || "C:\\OmniFusion-Standalone\\downloads");
+  const [dlFolder, setDlFolder] = React.useState(localStorage.getItem("omniphony_download_folder") || "");
   const [ac4Format, setAc4Format] = React.useState(localStorage.getItem("omniphony_download_ac4_format") || "flac");
   const [dlPattern, setDlPattern] = React.useState(localStorage.getItem("omniphony_download_pattern") || "{artist}/{album}/{trackNumber} - {title}");
+
+  React.useEffect(() => {
+    let active = true;
+    requestWithTimeout(`${API_BASE}/config`, { cache: "no-store" }, 5000)
+      .then(async (response) => {
+        if (!response.ok) return;
+        const config = await response.json();
+        const loadedPriority = Array.isArray(config?.priority)
+          ? config.priority.join(",")
+          : "";
+        const isSupportedPriority = priorityPresets.some(
+          (preset) => preset.value.join(",") === loadedPriority
+        );
+        if (active && !priorityTouched.current && isSupportedPriority) {
+          currentConfig = { ...currentConfig, ...config };
+          setPriority(loadedPriority);
+        }
+      })
+      .catch(() => {});
+    return () => { active = false; };
+  }, []);
   
   return React.createElement(
     LunaSettings,
@@ -5830,6 +6595,7 @@ export const Settings = () => {
         value: priority,
         onChange: async (e) => {
           const val = e.target.value;
+          priorityTouched.current = true;
           setPriority(val);
           try {
             await fetch(`${API_BASE}/config`, {
@@ -5887,6 +6653,18 @@ export const Settings = () => {
         localStorage.setItem("omniphony_studio_path", val);
       }
     }),
+    React.createElement(LunaButtonSetting, {
+      title: "Apply Engine Paths",
+      desc: "Restart the plugin-owned API with the selected external MPV and Studio paths.",
+      onClick: async () => {
+        const ready = await ensureLocalOmniFusionService();
+        if (ready) {
+          alert("Omniphony API is ready with the selected engine paths.");
+        } else {
+          alert("Omniphony API could not start. Check that the bundled runtime is installed and both external paths are correct.");
+        }
+      }
+    }, "Apply Paths / Restart API"),
     React.createElement(LunaTextSetting, {
       title: "Amazon Music Eclipse Manifest URL",
       desc: "Eclipse add-on manifest URL for multi-source Amazon Music resolution.",

@@ -94,3 +94,19 @@ Notice: Spatial audio measurement and derived SOFA HRIR dataset based on the pub
 ## 8. libmpv & FFmpeg
 Source: https://mpv.io / https://ffmpeg.org
 License: GNU General Public License v2+ / LGPL v2.1+.
+
+---
+
+## 9. OxideAV AC-4 Adapter
+Source: https://github.com/OxideAV/oxideav-ac4
+Version: adapter-v0.1.71 (locally supplied Windows adapter binaries)
+Paths in runtime archive: `api/oxideav/adapter-v0.1.71/`
+License: MIT License. Full license text is included beside the binaries as `LICENSE`.
+
+---
+
+## 10. Harletty Bridge Libraries
+Source: https://github.com/harletty/harletty-bridge
+Version: v0.9.0 (locally supplied Windows bridge binaries)
+Paths in runtime archive: `api/harletty/v0.9.0/`
+License: Apache License 2.0. Full license text is included beside the binaries as `LICENSE`.

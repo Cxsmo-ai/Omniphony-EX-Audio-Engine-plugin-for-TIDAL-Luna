@@ -1,0 +1,40 @@
+name: Package and publish TidaLuna plugin release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Build and verify credential-free runtime archive
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'OmniphonyEX-API-win-x64.tar.gz'
+          python tools/package-runtime.py --output $archive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/verify-runtime-package.py --archive $archive --plugin-module omniphony.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish store entry and runtime assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'OmniphonyEX-API-win-x64.tar.gz'
+          $assets = @($archive, 'omniphony.mjs', 'omniphony.json', 'manifest.json', 'store.json', 'THIRD-PARTY-NOTICES.md')
+          gh release create $env:GITHUB_REF_NAME @assets `
+            --title "Omniphony EX $env:GITHUB_REF_NAME" --generate-notes
