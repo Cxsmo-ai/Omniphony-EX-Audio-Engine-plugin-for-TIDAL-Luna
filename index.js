@@ -51,7 +51,7 @@ async function ensureLocalServiceRunning() {
     }
   };
   const healthMatches = (health) => health?.status === 'ok'
-    && health.version === '2.1.28'
+    && health.version === '2.1.29'
     && samePath(health.pluginRoot, pluginRoot)
     && samePath(health.dataRoot, dataRoot)
     && samePath(health.mpvDirectory, mpvDir)

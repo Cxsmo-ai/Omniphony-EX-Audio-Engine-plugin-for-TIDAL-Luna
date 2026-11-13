@@ -89,7 +89,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.28"
+SERVICE_VERSION = "2.1.29"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 EOF_REWIND_TIMEOUT_SECONDS = 3.0
 
@@ -2865,6 +2865,9 @@ def get_python_tidal_mobile_session():
         is_pkce = session_data.get("is_pkce", {}).get("data") if isinstance(session_data, dict) else None
         if is_pkce is not False:
             raise RuntimeError("python-tidal mobile OAuth profile requires a non-PKCE session")
+        refresh_token = session_data.get("refresh_token", {}).get("data")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise RuntimeError("python-tidal mobile OAuth profile has no refresh token")
 
         config = tidalapi.Config()
         config.client_id = "km8T1xS355y7dd3H"
@@ -2883,8 +2886,26 @@ def get_python_tidal_mobile_session():
             return refreshed
         session.token_refresh = refresh_and_persist
 
-        if not session.load_session_from_file(SESSION_FILE):
+        # The saved access token may have been minted for another OAuth client.
+        # The prior AC-4 path explicitly exchanged this refresh token with the
+        # mobile client ID on every probe. Reproduce that through EbbLabs so the
+        # subsequent library get_stream() sees a mobile-client bearer token.
+        session.is_pkce = False
+        session.refresh_token = refresh_token
+        if not session.token_refresh(refresh_token):
+            raise RuntimeError("python-tidal mobile OAuth refresh failed")
+        if not session.load_oauth_session(
+            session.token_type,
+            session.access_token,
+            session.refresh_token,
+            expiry_time=session.expiry_time,
+            is_pkce=False,
+        ):
             raise RuntimeError("python-tidal OAuth session is no longer authenticated")
+        # Match the Android request identity used by the prior verified AC-4
+        # probe while keeping playback-info requests inside EbbLabs/python-tidal.
+        # The generic library WebView UA negotiates MP4A on historical AC-4 IDs.
+        session.request.user_agent = "TIDAL_ANDROID/1057 CFNetwork/1410.0.3 Darwin/22.4.0"
         # Save again after load so fields populated by the /sessions validation
         # (especially session_id) are persisted alongside any rotated token.
         _persist_python_tidal_session(session, SESSION_FILE)
