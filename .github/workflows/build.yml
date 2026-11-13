@@ -70,11 +70,13 @@ jobs:
           $release = Join-Path $PWD 'dist/release'
           New-Item -ItemType Directory -Path $release -Force | Out-Null
           Copy-Item 'dist/store.json' $release
-          Copy-Item 'dist/Omniphony EX Audio Engine.mjs' (Join-Path $release 'Omniphony.EX.Audio.Engine.mjs')
-          Copy-Item 'dist/Omniphony EX Audio Engine.json' (Join-Path $release 'Omniphony.EX.Audio.Engine.json')
+          Copy-Item 'dist/Omniphony EX Audio Engine.mjs' $release
+          Copy-Item 'dist/Omniphony EX Audio Engine.json' $release
           Copy-Item 'dist/OmniphonyEX-API-win-x64.tar.gz' $release
           Copy-Item 'LICENSE' $release
           Copy-Item 'THIRD-PARTY-NOTICES.md' $release
+          python tools/verify-luna-store.py --dist $release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload release package
         uses: actions/upload-artifact@v4
