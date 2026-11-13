@@ -24,7 +24,14 @@ function touch(file) {
   fs.writeFileSync(file, "test fixture");
 }
 
-function makeHarness({ healthResponses, mpvDir, studioExe, createRuntimeFiles = true }) {
+function makeHarness({
+  healthResponses,
+  mpvDir,
+  studioExe,
+  createRuntimeFiles = true,
+  localServiceVersion = "2.1.29",
+  verifiedBundle = false,
+}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omniphony-supervisor-test-"));
   const pluginRoot = path.join(userData, "plugins", "omniphony-tidal-luna-plugin");
   const dataRoot = path.join(pluginRoot, "data");
@@ -58,6 +65,34 @@ function makeHarness({ healthResponses, mpvDir, studioExe, createRuntimeFiles = 
     "harletty/v0.9.0/harletty_iamf_bridge.dll",
     "harletty/v0.9.0/LICENSE",
   ]) touch(path.join(apiRoot, file));
+  fs.writeFileSync(
+    path.join(apiRoot, "omnifusion_service.py"),
+    `SERVICE_VERSION = "${localServiceVersion}"\n`,
+  );
+  if (verifiedBundle) {
+    const bundleRoot = path.join(pluginRoot, "runtime-bundles", "2.1.43");
+    const bundledApiRoot = path.join(bundleRoot, "api");
+    for (const file of [
+      "runtime/python.exe",
+      "omnifusion_service.py",
+      "vendor/tidalapi/__init__.py",
+      "oxideav/adapter-v0.1.71/ac4-to-wav.exe",
+      "oxideav/adapter-v0.1.71/omnifusion_ac4_adapter.dll",
+      "oxideav/adapter-v0.1.71/LICENSE",
+      "harletty/v0.9.0/harletty_dolby_bridge.dll",
+      "harletty/v0.9.0/harletty_dts_bridge.dll",
+      "harletty/v0.9.0/harletty_iamf_bridge.dll",
+      "harletty/v0.9.0/LICENSE",
+    ]) touch(path.join(bundledApiRoot, file));
+    fs.writeFileSync(path.join(bundledApiRoot, "omnifusion_service.py"), 'SERVICE_VERSION = "2.1.29"\n');
+    const bundleSha256 = moduleSource.match(/const bundleSha256 = "([A-F0-9]+)";/)?.[1];
+    assert.ok(bundleSha256, "the runtime archive digest is pinned in the plugin");
+    fs.writeFileSync(path.join(bundleRoot, "bundle-version.json"), JSON.stringify({
+      pluginVersion: "2.1.43",
+      serviceVersion: "2.1.29",
+      sha256: bundleSha256,
+    }));
+  }
 
   const queuedHealth = healthResponses.slice();
   let defaultHealth = null;
@@ -126,7 +161,7 @@ function makeHarness({ healthResponses, mpvDir, studioExe, createRuntimeFiles = 
   vm.runInContext(supervisorCode, sandbox, { filename: "service-supervisor.native.js" });
   const health = {
     status: "ok",
-    version: "2.1.28",
+    version: "2.1.29",
     pluginRoot,
     dataRoot,
     mpvDirectory: paths.mpvDir,
@@ -141,7 +176,7 @@ function makeHarness({ healthResponses, mpvDir, studioExe, createRuntimeFiles = 
     requests,
     spawned,
     cleanup: () => fs.rmSync(userData, { recursive: true, force: true }),
-    ensure: () => module.exports.ensureService("2.1.28", {}),
+    ensure: () => module.exports.ensureService("2.1.29", {}),
   };
 }
 
@@ -178,6 +213,25 @@ function makeHarness({ healthResponses, mpvDir, studioExe, createRuntimeFiles = 
     assert.equal(result.ready, false);
     assert.equal(result.reason, "runtime_paths_invalid");
     assert.equal(harness.spawned.length, 0, "invalid paths never launch a broken service");
+  } finally {
+    harness.cleanup();
+  }
+}
+
+{
+  const harness = makeHarness({
+    healthResponses: [null],
+    localServiceVersion: "2.1.27",
+    verifiedBundle: true,
+  });
+  try {
+    const result = await harness.ensure();
+    assert.equal(result.ready, true, "a matching verified bundle replaces stale local development API files");
+    assert.match(
+      harness.spawned[0][1][0],
+      /runtime-bundles[\\/]2\.1\.43[\\/]api[\\/]omnifusion_service\.py$/,
+      "stale checked-out service code is never spawned over the required release bundle",
+    );
   } finally {
     harness.cleanup();
   }

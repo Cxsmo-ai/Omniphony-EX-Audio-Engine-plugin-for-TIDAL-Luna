@@ -6,9 +6,68 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 import omnifusion_service as service
+import tidalapi
 
 
 class ServiceLifecycleTests(unittest.TestCase):
+    def test_mobile_ac4_profile_refreshes_with_mobile_client_before_stream_use(self):
+        with TemporaryDirectory() as temp:
+            session_file = Path(temp) / "tidal-session-oauth.json"
+            session_file.write_text(json.dumps({
+                "is_pkce": {"data": False},
+                "refresh_token": {"data": "refresh-token-fixture"},
+            }), encoding="utf-8")
+            session = Mock()
+            session.request = Mock()
+            session.token_type = "Bearer"
+            session.access_token = "mobile-access-fixture"
+            session.refresh_token = None
+            session.expiry_time = None
+            session.session_id = "session-fixture"
+            session.is_pkce = False
+            session.load_oauth_session.return_value = True
+            calls = []
+
+            def refresh(refresh_token):
+                calls.append(("refresh", refresh_token))
+                session.token_type = "Bearer"
+                session.access_token = "mobile-access-fixture"
+                session.refresh_token = "rotated-refresh-fixture"
+                return True
+
+            def load_oauth_session(*args, **kwargs):
+                calls.append(("load", kwargs.get("is_pkce")))
+                return True
+
+            session.token_refresh.side_effect = refresh
+            session.load_oauth_session.side_effect = load_oauth_session
+            config = Mock()
+
+            with patch.object(service, "SESSION_FILE", session_file), \
+                    patch.object(service, "_TIDAL_MOBILE_API_SESSION", None), \
+                    patch.object(service, "_restrict_windows_session_acl"), \
+                    patch.object(service, "install_python_tidal_request_timeout"), \
+                    patch.object(tidalapi, "Config", return_value=config), \
+                    patch.object(tidalapi, "Session", return_value=session):
+                loaded = service.get_python_tidal_mobile_session()
+            persisted = json.loads(session_file.read_text(encoding="utf-8"))
+
+        self.assertIs(loaded, session)
+        self.assertEqual(config.client_id, "km8T1xS355y7dd3H")
+        self.assertEqual(calls, [
+            ("refresh", "refresh-token-fixture"),
+            ("load", False),
+        ])
+        self.assertEqual(
+            session.request.user_agent,
+            "TIDAL_ANDROID/1057 CFNetwork/1410.0.3 Darwin/22.4.0",
+        )
+        self.assertEqual(
+            persisted["refresh_token"]["data"],
+            "rotated-refresh-fixture",
+            "the EbbLabs client refresh rotation is persisted atomically",
+        )
+
     def test_renderer_that_exits_after_snapshot_is_ignored(self):
         renderer_name = service.RENDERER_EXE.name
         with patch.object(service, "_windows_process_snapshot", return_value=[(4567, renderer_name)]), \
