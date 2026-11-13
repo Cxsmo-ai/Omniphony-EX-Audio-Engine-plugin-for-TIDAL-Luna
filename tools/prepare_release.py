@@ -9,7 +9,8 @@ import shutil
 from pathlib import Path, PurePosixPath
 
 
-REQUIRED_RELEASE_FILES = ("LICENSE", "THIRD-PARTY-NOTICES.md")
+REQUIRED_ROOT_RELEASE_FILES = ("LICENSE", "THIRD-PARTY-NOTICES.md")
+REQUIRED_DIST_RELEASE_FILES = ("OmniphonyEX-API-win-x64.tar.gz",)
 
 
 def release_asset_name(filename: str) -> str:
@@ -53,8 +54,13 @@ def prepare_release(dist: Path, output: Path) -> list[str]:
         raise ValueError("plugin filenames collide after GitHub release-name normalization")
 
     repo_root = dist.parent
-    for filename in REQUIRED_RELEASE_FILES:
+    for filename in REQUIRED_ROOT_RELEASE_FILES:
         source = repo_root / filename
+        if not source.is_file():
+            raise FileNotFoundError(f"missing required release file: {source}")
+        assets.append((filename, source))
+    for filename in REQUIRED_DIST_RELEASE_FILES:
+        source = dist / filename
         if not source.is_file():
             raise FileNotFoundError(f"missing required release file: {source}")
         assets.append((filename, source))
@@ -69,7 +75,13 @@ def prepare_release(dist: Path, output: Path) -> list[str]:
         encoding="utf-8",
         newline="\n",
     )
-    return [*release_plugins, *(filename[:-4] + ".json" for filename in release_plugins), *REQUIRED_RELEASE_FILES, "store.json"]
+    return [
+        *release_plugins,
+        *(filename[:-4] + ".json" for filename in release_plugins),
+        *REQUIRED_ROOT_RELEASE_FILES,
+        *REQUIRED_DIST_RELEASE_FILES,
+        "store.json",
+    ]
 
 
 def main() -> int:
