@@ -45,6 +45,9 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Test GitHub release asset naming
+        run: python -m unittest tools.test_prepare_release
+
       - name: Run embedded API and downloader tests
         shell: pwsh
         run: |
@@ -71,13 +74,8 @@ jobs:
         shell: pwsh
         run: |
           $release = Join-Path $PWD 'dist/release'
-          New-Item -ItemType Directory -Path $release -Force | Out-Null
-          Copy-Item 'dist/store.json' $release
-          Copy-Item 'dist/Omniphony EX Audio Engine.mjs' $release
-          Copy-Item 'dist/Omniphony EX Audio Engine.json' $release
-          Copy-Item 'dist/OmniphonyEX-API-win-x64.tar.gz' $release
-          Copy-Item 'LICENSE' $release
-          Copy-Item 'THIRD-PARTY-NOTICES.md' $release
+          python tools/prepare_release.py --dist dist --output $release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tools/verify-luna-store.py --dist $release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
