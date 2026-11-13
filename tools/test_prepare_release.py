@@ -24,6 +24,7 @@ class PrepareReleaseTests(unittest.TestCase):
                 json.dumps({"name": "Omniphony EX Audio Engine", "version": "2.1.41", "hash": "x"}),
                 encoding="utf-8",
             )
+            (dist / "OmniphonyEX-API-win-x64.tar.gz").write_bytes(b"verified-runtime")
             (root / "LICENSE").write_text("license", encoding="utf-8")
             (root / "THIRD-PARTY-NOTICES.md").write_text("notices", encoding="utf-8")
 
@@ -36,6 +37,7 @@ class PrepareReleaseTests(unittest.TestCase):
                     "Omniphony.EX.Audio.Engine.json",
                     "LICENSE",
                     "THIRD-PARTY-NOTICES.md",
+                    "OmniphonyEX-API-win-x64.tar.gz",
                     "store.json",
                 ],
             )
@@ -45,6 +47,10 @@ class PrepareReleaseTests(unittest.TestCase):
             )
             self.assertTrue((release / "Omniphony.EX.Audio.Engine.mjs").is_file())
             self.assertTrue((release / "Omniphony.EX.Audio.Engine.json").is_file())
+            self.assertEqual(
+                (release / "OmniphonyEX-API-win-x64.tar.gz").read_bytes(),
+                b"verified-runtime",
+            )
             self.assertEqual(
                 json.loads((dist / "store.json").read_text(encoding="utf-8"))["plugins"],
                 ["Omniphony EX Audio Engine.mjs"],
@@ -73,6 +79,7 @@ class PrepareReleaseTests(unittest.TestCase):
                 )
             (root / "LICENSE").write_text("license", encoding="utf-8")
             (root / "THIRD-PARTY-NOTICES.md").write_text("notices", encoding="utf-8")
+            (dist / "OmniphonyEX-API-win-x64.tar.gz").write_bytes(b"runtime")
 
             with self.assertRaisesRegex(ValueError, "collide"):
                 prepare_release(dist, dist / "release")
