@@ -1906,15 +1906,33 @@ class HeadlessAudioEngine:
                         for c in s_conns
                     )
                     if has_self_loop:
-                        owned = self.studio_proc
-                        if owned and owned.poll() is None and owned.pid == int(status["studioPid"]):
+                        with self.studio_lock:
+                            owned = self.studio_proc
+                            owns_stale_studio = (
+                                owned is not None
+                                and owned.poll() is None
+                                and owned.pid == int(status["studioPid"])
+                            )
+                        if owns_stale_studio:
                             restarted_stale_studio = True
-                            self.stop_owned_omniphony_studio()
-                            time.sleep(0.3)
+                            stopped = self.stop_owned_omniphony_studio()
                             with self.studio_lock:
-                                self.studio_proc = subprocess.Popen(
-                                    [str(STUDIO_EXE)], cwd=str(STUDIO_EXE.parent),
+                                still_owned_and_running = (
+                                    self.studio_proc is not None
+                                    and self.studio_proc.poll() is None
                                 )
+                            if not stopped and still_owned_and_running:
+                                time.sleep(0.2)
+                                continue
+                            with self.studio_lock:
+                                if not self.studio_proc or self.studio_proc.poll() is not None:
+                                    try:
+                                        self.studio_proc = subprocess.Popen(
+                                            [str(STUDIO_EXE)], cwd=str(STUDIO_EXE.parent),
+                                        )
+                                    except OSError:
+                                        self.studio_proc = None
+                                        return {"ready": False, "checks": {"studioLaunch": False}}
                 except Exception:
                     pass
             time.sleep(0.2)
@@ -1924,19 +1942,31 @@ class HeadlessAudioEngine:
         """Stop only the Studio process this service launched itself."""
         with self.studio_lock:
             process = self.studio_proc
-            self.studio_proc = None
-        if not process or process.poll() is not None:
-            return False
-        try:
-            process.terminate()
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=3)
-        except OSError as exc:
-            print(f"[-] Could not stop owned Omniphony Studio process: {type(exc).__name__}")
-            return False
-        return True
+            if not process:
+                return False
+            try:
+                if process.poll() is not None:
+                    if self.studio_proc is process:
+                        self.studio_proc = None
+                    return False
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        print("[-] Owned Omniphony Studio did not exit after kill; retaining its process handle")
+                        return False
+                if self.studio_proc is process:
+                    self.studio_proc = None
+                return True
+            except OSError as exc:
+                if process.poll() is not None and self.studio_proc is process:
+                    self.studio_proc = None
+                print(f"[-] Could not stop owned Omniphony Studio process: {type(exc).__name__}")
+                return False
 
     def wait_for_position(self, target: float, timeout: float = 3.0) -> bool:
         deadline = time.monotonic() + timeout

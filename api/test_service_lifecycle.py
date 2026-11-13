@@ -57,6 +57,96 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.assertIsNone(engine.studio_proc)
         self.assertFalse(engine.stop_owned_omniphony_studio())
 
+    def test_owned_studio_stop_serializes_with_concurrent_route_start(self):
+        engine = service.HeadlessAudioEngine()
+        old_process = Mock(pid=5123)
+        old_process.poll.return_value = None
+        new_process = Mock(pid=6123)
+        new_process.poll.return_value = None
+        engine.studio_proc = old_process
+
+        wait_started = threading.Event()
+        allow_wait_finish = threading.Event()
+        initial_route_observed = threading.Event()
+        route_probe_count = 0
+        results = {}
+        errors = []
+
+        def blocked_wait(timeout):
+            self.assertEqual(timeout, 3)
+            wait_started.set()
+            if not allow_wait_finish.wait(timeout=2):
+                raise AssertionError("test did not release the owned Studio stop")
+            return 0
+
+        old_process.wait.side_effect = blocked_wait
+
+        def route_probe(_pid):
+            nonlocal route_probe_count
+            route_probe_count += 1
+            if route_probe_count == 1:
+                initial_route_observed.set()
+                return {"ready": False, "checks": {"studio": False}}
+            return {
+                "ready": True,
+                "checks": {"studio": True, "studioRendererConnected": True},
+            }
+
+        def stop_studio():
+            try:
+                results["stopped"] = engine.stop_owned_omniphony_studio()
+            except Exception as exc:  # surfaced in the main test thread
+                errors.append(exc)
+
+        def start_route():
+            try:
+                results["route"] = engine.ensure_omniphony_route(timeout=1)
+            except Exception as exc:  # surfaced in the main test thread
+                errors.append(exc)
+
+        with TemporaryDirectory() as temp:
+            studio_exe = Path(temp) / "omniphony-studio-egui.exe"
+            studio_exe.touch()
+            with patch.object(service, "STUDIO_EXE", studio_exe), \
+                    patch.object(service, "get_omniphony_route_status", side_effect=route_probe), \
+                    patch.object(service.subprocess, "Popen", return_value=new_process) as launch:
+                stopper = threading.Thread(target=stop_studio)
+                stopper.start()
+                self.assertTrue(wait_started.wait(timeout=1))
+
+                starter = threading.Thread(target=start_route)
+                starter.start()
+                self.assertTrue(initial_route_observed.wait(timeout=1))
+                self.assertFalse(launch.called, "route start must wait while owned Studio is stopping")
+
+                allow_wait_finish.set()
+                stopper.join(timeout=2)
+                starter.join(timeout=2)
+
+                self.assertFalse(stopper.is_alive())
+                self.assertFalse(starter.is_alive())
+                self.assertEqual(errors, [])
+                self.assertTrue(results["stopped"])
+                self.assertTrue(results["route"]["ready"])
+                launch.assert_called_once_with([str(studio_exe)], cwd=str(studio_exe.parent))
+
+        self.assertEqual(engine.studio_proc, new_process)
+
+    def test_owned_studio_double_timeout_is_bounded_and_retains_process_handle(self):
+        engine = service.HeadlessAudioEngine()
+        process = Mock(pid=5123)
+        process.poll.return_value = None
+        timeout = service.subprocess.TimeoutExpired("omniphony-studio", 3)
+        process.wait.side_effect = [timeout, timeout]
+        engine.studio_proc = process
+
+        self.assertFalse(engine.stop_owned_omniphony_studio())
+
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 2)
+        self.assertIs(engine.studio_proc, process)
+
     def _invalidated_joc_engine(self):
         engine = service.HeadlessAudioEngine()
         request_id = "invalidated-joc-request"
