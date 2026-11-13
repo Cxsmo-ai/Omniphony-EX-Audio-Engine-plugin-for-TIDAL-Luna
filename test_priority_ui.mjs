@@ -96,8 +96,101 @@ assert.match(syncLoopSource,
 assert.match(syncLoopSource,
   /if \(pausedSelectionConfirmedTrackId !== null\) updatePausedSelectionUi\(\);/,
   "successful status polling refreshes confirmed paused-selection readiness text");
+assert.match(syncLoopSource, /getStalledPlayRecoveryMode\(tidal, engineTrackId/,
+  "an explicit stalled TIDAL selection is reconciled when native Play interceptors do not fire");
+assert.match(syncLoopSource, /stalled-play-selection-held-paused/,
+  "an armed paused-preparation selection remains paused during stalled-play recovery");
+assert.match(syncLoopSource, /stalled-play-intent-recovered/,
+  "an unarmed stalled selection starts only after a trusted Play gesture was captured");
+assert.match(source, /function recordStalledPlayAuthorization\(event\)[\s\S]*?event\?\.isTrusted !== true[\s\S]*?stalledPlayAuthorization = \{/,
+  "fallback playback authorization originates from a trusted user Play control event");
+assert.match(source, /if \(!allowPaused && sameSelectedTrack[\s\S]*?latestTidal\.playing === true/,
+  "a diagnostics-only preparation cannot enter the asynchronous resume branch");
 assert.match(source, /handleImmediateTidalSeek[\s\S]*?sendEngineCommand\(["']seek["']/,
   "explicit intercepted TIDAL seeks still reach libmpv");
+const stalledRecoverySandbox = {};
+vm.runInNewContext(extractFunction("isUninterceptedStalledPlayIntent"), stalledRecoverySandbox);
+vm.runInNewContext(extractFunction("getStalledPlayRecoveryMode"), stalledRecoverySandbox);
+stalledRecoverySandbox.stalledPlayAuthorization = null;
+vm.runInNewContext(extractFunction("hasStalledPlayAuthorization"), stalledRecoverySandbox);
+vm.runInNewContext(extractFunction("consumeStalledPlayAuthorization"), stalledRecoverySandbox);
+stalledRecoverySandbox.prepareNextSelectionPaused = false;
+stalledRecoverySandbox.pausedSelectionPending = null;
+stalledRecoverySandbox.getQueuedTrackId = () => "97874144";
+stalledRecoverySandbox.getCurrentTrackId = () => "97874144";
+stalledRecoverySandbox.tracePlaybackEvent = () => {};
+vm.runInNewContext(extractFunction("getPlayControlTrackId"), stalledRecoverySandbox);
+vm.runInNewContext(extractFunction("recordStalledPlayAuthorization"), stalledRecoverySandbox);
+const playRow = { innerText: "Natural Imagine Dragons 3:10", getAttribute: () => null, querySelector: () => null };
+const playControl = {
+  textContent: "",
+  title: "",
+  getAttribute: (name) => name === "aria-label" ? "Play" : null,
+  closest: () => playRow,
+};
+const playEvent = { isTrusted: true, target: { closest: () => playControl } };
+assert.equal(stalledRecoverySandbox.recordStalledPlayAuthorization({ ...playEvent, isTrusted: false }), false,
+  "synthetic or untrusted clicks cannot create fallback Play authorization");
+assert.equal(stalledRecoverySandbox.recordStalledPlayAuthorization(playEvent), true,
+  "a trusted Play control inside a TIDAL track row creates a short-lived authorization");
+assert.equal(stalledRecoverySandbox.stalledPlayAuthorization.allowSelectionChange, true);
+assert.equal(stalledRecoverySandbox.stalledPlayAuthorization.rowText, "natural imagine dragons 3:10");
+stalledRecoverySandbox.prepareNextSelectionPaused = true;
+stalledRecoverySandbox.stalledPlayAuthorization = null;
+assert.equal(stalledRecoverySandbox.recordStalledPlayAuthorization(playEvent), false,
+  "an armed paused-preparation gate never creates an unpaused Play authorization");
+const stalledNatural = { trackId: 227401768, actual: "STALLED", desired: "PLAYING" };
+assert.equal(stalledRecoverySandbox.getStalledPlayRecoveryMode(stalledNatural, 97874144), null,
+  "unarmed STALLED/PLAYING without a fresh trusted Play gesture cannot start audio");
+assert.equal(stalledRecoverySandbox.getStalledPlayRecoveryMode(stalledNatural, 97874144, {
+  pausedPreparationArmed: true,
+}), "prepare-paused", "an armed selection is prepared without starting audio");
+assert.equal(stalledRecoverySandbox.getStalledPlayRecoveryMode(stalledNatural, 97874144, {
+  pausedSelectionPending: true,
+}), null, "an existing paused preparation is left to its pending-selection state machine");
+assert.equal(stalledRecoverySandbox.getStalledPlayRecoveryMode(stalledNatural, 97874144, {
+  pausedSelectionConfirmed: true,
+}), "block-confirmed-selection", "a confirmed paused selection blocks stalled state without trusted Play authorization");
+assert.equal(stalledRecoverySandbox.getStalledPlayRecoveryMode(stalledNatural, 97874144, {
+  pausedSelectionConfirmed: true,
+  explicitPlayAuthorized: true,
+}), "block-confirmed-selection", "a confirmed selection also waits until diagnostics are ready");
+assert.equal(stalledRecoverySandbox.getStalledPlayRecoveryMode(stalledNatural, 97874144, {
+  pausedSelectionConfirmed: true,
+  pausedSelectionDiagnosticsReady: true,
+  explicitPlayAuthorized: true,
+}), "start-play", "a confirmed selection starts only after diagnostics and trusted Play authorization");
+assert.equal(stalledRecoverySandbox.getStalledPlayRecoveryMode(stalledNatural, 97874144, {
+  explicitPlayAuthorized: true,
+}), "start-play", "a fresh trusted Play gesture authorizes the matching unarmed selection");
+stalledRecoverySandbox.stalledPlayAuthorization = { trackId: "227401768", expiresAt: 5000 };
+assert.equal(stalledRecoverySandbox.hasStalledPlayAuthorization(227401768, 4999), true,
+  "a current authorization matches its selected track before expiry");
+assert.equal(stalledRecoverySandbox.hasStalledPlayAuthorization(97874144, 4999), false,
+  "a trusted Play gesture cannot authorize a different track");
+assert.equal(stalledRecoverySandbox.consumeStalledPlayAuthorization("227401768", 4999), true,
+  "a matching stalled-play authorization is consumed exactly once");
+assert.equal(stalledRecoverySandbox.hasStalledPlayAuthorization(227401768, 4999), false,
+  "consumed stalled-play authorization cannot be reused");
+stalledRecoverySandbox.stalledPlayAuthorization = { trackId: "227401768", expiresAt: 4999 };
+assert.equal(stalledRecoverySandbox.hasStalledPlayAuthorization(227401768, 5000), false,
+  "expired trusted Play authorization cannot restart a stalled selection");
+stalledRecoverySandbox.stalledPlayAuthorization = {
+  trackId: null, allowSelectionChange: true, priorTrackId: "97874144",
+  rowText: "natural imagine dragons 3:10", expiresAt: 5000,
+};
+assert.equal(stalledRecoverySandbox.hasStalledPlayAuthorization(227401768, 4999, {
+  title: "Natural", artist: "Imagine Dragons",
+}), true, "a track-row gesture binds only when the selected title and artist match that row");
+assert.equal(stalledRecoverySandbox.hasStalledPlayAuthorization(227401768, 4999, {
+  title: "Bad Liar", artist: "Imagine Dragons",
+}), false, "a track-row gesture cannot authorize a different selected title");
+assert.equal(stalledRecoverySandbox.getStalledPlayRecoveryMode(stalledNatural, 227401768), null,
+  "a stalled state on the already-matched engine track does not trigger a duplicate stream");
+assert.equal(stalledRecoverySandbox.getStalledPlayRecoveryMode({ ...stalledNatural, desired: "NOT_PLAYING" }, 97874144), null,
+  "a stalled TIDAL state without desired Play is not treated as user intent");
+assert.equal(stalledRecoverySandbox.getStalledPlayRecoveryMode({ ...stalledNatural, actual: "BUFFERING" }, 97874144), null,
+  "buffering alone does not trigger fallback playback");
 const clockOrderingSandbox = {
   clockOrderingInstanceId: "svc-a",
   clockOrderingMpvInstanceId: "mpv-a",
@@ -947,6 +1040,7 @@ vm.runInContext(`
   let prepareNextSelectionPaused = true;
   let pausedSelectionPending = null;
   let pausedSelectionConfirmedTrackId = null;
+    let stalledPlayAuthorization = null;
   let pausedSelectionUserPlayAuthorization = null;
   let desiredPlaybackIntent = true;
   let mirroringTidalPlaybackState = false;
@@ -1108,6 +1202,9 @@ assert.equal(observerSandbox.window.luna.lib.PlayState.desiredState, "PLAYING",
 assert.ok(observedTidalEvents.some((event) => Array.isArray(event)
   && event[0] === "time" && event[1] === 12.75),
 "libmpv's clock is published through TIDAL TIME_UPDATE");
+assert.match(extractFunction("applyNativeTimelinePosition"),
+  /mirrorEngineDurationToTidal\(\s*engineDuration/,
+  "the native footer timeline projects the verified engine duration into TidaLuna");
 const timeEventsBeforeStateOnlyProjection = observedTidalEvents.filter((event) => Array.isArray(event)
   && event[0] === "time").length;
 observerSandbox.desiredPlaybackIntent = false;
@@ -1273,6 +1370,76 @@ assert.equal(await resumeGuardSeekSandbox.handleImmediateTidalSeek(0), true,
 assert.equal(JSON.stringify(resumeGuardSeekCommands.at(-1)), JSON.stringify(["seek", {
   timePos: 0, trackId: 42, playbackGeneration: 4, requestId: "r42", expectedPaused: true,
 }]), "ordinary zero seeks preserve the active playback identity");
+
+const durationMirrorEvents = [];
+let durationMirrorNow = 0;
+const durationMirrorPlayState = {
+  playbackControls: {
+    mediaProduct: { productId: 227401769 },
+    playbackContext: { actualProductId: 227401769, actualDuration: 0 },
+  },
+};
+const durationMirrorSandbox = {
+  currentStatusData: { trackId: 227401769 },
+  lastMirroredUiDurationKey: null,
+  lastMirroredUiDurationAttemptKey: null,
+  lastMirroredUiDurationAttemptAt: -Infinity,
+  lastTidalDurationMirrorDiagnostic: null,
+  getCurrentTrackId: () => 227401769,
+  getTidalPlayState: () => durationMirrorPlayState,
+  getMonotonicNow: () => durationMirrorNow,
+  parsePlaybackPosition: (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : null;
+  },
+  dispatchTidalAction: (type, value) => {
+    durationMirrorEvents.push([type, value]);
+    durationMirrorPlayState.playbackControls.playbackContext.actualDuration = value;
+    return true;
+  },
+};
+vm.createContext(durationMirrorSandbox);
+vm.runInContext(`${extractFunction("readTidalPlaybackDuration")}\n${extractFunction("mirrorEngineDurationToTidal")}`, durationMirrorSandbox);
+assert.equal(durationMirrorSandbox.mirrorEngineDurationToTidal(187.818667), true,
+  "a verified engine duration is mirrored through TidaLuna's native duration action");
+assert.deepEqual(durationMirrorEvents, [["playbackControls/SET_DURATION", 187.818667]]);
+assert.equal(durationMirrorSandbox.mirrorEngineDurationToTidal(187.818667), true,
+  "repeated clock frames do not dispatch the same track duration again");
+assert.equal(durationMirrorEvents.length, 1);
+assert.equal(durationMirrorSandbox.lastTidalDurationMirrorDiagnostic.verified, true,
+  "duration mirroring is counted only after TidaLuna Redux reports the matching duration");
+assert.equal(durationMirrorSandbox.mirrorEngineDurationToTidal(0), false,
+  "an empty engine duration never overwrites TIDAL's duration");
+assert.equal(durationMirrorSandbox.mirrorEngineDurationToTidal(187.818667, 227401768), false,
+  "a duration cannot be written while TIDAL and the prepared engine track differ");
+durationMirrorPlayState.playbackControls.mediaProduct.productId = 227401768;
+durationMirrorPlayState.playbackControls.playbackContext.actualProductId = 227401768;
+durationMirrorPlayState.playbackControls.playbackContext.actualDuration = 0;
+durationMirrorSandbox.currentStatusData = { trackId: 227401768 };
+durationMirrorSandbox.getCurrentTrackId = () => 227401768;
+assert.equal(durationMirrorSandbox.mirrorEngineDurationToTidal(187.818667), true,
+  "a new matching track receives its own duration even when the seconds are identical");
+assert.equal(durationMirrorEvents.length, 2);
+
+durationMirrorPlayState.playbackControls.playbackContext.actualDuration = 0;
+durationMirrorSandbox.lastMirroredUiDurationKey = null;
+durationMirrorSandbox.lastMirroredUiDurationAttemptKey = null;
+durationMirrorSandbox.lastMirroredUiDurationAttemptAt = -Infinity;
+durationMirrorSandbox.dispatchTidalAction = (type, value) => {
+  durationMirrorEvents.push([type, value]);
+  return true;
+};
+assert.equal(durationMirrorSandbox.mirrorEngineDurationToTidal(187.818667), false,
+  "a successful action call without a matching Redux readback is not accepted");
+assert.equal(durationMirrorSandbox.lastMirroredUiDurationKey, null,
+  "an unverified duration is not cached as mirrored");
+assert.equal(durationMirrorSandbox.mirrorEngineDurationToTidal(187.818667), false,
+  "a failed readback is throttled instead of dispatching on every animation frame");
+assert.equal(durationMirrorEvents.length, 3);
+durationMirrorNow = 251;
+assert.equal(durationMirrorSandbox.mirrorEngineDurationToTidal(187.818667), false,
+  "a failed duration readback is retried after the bounded backoff");
+assert.equal(durationMirrorEvents.length, 4);
 
 class FakeElement {
   constructor(tagName, registry) {
@@ -1865,6 +2032,9 @@ vm.runInContext(`
   let desiredPlaybackIntent = null;
   let playIntentChangedAt = 0;
     let pendingExplicitPlayIntent = null;
+    let prepareNextSelectionPaused = false;
+  let stalledPlayAuthorization = null;
+    let pausedSelectionUserPlayAuthorization = null;
     let transportIntentRevision = 0;
     globalThis.setSyncPlaybackIntent = (intent, changedAt) => {
     desiredPlaybackIntent = intent;
@@ -1911,6 +2081,10 @@ vm.runInContext(`
   ${extractFunction("mergeStatusWithLatestFastClockSample")}
   ${extractFunction("resolveEngineSampleAnchor")}
   ${extractFunction("holdSyncForPausedSelection")}
+  ${extractFunction("isUninterceptedStalledPlayIntent")}
+  ${extractFunction("getStalledPlayRecoveryMode")}
+  ${extractFunction("hasStalledPlayAuthorization")}
+  ${extractFunction("consumeStalledPlayAuthorization")}
   ${extractFunction("hasRecentTidalSeekIntent")}
   ${extractFunction("hasTidalClockDiscontinuity")}
   ${extractFunction("shouldSuppressStaleZeroSeek")}
@@ -3147,6 +3321,7 @@ const pausedPreparationSandbox = {
     trackId: 238551884, playing: false, position: 55.04,
     title: "Demons", artist: "Imagine Dragons",
   }),
+  setTidalPlaybackIntent() {},
   reportPlaybackReadinessBlock() {},
   updateBadgeUI() {},
   sendEngineCommand: async (endpoint, body) => {
@@ -3199,6 +3374,73 @@ assert.equal(pausedPreparationSandbox.currentStatusData.playbackGeneration, 121,
   "the response generation is retained for the later exact-track resume");
 assert.equal(pausedPreparationSandbox.currentConfig.priority[0], "EAC3_JOC",
   "verified playback settings are committed only after paused-track state is revalidated");
+
+// A paused preparation can race with TIDAL briefly reporting PLAYING while
+// the service resolves. That transient state must never resume libmpv, and
+// the plugin must restore TIDAL's intended paused state after resolution.
+let resolvePausedRacePlay;
+let pausedRaceSnapshot = { trackId: 17, playing: false, position: 9 };
+const pausedRaceCommands = [];
+const pausedRaceIntent = [];
+const pausedRaceSandbox = {
+  API_BASE: "http://127.0.0.1:8765",
+  crypto: globalThis.crypto,
+  AbortController,
+  pluginDisposed: false,
+  currentConfig: {},
+  currentStatusData: {},
+  console: { log() {}, warn() {}, error() {} },
+  checkPlaybackReadiness: async () => ({ ready: true, config: {} }),
+  getTidalPlaybackSnapshot: () => pausedRaceSnapshot,
+  setTidalPlaybackIntent: (playing) => pausedRaceIntent.push(playing),
+  reportPlaybackReadinessBlock() {},
+  updateBadgeUI() {},
+  sendEngineCommand: async (endpoint, body) => {
+    pausedRaceCommands.push({ endpoint, body });
+    return true;
+  },
+  requestWithTimeout: (url, options = {}) => {
+    const endpoint = url.split("/").at(-1);
+    if (endpoint === "play") {
+      const body = JSON.parse(options.body);
+      return new Promise((resolve) => { resolvePausedRacePlay = () => resolve({
+        ok: true,
+        json: async () => ({ generation: 171, requestId: body.requestId, format: "AC4_IMS" }),
+      }); });
+    }
+    return Promise.resolve({ ok: true });
+  },
+};
+vm.createContext(pausedRaceSandbox);
+vm.runInContext(`
+  function tracePlaybackEvent() {}
+  let enginePlayGeneration = 0;
+  let enginePlayAbortController = null;
+  let enginePlayPending = null;
+  let enginePlayPendingTrackId = null;
+  let enginePlayRequestId = null;
+  let enginePlayRequestTrackId = null;
+  let enginePlayAllowPaused = false;
+  let desiredPlaybackIntent = null;
+  let currentFormatLabel = "Omniphony EX";
+  let lastMirroredPlaybackState = null;
+  let lastPlayAttempt = { trackId: null, at: 0 };
+  let currentStatusData = globalThis.currentStatusData;
+  function hasPendingExplicitPlayIntent() { return false; }
+  function shouldPreserveExplicitPlayIntent() { return false; }
+  function cancelPendingEnginePlay() {}
+  ${extractFunction("triggerEnginePlay")}
+`, pausedRaceSandbox);
+const pausedRaceTask = pausedRaceSandbox.triggerEnginePlay(17, 9, {}, { allowPaused: true });
+for (let attempt = 0; attempt < 5 && !resolvePausedRacePlay; attempt += 1) await Promise.resolve();
+assert.ok(resolvePausedRacePlay, "paused preparation reaches the service before the TIDAL state race");
+pausedRaceSnapshot = { trackId: 17, playing: true, position: 9 };
+resolvePausedRacePlay();
+assert.equal(await pausedRaceTask, true, "transient TIDAL PLAYING does not discard a valid paused preparation");
+assert.deepEqual(pausedRaceCommands, [], "paused preparation never resumes, pauses, or cancels libmpv during the TIDAL race");
+assert.deepEqual(pausedRaceIntent, [false], "paused preparation restores TIDAL's intended paused state after the race");
+assert.equal(pausedRaceSandbox.currentStatusData.playbackGeneration, 171,
+  "the paused stream generation remains available for a later explicit Play");
 
 // If TIDAL pauses after /play has reached the service, the resolved stream must
 // remain paused and the plugin must not send a resume command.
@@ -3545,7 +3787,11 @@ const timelineProjectionSandbox = {
   nativeSliderInteractionCleanup: null,
   NATIVE_SLIDER_INTERACTION_HOLD_MS: 250,
   lastTidalSeekIntent: null,
-  currentStatusData: {},
+  currentStatusData: { trackId: 42 },
+  lastMirroredUiDurationKey: null,
+  lastMirroredUiDurationAttemptKey: null,
+  lastMirroredUiDurationAttemptAt: -Infinity,
+  lastTidalDurationMirrorDiagnostic: null,
   nativeTimelineProjection: null,
   nativeTimelineFrameId: null,
   lastMirroredUiTime: null,
@@ -3556,7 +3802,14 @@ const timelineProjectionSandbox = {
   lastNativeTimelineProjectionDiagnostic: null,
   nativeTimelineDispatchSequence: 0,
   nativeTimelineDispatchHistory: [],
-  tidalPlayState: { playTime: 0, currentTime: 0 },
+  tidalPlayState: {
+    playTime: 0,
+    currentTime: 0,
+    playbackControls: {
+      mediaProduct: { productId: 42 },
+      playbackContext: { actualProductId: 42, actualDuration: 0 },
+    },
+  },
   pluginDisposed: false,
   readNativeMediaClockDiagnostic: () => ({ testStub: true }),
   unloads: new Set(),
@@ -3612,6 +3865,8 @@ const timelineProjectionSandbox = {
         String(element.tagName || "").toUpperCase() === "DIV"
         && element.getAttribute?.("role") === "slider");
       customSlider?.setAttribute?.("aria-valuenow", String(value));
+    } else if (action === "playbackControls/SET_DURATION") {
+      timelineProjectionSandbox.tidalPlayState.playbackControls.playbackContext.actualDuration = Number(value);
     }
     return true;
   },
@@ -3621,6 +3876,8 @@ vm.runInContext([
   "const MAX_NATIVE_TIMELINE_SAMPLE_AGE_MS = 250;",
   "const NATIVE_TIMELINE_DIAGNOSTIC_INTERVAL_MS = 2000;",
   extractFunction("parsePlaybackPosition"),
+  extractFunction("readTidalPlaybackDuration"),
+  extractFunction("mirrorEngineDurationToTidal"),
   extractFunction("parseNonNegativeFiniteNumber"),
   extractFunction("getTidalPosition"),
   extractFunction("getMonotonicNow"),
@@ -4363,6 +4620,9 @@ assert.equal("max" in tidalCustomProgressDiv, false,
 assert.deepEqual(timelineProjectionSandbox.reduxTimelineEvents.at(-1),
   ["playbackControls/TIME_UPDATE", 45],
   "the custom progress DIV is updated through TIDAL's native Redux action");
+assert.ok(timelineProjectionSandbox.reduxTimelineEvents.some((event) =>
+  event[0] === "playbackControls/SET_DURATION" && event[1] === 200),
+"the custom progress DIV receives the authoritative libmpv duration through TidaLuna");
 assert.equal(timelineProjectionSandbox.nativeTimelineDiagnosticWindow.last.sliderAfter, null,
   "custom DIV property readback is excluded from synchronization diagnostics");
 assert.equal(timelineProjectionSandbox.nativeTimelineDiagnosticWindow.last.customSliderAriaValueBefore, 20,
@@ -4414,8 +4674,8 @@ assert.equal(vm.runInContext(
   timelineProjectionSandbox,
 ), true, "a paused engine clock repairs a TIDAL Redux reset after reload");
 assert.equal(timelineProjectionSandbox.reduxTimelineEvents.length,
-  preReloadCorrectionEventCount + 1,
-  "a host-state mismatch dispatches even when the cached mirrored position is unchanged");
+  preReloadCorrectionEventCount + 2,
+  "a host-state mismatch restores both the verified engine duration and position");
 assert.deepEqual(timelineProjectionSandbox.reduxTimelineEvents.at(-1),
   ["playbackControls/TIME_UPDATE", 63.539449],
   "the reload correction uses TIDAL's native Redux TIME_UPDATE action");

@@ -1153,6 +1153,76 @@ def joc_route_is_verified(route_status: dict | None, active_decoder=None) -> boo
     return is_active_orender_decoder(active_decoder)
 
 
+def refresh_invalidated_joc_route_telemetry(engine) -> bool:
+    """Refresh route diagnostics for an invalidated JOC generation only.
+
+    A Studio reconnect does not revive the old MPV/orender stream. This
+    read-only probe updates only omniphonyRoute, and only if the same failed
+    generation and MPV process are still current when the probe completes.
+    """
+    with engine.playback_lock:
+        with engine.playback_generation_lock:
+            observed_meta = engine.current_meta
+            generation = observed_meta.get("generation")
+            if (
+                observed_meta.get("format") != "EAC3_JOC"
+                or observed_meta.get("trackId") is None
+                or not isinstance(generation, int)
+                or generation <= 0
+                or generation in {
+                    engine.pending_generation,
+                    engine.active_generation,
+                    engine.prepared_generation,
+                }
+            ):
+                return False
+            observed_identity = (
+                observed_meta.get("trackId"), generation,
+                observed_meta.get("requestId"),
+                engine.pending_generation, engine.pending_request_id,
+                engine.active_generation, engine.active_request_id,
+                engine.prepared_generation, engine.prepared_request_id,
+            )
+            observed_proc = engine.proc
+            observed_pid = observed_proc.pid if observed_proc else None
+
+    try:
+        route_status = get_omniphony_route_status(observed_pid)
+    except Exception as exc:
+        print(f"[!] Failed invalidated JOC route telemetry refresh: {type(exc).__name__}")
+        return False
+    if not isinstance(route_status, dict):
+        return False
+
+    with engine.playback_lock:
+        with engine.playback_generation_lock:
+            current_meta = engine.current_meta
+            current_generation = current_meta.get("generation")
+            current_identity = (
+                current_meta.get("trackId"), current_generation,
+                current_meta.get("requestId"),
+                engine.pending_generation, engine.pending_request_id,
+                engine.active_generation, engine.active_request_id,
+                engine.prepared_generation, engine.prepared_request_id,
+            )
+            if (
+                current_meta is not observed_meta
+                or current_meta.get("format") != "EAC3_JOC"
+                or not isinstance(current_generation, int)
+                or current_generation in {
+                    engine.pending_generation,
+                    engine.active_generation,
+                    engine.prepared_generation,
+                }
+                or current_identity != observed_identity
+                or engine.proc is not observed_proc
+                or (engine.proc.pid if engine.proc else None) != observed_pid
+            ):
+                return False
+            current_meta["omniphonyRoute"] = route_status
+            return True
+
+
 def wait_for_verified_joc_route(engine, timeout: float = 12.0) -> dict:
     """Wait for strict orender selection, then require Studio to attach to this MPV."""
     if not engine.wait_for_selected_decoder("orender"):
@@ -1220,6 +1290,8 @@ class HeadlessAudioEngine:
         # Startup and first HTTP requests can call ensure_mpv concurrently.
         # Serialize engine creation independently from the IPC command lock.
         self.ensure_lock = threading.Lock()
+        self.studio_lock = threading.Lock()
+        self.studio_proc: subprocess.Popen | None = None
         self.playback_lock = threading.Lock()
         self.playback_generation_lock = threading.RLock()
         self.seek_sequence = 0
@@ -1800,10 +1872,15 @@ class HeadlessAudioEngine:
             return {"ready": False, "checks": {"studioExecutable": False}}
         initial = get_omniphony_route_status(self.proc.pid if self.proc else None)
         if not initial.get("checks", {}).get("studio"):
-            try:
-                subprocess.Popen([str(STUDIO_EXE)], cwd=str(STUDIO_EXE.parent))
-            except OSError:
-                return {"ready": False, "checks": {"studioLaunch": False}}
+            with self.studio_lock:
+                if not self.studio_proc or self.studio_proc.poll() is not None:
+                    try:
+                        self.studio_proc = subprocess.Popen(
+                            [str(STUDIO_EXE)], cwd=str(STUDIO_EXE.parent),
+                        )
+                    except OSError:
+                        self.studio_proc = None
+                        return {"ready": False, "checks": {"studioLaunch": False}}
 
         deadline = time.monotonic() + timeout
         status = {"ready": False, "checks": {}}
@@ -1829,14 +1906,37 @@ class HeadlessAudioEngine:
                         for c in s_conns
                     )
                     if has_self_loop:
-                        restarted_stale_studio = True
-                        psutil.Process(int(status["studioPid"])).terminate()
-                        time.sleep(0.3)
-                        subprocess.Popen([str(STUDIO_EXE)], cwd=str(STUDIO_EXE.parent))
+                        owned = self.studio_proc
+                        if owned and owned.poll() is None and owned.pid == int(status["studioPid"]):
+                            restarted_stale_studio = True
+                            self.stop_owned_omniphony_studio()
+                            time.sleep(0.3)
+                            with self.studio_lock:
+                                self.studio_proc = subprocess.Popen(
+                                    [str(STUDIO_EXE)], cwd=str(STUDIO_EXE.parent),
+                                )
                 except Exception:
                     pass
             time.sleep(0.2)
         return status
+
+    def stop_owned_omniphony_studio(self) -> bool:
+        """Stop only the Studio process this service launched itself."""
+        with self.studio_lock:
+            process = self.studio_proc
+            self.studio_proc = None
+        if not process or process.poll() is not None:
+            return False
+        try:
+            process.terminate()
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+        except OSError as exc:
+            print(f"[-] Could not stop owned Omniphony Studio process: {type(exc).__name__}")
+            return False
+        return True
 
     def wait_for_position(self, target: float, timeout: float = 3.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -6183,6 +6283,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                                         "Omniphony route is unverified and mpv pause failed "
                                         f"({pause_error}); playback controls remain available for recovery"
                                     )
+
+            if not joc_snapshot:
+                refresh_invalidated_joc_route_telemetry(engine)
             
             track_status = public_track_status(engine.current_meta, playback_state)
             self.send_json({
@@ -6969,9 +7072,13 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                         route_status = get_omniphony_route_status(engine.proc.pid if engine.proc else None)
                         decoder_result = engine.cmd(["get_property", "current-tracks/audio/decoder"])
                         active_decoder = decoder_result.get("data") if decoder_result else None
-                        route_status.setdefault("checks", {})["activeDecoder"] = is_active_orender_decoder(active_decoder)
-                        route_status["ready"] = joc_route_is_verified(route_status, active_decoder)
-                        if not route_status.get("ready"):
+                        decoder_confirmed = is_active_orender_decoder(active_decoder)
+                        route_status.setdefault("checks", {})["activeDecoder"] = decoder_confirmed
+                        route_status["ready"] = (
+                            joc_route_is_verified(route_status, active_decoder)
+                            and decoder_confirmed
+                        )
+                        if not route_status["ready"]:
                             return self.send_json({
                                 "error": "E-AC-3 JOC resume blocked: Omniphony route or selected orender decoder is not verified",
                                 "omniphonyRoute": route_status,
@@ -7392,6 +7499,7 @@ def run():
             except subprocess.TimeoutExpired:
                 engine.proc.kill()
                 engine.proc.wait(timeout=3)
+        engine.stop_owned_omniphony_studio()
 
 if __name__ == "__main__":
     run()
