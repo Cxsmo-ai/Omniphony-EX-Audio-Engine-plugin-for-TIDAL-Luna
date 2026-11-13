@@ -3,12 +3,293 @@ import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import omnifusion_service as service
 
 
 class ServiceLifecycleTests(unittest.TestCase):
+    def test_joc_route_start_tracks_and_closes_only_its_owned_studio(self):
+        engine = service.HeadlessAudioEngine()
+        with TemporaryDirectory() as temp:
+            studio_exe = Path(temp) / "omniphony-studio-egui.exe"
+            studio_exe.touch()
+            process = Mock(pid=5123)
+            process.poll.return_value = None
+            route_states = [
+                {"ready": False, "checks": {"studio": False}},
+                {"ready": True, "checks": {"studio": True, "studioRendererConnected": True}},
+            ]
+            with patch.object(service, "STUDIO_EXE", studio_exe), \
+                    patch.object(service, "get_omniphony_route_status", side_effect=route_states) as route_probe, \
+                    patch.object(service.subprocess, "Popen", return_value=process) as launch:
+                route = engine.ensure_omniphony_route(timeout=0.5)
+
+            self.assertTrue(route["ready"])
+            self.assertEqual(engine.studio_proc, process)
+            launch.assert_called_once_with([str(studio_exe)], cwd=str(studio_exe.parent))
+            self.assertEqual(route_probe.call_count, 2)
+            self.assertTrue(engine.stop_owned_omniphony_studio())
+
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=3)
+        process.kill.assert_not_called()
+        self.assertIsNone(engine.studio_proc)
+
+    def test_existing_user_started_studio_is_never_claimed_or_closed(self):
+        engine = service.HeadlessAudioEngine()
+        engine.proc = Mock(pid=35128)
+        with TemporaryDirectory() as temp:
+            studio_exe = Path(temp) / "omniphony-studio-egui.exe"
+            studio_exe.touch()
+            with patch.object(service, "STUDIO_EXE", studio_exe), \
+                    patch.object(service, "get_omniphony_route_status", return_value={
+                        "ready": True, "checks": {"studio": True, "studioRendererConnected": True},
+                    }) as route_probe, \
+                    patch.object(service.subprocess, "Popen") as launch:
+                route = engine.ensure_omniphony_route(timeout=0.1)
+
+        self.assertTrue(route["ready"])
+        self.assertEqual(route_probe.call_count, 2)
+        self.assertEqual(route_probe.call_args_list[0].args, (35128,))
+        self.assertEqual(route_probe.call_args_list[1].args, (35128,))
+        launch.assert_not_called()
+        self.assertIsNone(engine.studio_proc)
+        self.assertFalse(engine.stop_owned_omniphony_studio())
+
+    def test_owned_studio_stop_serializes_with_concurrent_route_start(self):
+        engine = service.HeadlessAudioEngine()
+        old_process = Mock(pid=5123)
+        old_process.poll.return_value = None
+        new_process = Mock(pid=6123)
+        new_process.poll.return_value = None
+        engine.studio_proc = old_process
+
+        wait_started = threading.Event()
+        allow_wait_finish = threading.Event()
+        initial_route_observed = threading.Event()
+        route_probe_count = 0
+        results = {}
+        errors = []
+
+        def blocked_wait(timeout):
+            self.assertEqual(timeout, 3)
+            wait_started.set()
+            if not allow_wait_finish.wait(timeout=2):
+                raise AssertionError("test did not release the owned Studio stop")
+            return 0
+
+        old_process.wait.side_effect = blocked_wait
+
+        def route_probe(_pid):
+            nonlocal route_probe_count
+            route_probe_count += 1
+            if route_probe_count == 1:
+                initial_route_observed.set()
+                return {"ready": False, "checks": {"studio": False}}
+            return {
+                "ready": True,
+                "checks": {"studio": True, "studioRendererConnected": True},
+            }
+
+        def stop_studio():
+            try:
+                results["stopped"] = engine.stop_owned_omniphony_studio()
+            except Exception as exc:  # surfaced in the main test thread
+                errors.append(exc)
+
+        def start_route():
+            try:
+                results["route"] = engine.ensure_omniphony_route(timeout=1)
+            except Exception as exc:  # surfaced in the main test thread
+                errors.append(exc)
+
+        with TemporaryDirectory() as temp:
+            studio_exe = Path(temp) / "omniphony-studio-egui.exe"
+            studio_exe.touch()
+            with patch.object(service, "STUDIO_EXE", studio_exe), \
+                    patch.object(service, "get_omniphony_route_status", side_effect=route_probe), \
+                    patch.object(service.subprocess, "Popen", return_value=new_process) as launch:
+                stopper = threading.Thread(target=stop_studio)
+                stopper.start()
+                self.assertTrue(wait_started.wait(timeout=1))
+
+                starter = threading.Thread(target=start_route)
+                starter.start()
+                self.assertTrue(initial_route_observed.wait(timeout=1))
+                self.assertFalse(launch.called, "route start must wait while owned Studio is stopping")
+
+                allow_wait_finish.set()
+                stopper.join(timeout=2)
+                starter.join(timeout=2)
+
+                self.assertFalse(stopper.is_alive())
+                self.assertFalse(starter.is_alive())
+                self.assertEqual(errors, [])
+                self.assertTrue(results["stopped"])
+                self.assertTrue(results["route"]["ready"])
+                launch.assert_called_once_with([str(studio_exe)], cwd=str(studio_exe.parent))
+
+        self.assertEqual(engine.studio_proc, new_process)
+
+    def test_owned_studio_double_timeout_is_bounded_and_retains_process_handle(self):
+        engine = service.HeadlessAudioEngine()
+        process = Mock(pid=5123)
+        process.poll.return_value = None
+        timeout = service.subprocess.TimeoutExpired("omniphony-studio", 3)
+        process.wait.side_effect = [timeout, timeout]
+        engine.studio_proc = process
+
+        self.assertFalse(engine.stop_owned_omniphony_studio())
+
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 2)
+        self.assertIs(engine.studio_proc, process)
+
+    def _invalidated_joc_engine(self):
+        engine = service.HeadlessAudioEngine()
+        request_id = "invalidated-joc-request"
+        engine.pending_generation = 8
+        engine.pending_request_id = None
+        engine.active_generation = 0
+        engine.active_request_id = None
+        engine.prepared_generation = 0
+        engine.prepared_request_id = None
+        engine.proc = Mock(pid=35128)
+        engine.current_meta = {
+            "trackId": "227401768",
+            "generation": 7,
+            "requestId": request_id,
+            "format": "EAC3_JOC",
+            "playbackState": "failed",
+            "label": "Omniphony renderer disconnected",
+            "lastFailure": "route disconnected",
+            "omniphonyRoute": {"ready": False, "studioPid": 11844},
+        }
+        engine.cmd = Mock(return_value={"error": "success"})
+        return engine, request_id
+
+    def test_invalidated_joc_refresh_updates_only_route_telemetry(self):
+        engine, request_id = self._invalidated_joc_engine()
+        replacement_route = {
+            "ready": True,
+            "studioPid": 33888,
+            "checks": {"studioRendererConnected": True},
+        }
+        original_state = dict(engine.current_meta)
+
+        with patch.object(service, "get_omniphony_route_status", return_value=replacement_route) as probe:
+            refreshed = service.refresh_invalidated_joc_route_telemetry(engine)
+
+        self.assertTrue(refreshed)
+        probe.assert_called_once_with(35128)
+        self.assertEqual(engine.current_meta["omniphonyRoute"], replacement_route)
+        for key in ("trackId", "generation", "requestId", "playbackState", "label", "lastFailure"):
+            self.assertEqual(engine.current_meta[key], original_state[key])
+        self.assertEqual(engine.pending_generation, 8)
+        self.assertEqual(engine.active_generation, 0)
+        self.assertEqual(engine.prepared_generation, 0)
+        self.assertFalse(engine.control_matches("227401768", 7, request_id))
+        engine.cmd.assert_not_called()
+
+    def test_invalidated_joc_refresh_discards_result_after_track_replacement(self):
+        engine, _ = self._invalidated_joc_engine()
+        probe_started = threading.Event()
+        allow_probe_finish = threading.Event()
+
+        def delayed_probe(pid):
+            self.assertEqual(pid, 35128)
+            probe_started.set()
+            self.assertTrue(allow_probe_finish.wait(timeout=2))
+            return {"ready": True, "studioPid": 33888}
+
+        with patch.object(service, "get_omniphony_route_status", side_effect=delayed_probe):
+            worker = threading.Thread(
+                target=lambda: service.refresh_invalidated_joc_route_telemetry(engine)
+            )
+            worker.start()
+            self.assertTrue(probe_started.wait(timeout=2))
+            with engine.playback_lock:
+                with engine.playback_generation_lock:
+                    engine.pending_generation = 9
+                    engine.pending_request_id = "new-track-request"
+                    engine.current_meta = {
+                        "trackId": "new-track",
+                        "generation": 9,
+                        "requestId": "new-track-request",
+                        "format": "EAC3_JOC",
+                        "playbackState": "prepared",
+                        "omniphonyRoute": {"ready": False, "studioPid": 11844},
+                    }
+            allow_probe_finish.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(engine.current_meta["trackId"], "new-track")
+        self.assertEqual(engine.current_meta["omniphonyRoute"]["studioPid"], 11844)
+        engine.cmd.assert_not_called()
+
+    def test_invalidated_joc_refresh_discards_result_after_mpv_replacement(self):
+        engine, _ = self._invalidated_joc_engine()
+        old_proc = engine.proc
+        probe_started = threading.Event()
+        allow_probe_finish = threading.Event()
+
+        def delayed_probe(pid):
+            probe_started.set()
+            self.assertTrue(allow_probe_finish.wait(timeout=2))
+            return {"ready": True, "studioPid": 33888}
+
+        with patch.object(service, "get_omniphony_route_status", side_effect=delayed_probe):
+            worker = threading.Thread(
+                target=lambda: service.refresh_invalidated_joc_route_telemetry(engine)
+            )
+            worker.start()
+            self.assertTrue(probe_started.wait(timeout=2))
+            with engine.playback_lock:
+                with engine.playback_generation_lock:
+                    engine.proc = Mock(pid=35222)
+            allow_probe_finish.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertIsNot(engine.proc, old_proc)
+        self.assertEqual(engine.current_meta["omniphonyRoute"]["studioPid"], 11844)
+        engine.cmd.assert_not_called()
+
+    def test_invalidated_joc_refresh_failure_does_not_change_playback(self):
+        engine, _ = self._invalidated_joc_engine()
+        original_meta = dict(engine.current_meta)
+        with patch.object(service, "get_omniphony_route_status", side_effect=OSError("probe failed")):
+            refreshed = service.refresh_invalidated_joc_route_telemetry(engine)
+        self.assertFalse(refreshed)
+        self.assertEqual(engine.current_meta, original_meta)
+        engine.cmd.assert_not_called()
+
+    def test_route_telemetry_refresh_ignores_active_joc_and_non_joc_tracks(self):
+        engine, request_id = self._invalidated_joc_engine()
+        cases = (
+            ("EAC3_JOC", 7, 7, "failed"),
+            ("AC4_IMS", 7, 8, "failed"),
+            ("EAC3_JOC", 8, 8, "paused"),
+        )
+        with patch.object(service, "get_omniphony_route_status") as probe:
+            for codec, generation, pending_generation, state in cases:
+                with self.subTest(codec=codec, generation=generation, state=state):
+                    engine.current_meta = {
+                        "trackId": "227401768",
+                        "generation": generation,
+                        "requestId": request_id,
+                        "format": codec,
+                        "playbackState": state,
+                        "omniphonyRoute": {"ready": False, "studioPid": 11844},
+                    }
+                    engine.pending_generation = pending_generation
+                    self.assertFalse(service.refresh_invalidated_joc_route_telemetry(engine))
+        probe.assert_not_called()
+        engine.cmd.assert_not_called()
+
     def test_eclipse_manifest_urls_allow_https_and_local_development_only(self):
         self.assertEqual(
             service.validate_eclipse_addon_urls([

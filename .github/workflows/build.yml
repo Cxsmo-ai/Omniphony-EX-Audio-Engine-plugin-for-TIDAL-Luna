@@ -34,6 +34,9 @@ jobs:
       - name: Run plugin lifecycle tests
         run: node --test tests/*.test.mjs
 
+      - name: Run playback controls and priority UI harness
+        run: node test_priority_ui.mjs
+
       - name: Build plugin modules and store catalog
         run: pnpm run build
 

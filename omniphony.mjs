@@ -18,7 +18,7 @@
 const API_BASE = "http://127.0.0.1:8765";
 const REQUIRED_SERVICE_VERSION = "2.1.27";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.40";
+const PLUGIN_BUILD = "2.1.41";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -130,11 +130,11 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.40");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.41");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.40/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "7B377F3041C9E4AAA525767F53680FAEC709D53E40B6D5817C9F488A9CD22C89";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.41/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "CCE8A969620265391FDEDDA8E0A69D21EDC134848D10CE09239A2C252C641ADB";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -163,7 +163,6 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
       path.join(mpvDir, "mpv.exe"),
       path.join(mpvDir, "orender.dll"),
       studioExe,
-      path.join(path.dirname(studioExe), "orender.exe"),
     ];
     const missingRuntimeFiles = runtimeFiles.filter((file) => !fs.existsSync(file));
     if (missingRuntimeFiles.length) {
@@ -197,7 +196,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.40"
+        return marker.pluginVersion === "2.1.41"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -266,7 +265,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.40", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.41", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -465,7 +464,12 @@ let lastAutoAdvanceUnavailableIdentity = null;
 let pausedSelectionPending = null;
 let pausedSelectionConfirmedTrackId = null;
 let pausedSelectionUserPlayAuthorization = null;
+let stalledPlayAuthorization = null;
 let lastMirroredUiTime = null;
+let lastMirroredUiDurationKey = null;
+let lastMirroredUiDurationAttemptKey = null;
+let lastMirroredUiDurationAttemptAt = -Infinity;
+let lastTidalDurationMirrorDiagnostic = null;
 let lastEngineStateCommandAt = 0;
 let previousEngineSample = null;
 let lastTidalSeekIntent = null;
@@ -1049,6 +1053,7 @@ function restoreNativeMediaPlayback() {
 }
 
 function handleNativePlayerPlay(onPlaybackChange) {
+  stalledPlayAuthorization = null;
   const queueTrackId = getQueuedTrackId();
   tracePlaybackEvent("native-player-play-request", {
     queuedTrackId: queueTrackId,
@@ -1902,6 +1907,81 @@ function dispatchTidalAction(type, payload) {
   }
 }
 
+function readTidalPlaybackDuration(trackId) {
+  try {
+    const controls = getTidalPlayState()?.playbackControls;
+    const playbackContext = controls?.playbackContext;
+    const activeTrackId = controls?.mediaProduct?.productId
+      ?? playbackContext?.actualProductId
+      ?? null;
+    const duration = parsePlaybackPosition(playbackContext?.actualDuration);
+    return {
+      trackId: activeTrackId === null ? null : String(activeTrackId),
+      trackMatches: activeTrackId !== null && String(activeTrackId) === String(trackId ?? ""),
+      duration,
+    };
+  } catch (_) {
+    return { trackId: null, trackMatches: false, duration: null };
+  }
+}
+
+function mirrorEngineDurationToTidal(duration, trackId = getCurrentTrackId()) {
+  const seconds = parsePlaybackPosition(duration);
+  const selectedTrackId = String(trackId ?? "");
+  const engineTrackId = String(currentStatusData?.trackId ?? "");
+  if (!selectedTrackId || selectedTrackId !== engineTrackId
+      || seconds === null || seconds <= 0) return false;
+
+  const durationKey = `${selectedTrackId}:${seconds.toFixed(3)}`;
+  const before = readTidalPlaybackDuration(selectedTrackId);
+  if (!before.trackMatches) {
+    lastTidalDurationMirrorDiagnostic = {
+      trackId: selectedTrackId,
+      actualTrackId: before.trackId,
+      expectedSeconds: seconds,
+      actualSeconds: before.duration,
+      dispatchAttempted: false,
+      verified: false,
+      reason: "tidal-track-mismatch-or-unavailable",
+    };
+    return false;
+  }
+  if (before.duration !== null && Math.abs(before.duration - seconds) <= 0.001) {
+    lastMirroredUiDurationKey = durationKey;
+    lastTidalDurationMirrorDiagnostic = {
+      trackId: selectedTrackId,
+      actualTrackId: before.trackId,
+      expectedSeconds: seconds,
+      actualSeconds: before.duration,
+      dispatchAttempted: false,
+      verified: true,
+      reason: "redux-readback-already-matched",
+    };
+    return true;
+  }
+  if (durationKey === lastMirroredUiDurationAttemptKey
+      && getMonotonicNow() - lastMirroredUiDurationAttemptAt < 250) return false;
+
+  lastMirroredUiDurationAttemptKey = durationKey;
+  lastMirroredUiDurationAttemptAt = getMonotonicNow();
+  const dispatched = dispatchTidalAction("playbackControls/SET_DURATION", seconds);
+  const after = readTidalPlaybackDuration(selectedTrackId);
+  const verified = dispatched && after.trackMatches
+    && after.duration !== null && Math.abs(after.duration - seconds) <= 0.001;
+  lastTidalDurationMirrorDiagnostic = {
+    trackId: selectedTrackId,
+    actualTrackId: after.trackId,
+    expectedSeconds: seconds,
+    actualSeconds: after.duration,
+    dispatchAttempted: true,
+    verified,
+    reason: verified ? "redux-readback-matched" : "redux-readback-did-not-match",
+  };
+  if (!verified) return false;
+  lastMirroredUiDurationKey = durationKey;
+  return true;
+}
+
 function recordNativeTimelineDiagnostic(kind, details = {}, now = getMonotonicNow()) {
   const sample = nativeTimelineDiagnosticWindow;
   const at = Number(now);
@@ -2200,6 +2280,72 @@ function recordPausedSelectionUserPlayAuthorization(event) {
   ].map((value) => String(value ?? "").trim().toLowerCase());
   if (!labels.some((value) => /^(play|resume|play button|play-button)$/.test(value))) return false;
   pausedSelectionUserPlayAuthorization = { trackId, expiresAt: Date.now() + 1500 };
+  return true;
+}
+
+function getPlayControlTrackId(control, trackRow) {
+  const candidates = [control, trackRow].filter(Boolean);
+  for (const element of candidates) {
+    for (const attribute of ["data-track-id", "data-media-item-id", "data-item-id"]) {
+      const value = String(element.getAttribute?.(attribute) || "").trim();
+      if (/^\d+$/.test(value)) return value;
+    }
+  }
+  const link = trackRow?.querySelector?.('a[href*="/track/"]');
+  const href = String(link?.getAttribute?.("href") || link?.href || "");
+  return href.match(/\/track\/(\d+)(?:[/?#]|$)/)?.[1] || null;
+}
+
+function recordStalledPlayAuthorization(event) {
+  if (event?.isTrusted !== true || prepareNextSelectionPaused || pausedSelectionPending) return false;
+  const control = event.target?.closest?.("button, [role='button']");
+  if (!control) return false;
+  const labels = [
+    control.getAttribute?.("aria-label"), control.getAttribute?.("title"),
+    control.getAttribute?.("data-testid"), control.getAttribute?.("data-test-id"),
+    control.title, control.textContent,
+  ].map((value) => String(value ?? "").trim().toLowerCase());
+  if (!labels.some((value) => /^(play|resume|play button|play-button)$/.test(value))) return false;
+
+  const trackRow = control.closest?.(
+    "tr, [role='row'], [data-test*='track-row'], [data-testid*='track-row'], [class*='trackRow']",
+  ) || null;
+  const selectedTrackId = String(getQueuedTrackId() ?? getCurrentTrackId() ?? "");
+  stalledPlayAuthorization = {
+    trackId: getPlayControlTrackId(control, trackRow),
+    allowSelectionChange: Boolean(trackRow),
+    priorTrackId: selectedTrackId,
+    rowText: String(trackRow?.innerText || trackRow?.textContent || "")
+      .replace(/\s+/g, " ").trim().toLowerCase(),
+    expiresAt: Date.now() + 2000,
+  };
+  tracePlaybackEvent("stalled-play-gesture-captured", {
+    rowControl: Boolean(trackRow),
+    trackBound: Boolean(stalledPlayAuthorization.trackId),
+  });
+  return true;
+}
+
+function hasStalledPlayAuthorization(trackId, now = Date.now(), trackMeta = null) {
+  const authorization = stalledPlayAuthorization;
+  if (!authorization) return false;
+  if (now > authorization.expiresAt) {
+    stalledPlayAuthorization = null;
+    return false;
+  }
+  const key = String(trackId ?? "");
+  if (authorization.trackId) return authorization.trackId === key;
+  if (!authorization.allowSelectionChange) return authorization.priorTrackId === key;
+  if (authorization.priorTrackId === key) return true;
+  const title = String(trackMeta?.title || "").trim().toLowerCase();
+  const artist = String(trackMeta?.artist || "").trim().toLowerCase();
+  return Boolean(title && artist && authorization.rowText.includes(title)
+    && authorization.rowText.includes(artist));
+}
+
+function consumeStalledPlayAuthorization(trackId, now = Date.now(), trackMeta = null) {
+  if (!hasStalledPlayAuthorization(trackId, now, trackMeta)) return false;
+  stalledPlayAuthorization = null;
   return true;
 }
 
@@ -2794,6 +2940,9 @@ function applyNativeTimelinePosition(
     recordNativeTimelineDiagnostic("skip", { reason: "invalid-position" }, frameTime);
     return false;
   }
+  const timelineDurationDispatchSucceeded = mirrorEngineDurationToTidal(
+    engineDuration, getCurrentTrackId(),
+  );
   const projection = nativeTimelineProjection;
   const customSliderAriaValueBefore = isTidalDivSlider
     ? parsePlaybackPosition(slider.getAttribute?.("aria-valuenow")) : null;
@@ -2888,6 +3037,8 @@ function applyNativeTimelinePosition(
     timelineActionAvailable,
     timelineDispatchAttempted,
     timelineDispatchSucceeded,
+    timelineDurationDispatchSucceeded,
+    durationMirrorDiagnostic: lastTidalDurationMirrorDiagnostic,
     timelineDispatchOutcome,
     tidalReduxPositionBefore: tidalReduxPosition,
     tidalReduxPositionAfterDispatch,
@@ -3001,6 +3152,10 @@ function reportNativeTimelineProjection(state) {
 
 function clearNativeTimelineProjection() {
   nativeTimelineProjection = null;
+  lastMirroredUiDurationKey = null;
+  lastMirroredUiDurationAttemptKey = null;
+  lastMirroredUiDurationAttemptAt = -Infinity;
+  lastTidalDurationMirrorDiagnostic = null;
   cancelNativeTimelineFrame();
   restoreNativeProgressFillProjection();
 }
@@ -3399,15 +3554,19 @@ function installPlaybackObservers(onPlaybackChange, onSeek) {
   });
   if (typeof document?.addEventListener === "function") {
     const onTrustedPlayClick = (event) => { recordPausedSelectionUserPlayAuthorization(event); };
+  const onTrustedStalledPlayClick = (event) => { recordStalledPlayAuthorization(event); };
     const onTrustedPlayKeydown = (event) => {
       if (event?.key === "Enter" || event?.key === " " || event?.code === "Space") {
         recordPausedSelectionUserPlayAuthorization(event);
+      recordStalledPlayAuthorization(event);
       }
     };
     document.addEventListener("click", onTrustedPlayClick, true);
+  document.addEventListener("click", onTrustedStalledPlayClick, true);
     document.addEventListener("keydown", onTrustedPlayKeydown, true);
     unloads.add(() => {
       document.removeEventListener("click", onTrustedPlayClick, true);
+    document.removeEventListener("click", onTrustedStalledPlayClick, true);
       document.removeEventListener("keydown", onTrustedPlayKeydown, true);
     });
   }
@@ -3593,6 +3752,7 @@ function installPlaybackObservers(onPlaybackChange, onSeek) {
         tracePlaybackEvent("tidal-control-pause", {
           dispatchStack: new Error("TIDAL PAUSE dispatch").stack || null
         });
+        stalledPlayAuthorization = null;
         setTidalPlaybackIntent(false);
         onPlaybackChange();
         return true;
@@ -3820,6 +3980,32 @@ function getTidalPlaybackSnapshot() {
   };
 }
 
+function isUninterceptedStalledPlayIntent(snapshot) {
+  return String(snapshot?.actual || "").toUpperCase() === "STALLED"
+    && String(snapshot?.desired || "").toUpperCase() === "PLAYING";
+}
+
+function getStalledPlayRecoveryMode(snapshot, engineTrackId, {
+  pausedPreparationArmed = false,
+  pausedSelectionPending = false,
+  pausedSelectionConfirmed = false,
+  pausedSelectionDiagnosticsReady = false,
+  explicitPlayAuthorized = false,
+} = {}) {
+  const selectedTrackId = Number(snapshot?.trackId);
+  if (!isUninterceptedStalledPlayIntent(snapshot)
+      || !Number.isSafeInteger(selectedTrackId)
+      || selectedTrackId <= 0
+      || selectedTrackId === Number(engineTrackId)
+      || pausedSelectionPending) return null;
+  if (pausedPreparationArmed) return "prepare-paused";
+  if (pausedSelectionConfirmed
+      && (!pausedSelectionDiagnosticsReady || !explicitPlayAuthorized)) {
+    return "block-confirmed-selection";
+  }
+  return explicitPlayAuthorized ? "start-play" : null;
+}
+
 function getCurrentTrackMeta() {
   let title = "";
   let artist = "";
@@ -4005,7 +4191,8 @@ async function triggerEnginePlay(trackId, timePos = 0, meta = {}, options = {}) 
           || shouldPreserveExplicitPlayIntent(
             currentStatusData, key, currentStatusData?.trackId, desiredPlaybackIntent
           ));
-      if (sameSelectedTrack && (latestTidal.playing === true || explicitPlayStillPending)) {
+      if (!allowPaused && sameSelectedTrack
+          && (latestTidal.playing === true || explicitPlayStillPending)) {
         const resumed = await sendEngineCommand("resume", {
           trackId: Number(key),
           playbackGeneration: data.generation,
@@ -4037,10 +4224,12 @@ async function triggerEnginePlay(trackId, timePos = 0, meta = {}, options = {}) 
         enginePlayRequestId = null;
         enginePlayRequestTrackId = null;
         enginePlayAllowPaused = false;
-      } else if (sameSelectedTrack && latestTidal.playing === false && allowPaused) {
+      } else if (sameSelectedTrack && allowPaused) {
         // A deliberate paused selection is prepared for diagnostics without
-        // ever resuming libmpv. Keep the service's prepared identity so a later
-        // TIDAL Play can resume this exact stream after fresh state checks.
+        // ever resuming libmpv, even if TIDAL races into PLAYING while the
+        // service resolves. Reassert the paused UI and keep the prepared
+        // identity so a later verified Play can resume this exact stream.
+        setTidalPlaybackIntent(false);
         lastMirroredPlaybackState = "paused";
         enginePlayRequestId = null;
         enginePlayRequestTrackId = null;
@@ -4539,6 +4728,82 @@ function startSyncLoop() {
       const engineTrackId = Number(status.trackId);
       const tidalIsPlaying = Boolean(tidal?.playing && mediaTrackId > 0);
       const enginePlayStartupPending = isEnginePlayStartupPending(mediaTrackId);
+
+      // Album-row playback can leave TIDAL at STALLED/PLAYING without reaching
+      // either the native media.play hook or Redux PLAY interceptor. Recover
+      // only when TIDAL's explicit desired state is PLAYING and the engine is
+      // still on a different track. Unarmed recovery additionally requires a
+      // fresh trusted Play-button gesture; a buffering state alone is not intent.
+      const stalledPlayRecoveryMode = naturalEndHandoff ? null
+        : getStalledPlayRecoveryMode(tidal, engineTrackId, {
+          pausedPreparationArmed: prepareNextSelectionPaused,
+          pausedSelectionPending: Boolean(pausedSelectionPending),
+          pausedSelectionConfirmed: pausedSelectionConfirmedTrackId !== null,
+          pausedSelectionDiagnosticsReady: pausedSelectionConfirmedTrackId !== null
+            && isPausedSelectionDiagnosticsReady(pausedSelectionConfirmedTrackId),
+          explicitPlayAuthorized: hasStalledPlayAuthorization(mediaTrackId, Date.now(), tidal)
+            && (pausedSelectionConfirmedTrackId === null
+              || hasPausedSelectionUserPlayAuthorization(mediaTrackId)),
+        });
+      if (stalledPlayRecoveryMode) {
+        if (stalledPlayRecoveryMode === "prepare-paused") {
+          prepareNextSelectionPaused = false;
+          pausedSelectionPending = {
+            trackId: String(mediaTrackId),
+            expiresAt: Date.now() + 5000,
+            expired: false,
+          };
+          pausedSelectionConfirmedTrackId = null;
+          pausedSelectionUserPlayAuthorization = null;
+          stalledPlayAuthorization = null;
+          pendingExplicitPlayIntent = null;
+          desiredPlaybackIntent = false;
+          tracePlaybackEvent("stalled-play-selection-held-paused", {
+            selectedTrackId: mediaTrackId,
+            engineTrackId,
+          });
+          setTidalPlaybackIntent(false);
+          updatePausedSelectionUi("TIDAL selected the track without delivering its native Play event. Holding it paused while OmniFusion prepares diagnostics.");
+          return;
+        }
+
+        if (stalledPlayRecoveryMode === "block-confirmed-selection") {
+          const confirmedTrackId = pausedSelectionConfirmedTrackId;
+          const queueMatches = String(getQueuedTrackId() ?? "") === confirmedTrackId
+            && confirmedTrackId === String(mediaTrackId);
+          const diagnosticsReady = queueMatches && isPausedSelectionDiagnosticsReady(confirmedTrackId);
+          setTidalPlaybackIntent(false);
+          updatePausedSelectionUi(!queueMatches
+            ? "TIDAL queue changed after selection verification. Playback remains paused until the selected track is verified again."
+            : diagnosticsReady
+              ? "Stream diagnostics are ready. Use TIDAL's Play control to start this track."
+              : "The selected stream diagnostics are still loading. Playback remains paused.");
+          return;
+        }
+
+        const stalledTrackKey = String(mediaTrackId);
+        const now = Date.now();
+        if (!consumeStalledPlayAuthorization(stalledTrackKey, now, tidal)) return;
+        pausedSelectionConfirmedTrackId = null;
+        pausedSelectionUserPlayAuthorization = null;
+        desiredPlaybackIntent = true;
+        playIntentChangedAt = now;
+        pendingExplicitPlayIntent = { trackId: stalledTrackKey, startedAt: now };
+        tracePlaybackEvent("stalled-play-intent-recovered", {
+          selectedTrackId: mediaTrackId,
+          engineTrackId,
+        });
+        if ((!enginePlayPending || enginePlayPendingTrackId !== stalledTrackKey)
+            && (lastPlayAttempt.trackId !== stalledTrackKey
+              || now - lastPlayAttempt.at > 5000)) {
+          lastPlayAttempt = { trackId: stalledTrackKey, at: now };
+          void triggerEnginePlay(mediaTrackId, tidal.position, {
+            title: tidal.title,
+            artist: tidal.artist,
+          });
+        }
+        return;
+      }
       if (holdSyncForPausedSelection(mediaTrackId, statusObservedAt)) {
         // This path intentionally skips transport reconciliation, but the
         // diagnostics-first state must still refresh the footer and overlay.

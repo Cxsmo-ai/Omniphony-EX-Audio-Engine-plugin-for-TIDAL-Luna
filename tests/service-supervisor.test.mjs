@@ -38,7 +38,6 @@ function makeHarness({ healthResponses, mpvDir, studioExe, createRuntimeFiles = 
       path.join(paths.mpvDir, "mpv.exe"),
       path.join(paths.mpvDir, "orender.dll"),
       paths.studioExe,
-      path.join(path.dirname(paths.studioExe), "orender.exe"),
     ]) touch(file);
   }
   for (const file of [
@@ -154,6 +153,11 @@ function makeHarness({ healthResponses, mpvDir, studioExe, createRuntimeFiles = 
       JSON.parse(fs.readFileSync(path.join(harness.health.dataRoot, "config", "runtime-paths.json"), "utf8")),
       harness.paths,
       "the selected paths remain persisted in plugin user data",
+    );
+    assert.equal(
+      fs.existsSync(path.join(path.dirname(harness.paths.studioExe), "orender.exe")),
+      false,
+      "the in-process orender.dll route does not require a separate renderer executable",
     );
   } finally {
     harness.cleanup();
