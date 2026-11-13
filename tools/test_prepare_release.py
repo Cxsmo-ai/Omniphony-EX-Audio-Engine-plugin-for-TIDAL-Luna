@@ -21,7 +21,7 @@ class PrepareReleaseTests(unittest.TestCase):
             )
             (dist / "Omniphony EX Audio Engine.mjs").write_text("module", encoding="utf-8")
             (dist / "Omniphony EX Audio Engine.json").write_text(
-                json.dumps({"name": "Omniphony EX Audio Engine", "version": "2.1.41", "hash": "x"}),
+                json.dumps({"name": "Omniphony EX Audio Engine", "version": "2.1.42", "hash": "x"}),
                 encoding="utf-8",
             )
             (dist / "OmniphonyEX-API-win-x64.tar.gz").write_bytes(b"verified-runtime")

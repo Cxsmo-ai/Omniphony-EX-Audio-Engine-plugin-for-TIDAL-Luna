@@ -525,7 +525,10 @@ vm.runInContext(`
 `, readinessSandbox);
 const unverifiedUiReadiness = await readinessSandbox.checkPlaybackReadiness();
 assert.equal(unverifiedUiReadiness.ready, false, "unverified addon controls block playback before service checks");
-assert.match(unverifiedUiReadiness.reason, /2\.1\.27 is required/);
+assert.match(
+  unverifiedUiReadiness.reason,
+  new RegExp(`${requiredServiceVersion.replaceAll(".", "\\.")} is required`),
+);
 readinessSandbox.settingsUiVerified = true;
 readinessSandbox.nativePlayerCommandHookInstalled = false;
 const missingNativeGuardReadiness = await readinessSandbox.checkPlaybackReadiness();

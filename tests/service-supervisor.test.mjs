@@ -8,10 +8,16 @@ import vm from "node:vm";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const moduleSource = fs.readFileSync(path.join(root, "..", "omniphony.mjs"), "utf8");
+const legacyBootstrapSource = fs.readFileSync(path.join(root, "..", "index.js"), "utf8");
 const supervisorCode = moduleSource.match(
   /const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String\.raw`([\s\S]*?)`;/,
 )?.[1];
 assert.ok(supervisorCode, "the native service supervisor is embedded in the plugin entrypoint");
+assert.doesNotMatch(
+  legacyBootstrapSource,
+  /path\.join\(path\.dirname\(studioExe\),\s*['"]orender\.exe['"]\)/,
+  "in-process orender.dll playback must not require the standalone renderer executable",
+);
 
 function touch(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -120,7 +126,7 @@ function makeHarness({ healthResponses, mpvDir, studioExe, createRuntimeFiles = 
   vm.runInContext(supervisorCode, sandbox, { filename: "service-supervisor.native.js" });
   const health = {
     status: "ok",
-    version: "2.1.27",
+    version: "2.1.28",
     pluginRoot,
     dataRoot,
     mpvDirectory: paths.mpvDir,
@@ -135,7 +141,7 @@ function makeHarness({ healthResponses, mpvDir, studioExe, createRuntimeFiles = 
     requests,
     spawned,
     cleanup: () => fs.rmSync(userData, { recursive: true, force: true }),
-    ensure: () => module.exports.ensureService("2.1.27", {}),
+    ensure: () => module.exports.ensureService("2.1.28", {}),
   };
 }
 

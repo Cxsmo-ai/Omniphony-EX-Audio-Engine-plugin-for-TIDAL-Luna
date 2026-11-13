@@ -62,7 +62,9 @@ STUDIO_EXE = configured_path(
     PLUGIN_DIR / "external" / "omniphony-studio-egui.exe",
 )
 RENDERER_EXE = STUDIO_EXE.parent / "orender.exe"
-ORENDER_PIPE = r"\\.\pipe\orender.input"
+# Studio must register with the in-process mpv/orender OSC listener. Launching
+# it with no target can make Studio connect to its own saved listener instead.
+STUDIO_REGISTER_TARGET = "127.0.0.1:9000"
 # This portable MPV build is compiled against the bundled Omniphony ABI.
 # Do not let its runtime loader select the older Studio-wide copy first.
 ORENDER_DLL = MPV_DIR / "orender.dll"
@@ -87,7 +89,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.27"
+SERVICE_VERSION = "2.1.28"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 EOF_REWIND_TIMEOUT_SECONDS = 3.0
 
@@ -842,6 +844,7 @@ def omniphony_route_is_ready(
     orender_module_loaded: bool,
     studio_renderer_connected: bool,
     binaural_output_configured: bool,
+    standalone_renderer_absent: bool = True,
 ) -> bool:
     """Require the embedded orender decoder and a live Studio↔MPV route.
 
@@ -855,6 +858,7 @@ def omniphony_route_is_ready(
         and orender_module_loaded
         and studio_renderer_connected
         and binaural_output_configured
+        and standalone_renderer_absent
     )
 
 
@@ -1021,15 +1025,18 @@ def _route_process_candidates() -> list[dict]:
             if name.casefold() != STUDIO_EXE.name.casefold():
                 info["cmdline"] = process.cmdline()
             candidates.append(info)
-        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+        except psutil.NoSuchProcess:
             # The standalone renderer is optional: JOC uses libmpv's in-process
             # orender.dll and Studio's direct MPV connection. It may exit after
             # Toolhelp snapshots its PID, so its missing metadata cannot erase
             # otherwise valid Studio/MPV candidates or invalidate that route.
-            # Studio and MPV identity remain fail-closed because either can
-            # change which renderer actually owns playback.
             if name.casefold() == RENDERER_EXE.name.casefold():
                 continue
+            raise
+        except (psutil.AccessDenied, OSError):
+            # A discovered renderer whose executable cannot be inspected is
+            # not proven absent. Fail closed rather than trusting an unknown
+            # process to be harmless.
             raise
     return candidates
 
@@ -1053,16 +1060,6 @@ def get_omniphony_route_status(mpv_pid: int | None = None) -> dict:
         elif exe == os.path.normcase(os.path.realpath(str(MPV_EXE))) and is_omnifusion_mpv_process(info):
             if mpv_pid is None or info.get("pid") == mpv_pid:
                 mpvs.append(info)
-
-    renderer_cmdline = [
-        str(arg).casefold().replace("/", "\\")
-        for item in renderers for arg in (item.get("cmdline") or [])
-    ]
-    renderer_pipe_configured = (
-        len(renderers) == 1
-        and "render" in renderer_cmdline
-        and ORENDER_PIPE.casefold() in renderer_cmdline
-    )
 
     orender_module_loaded = False
     if len(mpvs) == 1:
@@ -1104,23 +1101,23 @@ def get_omniphony_route_status(mpv_pid: int | None = None) -> dict:
 
     checks = {
         "studio": len(studios) == 1,
-        "renderer": len(renderers) == 1,
         "mpv": len(mpvs) == 1,
-        "rendererPipeConfigured": renderer_pipe_configured,
+        "embeddedRenderer": orender_module_loaded,
         "orenderModuleLoaded": orender_module_loaded,
         "studioRendererConnected": studio_renderer_connected,
         "processIdentity": process_identity_valid,
         "headphoneBinauralConfigured": studio_binaural_output_is_configured(),
+        "standaloneRendererAbsent": len(renderers) == 0,
     }
     ready = omniphony_route_is_ready(
         len(studios), len(mpvs), orender_module_loaded, studio_renderer_connected,
-        checks["headphoneBinauralConfigured"],
+        checks["headphoneBinauralConfigured"], checks["standaloneRendererAbsent"],
     ) and process_identity_valid
     return {
         "ready": ready,
         "checks": checks,
         "studioPid": studios[0]["pid"] if len(studios) == 1 else None,
-        "rendererPid": renderers[0]["pid"] if len(renderers) == 1 else None,
+        "standaloneRendererPid": renderers[0]["pid"] if len(renderers) == 1 else None,
         "mpvPid": mpvs[0]["pid"] if len(mpvs) == 1 else None,
     }
 
@@ -1876,7 +1873,8 @@ class HeadlessAudioEngine:
                 if not self.studio_proc or self.studio_proc.poll() is not None:
                     try:
                         self.studio_proc = subprocess.Popen(
-                            [str(STUDIO_EXE)], cwd=str(STUDIO_EXE.parent),
+                            [str(STUDIO_EXE), "--register", STUDIO_REGISTER_TARGET],
+                            cwd=str(STUDIO_EXE.parent),
                         )
                     except OSError:
                         self.studio_proc = None
@@ -1928,7 +1926,8 @@ class HeadlessAudioEngine:
                                 if not self.studio_proc or self.studio_proc.poll() is not None:
                                     try:
                                         self.studio_proc = subprocess.Popen(
-                                            [str(STUDIO_EXE)], cwd=str(STUDIO_EXE.parent),
+                                            [str(STUDIO_EXE), "--register", STUDIO_REGISTER_TARGET],
+                                            cwd=str(STUDIO_EXE.parent),
                                         )
                                     except OSError:
                                         self.studio_proc = None

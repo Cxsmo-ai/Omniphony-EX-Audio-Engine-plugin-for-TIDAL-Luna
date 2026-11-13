@@ -9,6 +9,33 @@ import omnifusion_service as service
 
 
 class ServiceLifecycleTests(unittest.TestCase):
+    def test_renderer_that_exits_after_snapshot_is_ignored(self):
+        renderer_name = service.RENDERER_EXE.name
+        with patch.object(service, "_windows_process_snapshot", return_value=[(4567, renderer_name)]), \
+                patch.object(
+                    service.psutil, "Process",
+                    side_effect=service.psutil.NoSuchProcess(pid=4567),
+                ):
+            self.assertEqual(service._route_process_candidates(), [])
+
+    def test_inaccessible_snapshotted_renderer_fails_route_inspection_closed(self):
+        renderer_name = service.RENDERER_EXE.name
+        with patch.object(service, "_windows_process_snapshot", return_value=[(4567, renderer_name)]), \
+                patch.object(
+                    service.psutil, "Process",
+                    side_effect=service.psutil.AccessDenied(pid=4567),
+                ):
+            with self.assertRaises(service.psutil.AccessDenied):
+                service._route_process_candidates()
+
+    def test_route_requires_embedded_renderer_and_rejects_standalone_renderer(self):
+        self.assertTrue(service.omniphony_route_is_ready(
+            1, 1, True, True, True, standalone_renderer_absent=True,
+        ))
+        self.assertFalse(service.omniphony_route_is_ready(
+            1, 1, True, True, True, standalone_renderer_absent=False,
+        ))
+
     def test_joc_route_start_tracks_and_closes_only_its_owned_studio(self):
         engine = service.HeadlessAudioEngine()
         with TemporaryDirectory() as temp:
@@ -27,7 +54,10 @@ class ServiceLifecycleTests(unittest.TestCase):
 
             self.assertTrue(route["ready"])
             self.assertEqual(engine.studio_proc, process)
-            launch.assert_called_once_with([str(studio_exe)], cwd=str(studio_exe.parent))
+            launch.assert_called_once_with(
+                [str(studio_exe), "--register", service.STUDIO_REGISTER_TARGET],
+                cwd=str(studio_exe.parent),
+            )
             self.assertEqual(route_probe.call_count, 2)
             self.assertTrue(engine.stop_owned_omniphony_studio())
 
@@ -128,7 +158,10 @@ class ServiceLifecycleTests(unittest.TestCase):
                 self.assertEqual(errors, [])
                 self.assertTrue(results["stopped"])
                 self.assertTrue(results["route"]["ready"])
-                launch.assert_called_once_with([str(studio_exe)], cwd=str(studio_exe.parent))
+                launch.assert_called_once_with(
+                    [str(studio_exe), "--register", service.STUDIO_REGISTER_TARGET],
+                    cwd=str(studio_exe.parent),
+                )
 
         self.assertEqual(engine.studio_proc, new_process)
 

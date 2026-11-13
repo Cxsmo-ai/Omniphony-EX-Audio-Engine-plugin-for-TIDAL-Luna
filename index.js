@@ -35,7 +35,6 @@ async function ensureLocalServiceRunning() {
     path.join(mpvDir, 'mpv.exe'),
     path.join(mpvDir, 'orender.dll'),
     studioExe,
-    path.join(path.dirname(studioExe), 'orender.exe'),
   ].filter((file) => !fs.existsSync(file));
   if (missingRuntimeFiles.length) {
     console.error('[Omniphony EX] Runtime paths are incomplete:', missingRuntimeFiles);
@@ -52,7 +51,7 @@ async function ensureLocalServiceRunning() {
     }
   };
   const healthMatches = (health) => health?.status === 'ok'
-    && health.version === '2.1.27'
+    && health.version === '2.1.28'
     && samePath(health.pluginRoot, pluginRoot)
     && samePath(health.dataRoot, dataRoot)
     && samePath(health.mpvDirectory, mpvDir)
