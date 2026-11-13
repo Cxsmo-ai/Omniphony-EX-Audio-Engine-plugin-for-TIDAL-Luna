@@ -19,6 +19,15 @@ const API_BASE = "http://127.0.0.1:8765";
 const REQUIRED_SERVICE_VERSION = "2.1.27";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
 const PLUGIN_BUILD = "2.1.39";
+function parseEclipseManifestUrl(value) {
+  const parsed = new URL(String(value ?? "").trim());
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  const localHttp = parsed.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(hostname);
+  if ((parsed.protocol !== "https:" && !localHttp) || !parsed.hostname || parsed.username || parsed.password) {
+    throw new Error("Enter an HTTPS manifest URL (HTTP is allowed only for localhost development).");
+  }
+  return parsed.href;
+}
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -125,7 +134,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
     const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.39/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "97A958363092DA636FD862B4C76366589319B4FA26024C4A74F7C67278074D38";
+    const bundleSha256 = "298B068B21BBECFDFF5F2E75F865530C405EDE3D3C1BA40B2B0C59CE0E6FAE92";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -6044,36 +6053,70 @@ function toggleSettingsPanel() {
   panel.appendChild(searchResultsContainer);
 
   let searchDebounceTimer = null;
+  let searchGeneration = 0;
+  const setSearchMessage = (message, color = "#888") => {
+    const messageElement = document.createElement("div");
+    messageElement.style.cssText = `color:${color};padding:6px;`;
+    messageElement.textContent = String(message ?? "");
+    searchResultsContainer.replaceChildren(messageElement);
+  };
+
+  const createTextBadge = (label, cssText, iconMarkup = "") => {
+    const badge = document.createElement("span");
+    badge.style.cssText = cssText;
+    if (iconMarkup) {
+      const svgDocument = new DOMParser().parseFromString(iconMarkup, "image/svg+xml");
+      if (svgDocument.documentElement?.localName === "svg") {
+        badge.appendChild(document.importNode(svgDocument.documentElement, true));
+      }
+    }
+    const labelElement = document.createElement("span");
+    labelElement.textContent = String(label ?? "");
+    badge.appendChild(labelElement);
+    return badge;
+  };
+
   searchInput.oninput = () => {
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    const generation = ++searchGeneration;
     const q = searchInput.value.trim();
     if (!q) {
       searchResultsContainer.style.display = "none";
-      searchResultsContainer.innerHTML = "";
+      searchResultsContainer.replaceChildren();
       return;
     }
     searchResultsContainer.style.display = "block";
-    searchResultsContainer.innerHTML = "<div style='color:#888;padding:6px;'>Searching across TIDAL & Amazon Music...</div>";
+    setSearchMessage("Searching across TIDAL & Amazon Music...");
 
     searchDebounceTimer = setTimeout(async () => {
       try {
         const sRes = await fetch(`${API_BASE}/search/multi?q=${encodeURIComponent(q)}&limit=10`);
+        if (generation !== searchGeneration || !searchInput.isConnected) return;
         if (!sRes.ok) throw new Error(`Search failed: ${sRes.status}`);
         const data = await sRes.json();
+        if (generation !== searchGeneration || !searchInput.isConnected) return;
         const tracks = data?.tracks || [];
         if (!tracks.length) {
-          searchResultsContainer.innerHTML = "<div style='color:#888;padding:6px;'>No tracks found across providers.</div>";
+          setSearchMessage("No tracks found across providers.");
           return;
         }
 
-        searchResultsContainer.innerHTML = "";
+        searchResultsContainer.replaceChildren();
         tracks.forEach((t) => {
           const row = document.createElement("div");
           row.style.cssText = "display:flex;align-items:center;justify-content:space-between;padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.05);gap:8px;";
 
-          if (t.cover) {
+          const coverUrl = (() => {
+            try {
+              const parsed = new URL(String(t.cover || ""));
+              return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.href : "";
+            } catch (_) {
+              return "";
+            }
+          })();
+          if (coverUrl) {
             const coverEl = document.createElement("img");
-            coverEl.src = t.cover;
+            coverEl.src = coverUrl;
             coverEl.style.cssText = "width:34px;height:34px;border-radius:4px;object-fit:cover;flex-shrink:0;";
             coverEl.onerror = () => { coverEl.style.display = "none"; };
             row.appendChild(coverEl);
@@ -6086,23 +6129,34 @@ function toggleSettingsPanel() {
 
           const tidalLogoSvg = `<svg style='width:11px;height:11px;fill:currentColor;flex-shrink:0;' viewBox='0 0 24 24'><path d='M12.012 3.992L8.008 7.996 4.004 3.992 0 7.996l4.004 4.004L0 16.004l4.004 4.004 4.004-4.004 4.004 4.004 4.004-4.004-4.004-4.004 4.004-4.004-4.004-4.004zm4.004 4.004l4.004-4.004L24 7.996l-3.984 4.004-4.004-4.004z'/></svg>`;
 
-          const sourceBadge = t.source === "AMAZON"
-            ? `<span style='display:inline-flex;align-items:center;background:#ff9900;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;gap:3px;'>${amazonLogoSvg}<span>AMAZON MUSIC</span></span>`
-            : `<span style='display:inline-flex;align-items:center;background:#00d2c4;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;gap:3px;'>${tidalLogoSvg}<span>TIDAL</span></span>`;
+          const titleLine = document.createElement("div");
+          const isAmazon = t.source === "AMAZON";
+          titleLine.appendChild(createTextBadge(
+            isAmazon ? "AMAZON MUSIC" : "TIDAL",
+            `display:inline-flex;align-items:center;background:${isAmazon ? "#ff9900" : "#00d2c4"};color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;gap:3px;`,
+            isAmazon ? amazonLogoSvg : tidalLogoSvg,
+          ));
+          if (t.upgrade && t.upgrade.provider === "AMAZON") {
+            titleLine.appendChild(createTextBadge(
+              "AMZ UPGRADE",
+              "display:inline-flex;align-items:center;background:rgba(255,153,0,0.18);border:1px solid #ff9900;color:#ff9900;font-weight:700;font-size:9px;padding:1px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;gap:3px;",
+              amazonLogoSvg,
+            ));
+          }
+          if (t.exclusive) {
+            titleLine.appendChild(createTextBadge("EXCLUSIVE", "display:inline-flex;align-items:center;background:#7928ca;color:#fff;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;"));
+          }
+          if (t.isAtmos || t.upgrade) {
+            titleLine.appendChild(createTextBadge("ATMOS", "display:inline-flex;align-items:center;background:#31d8ff;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;"));
+          }
+          const title = document.createElement("strong");
+          title.textContent = String(t.title ?? "Unknown title");
+          titleLine.appendChild(title);
 
-          const upgradeBadge = t.upgrade && t.upgrade.provider === "AMAZON"
-            ? `<span style='display:inline-flex;align-items:center;background:rgba(255,153,0,0.18);border:1px solid #ff9900;color:#ff9900;font-weight:700;font-size:9px;padding:1px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;gap:3px;' title='Atmos upgrade available via Amazon Music'>${amazonLogoSvg}<span>AMZ UPGRADE</span></span>`
-            : "";
-
-          const exclusiveBadge = t.exclusive
-            ? "<span style='display:inline-flex;align-items:center;background:#7928ca;color:#fff;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;'>EXCLUSIVE</span>"
-            : "";
-
-          const atmosPill = t.isAtmos || t.upgrade
-            ? "<span style='display:inline-flex;align-items:center;background:#31d8ff;color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;'>ATMOS</span>"
-            : "";
-
-          metaDiv.innerHTML = `<div>${sourceBadge}${upgradeBadge}${exclusiveBadge}${atmosPill}<strong>${t.title}</strong></div><div style='color:#888;font-size:10px;'>${t.artist} · ${t.album}</div>`;
+          const detailsLine = document.createElement("div");
+          detailsLine.style.cssText = "color:#888;font-size:10px;";
+          detailsLine.textContent = `${String(t.artist ?? "Unknown artist")} · ${String(t.album ?? "Unknown album")}`;
+          metaDiv.append(titleLine, detailsLine);
           row.appendChild(metaDiv);
 
           const btnGroup = document.createElement("div");
@@ -6158,7 +6212,9 @@ function toggleSettingsPanel() {
           searchResultsContainer.appendChild(row);
         });
       } catch (err) {
-        searchResultsContainer.innerHTML = `<div style='color:#ff7272;padding:6px;'>Error: ${err.message}</div>`;
+        if (generation === searchGeneration && searchInput.isConnected) {
+          setSearchMessage(`Error: ${err.message}`, "#ff7272");
+        }
       }
     }, 300);
   };
@@ -6238,11 +6294,20 @@ function toggleSettingsPanel() {
   addonStatus.style.cssText = "min-height:16px;color:#aaa;font-size:11px;line-height:1.4;margin:0 0 10px;overflow-wrap:anywhere;";
   addonStatus.innerText = "Default: Amazon Music Eclipse Addon supported (ISRC / title matching).";
   panel.appendChild(addonStatus);
+  const setAddonStatus = (message, color = "#aaa", emphasize = false) => {
+    addonStatus.replaceChildren();
+    const statusText = document.createElement(emphasize ? "strong" : "span");
+    statusText.style.color = color;
+    statusText.textContent = String(message ?? "");
+    addonStatus.appendChild(statusText);
+  };
 
   addAddonBtn.onclick = async () => {
-    const url = addonInput.value.trim();
-    if (!url) {
-      addonStatus.innerText = "Please enter a valid manifest.json URL.";
+    let url;
+    try {
+      url = parseEclipseManifestUrl(addonInput.value);
+    } catch (err) {
+      setAddonStatus(err.message || "Please enter a valid HTTPS manifest URL.", "#ff7272");
       return;
     }
     addonStatus.innerText = "Saving & probing Eclipse addon manifest...";
@@ -6262,9 +6327,9 @@ function toggleSettingsPanel() {
       const r = await fetch(url).catch(() => null);
       if (r && r.ok) {
         const manifest = await r.json();
-        addonStatus.innerHTML = `<span style="color:#00ff88;font-weight:600;">✓ Saved & Loaded ${manifest.name || 'Addon'} v${manifest.version || '1.0'}</span> (${manifest.description || 'Active'})`;
+        setAddonStatus(`✓ Saved & Loaded ${String(manifest.name || "Addon")} v${String(manifest.version || "1.0")} (${String(manifest.description || "Active")})`, "#00ff88", true);
       } else {
-        addonStatus.innerHTML = `<span style="color:#00ff88;font-weight:600;">✓ Saved Eclipse Manifest to RealMAX Engine</span> (${url})`;
+        setAddonStatus(`✓ Saved Eclipse Manifest to RealMAX Engine (${url})`, "#00ff88", true);
       }
     } catch (err) {
       addonStatus.innerText = `Error: ${err.message}`;
@@ -6283,11 +6348,19 @@ function toggleSettingsPanel() {
         return;
       }
       if (data.status === "waiting_for_user" && data.userCode) {
-        authStatus.innerHTML = `Open browser and verify code: <strong style="color:#00d2c4;font-size:13px;">${data.userCode}</strong> (${data.verificationUrl})`;
+        authStatus.replaceChildren(document.createTextNode("Open browser and verify code: "));
+        const code = document.createElement("strong");
+        code.style.cssText = "color:#00d2c4;font-size:13px;";
+        code.textContent = String(data.userCode);
+        authStatus.append(code, document.createTextNode(` (${String(data.verificationUrl || "")})`));
         authBtn.disabled = true;
         authBtn.style.opacity = "0.6";
       } else if (data.status === "success") {
-        authStatus.innerHTML = `<span style="color:#00ff88;font-weight:600;">✓ TIDAL Account Linked Successfully!</span>`;
+        authStatus.replaceChildren();
+        const success = document.createElement("strong");
+        success.style.cssText = "color:#00ff88;font-weight:600;";
+        success.textContent = "✓ TIDAL Account Linked Successfully!";
+        authStatus.appendChild(success);
         authBtn.disabled = false;
         authBtn.style.opacity = "1";
         if (authPollTimer) {
@@ -6350,7 +6423,7 @@ function toggleSettingsPanel() {
       if (Array.isArray(loaded?.eclipse_addons) && loaded.eclipse_addons.length > 0) {
         if (addonInput && !addonInput.value) addonInput.value = loaded.eclipse_addons[0];
         if (addonStatus) {
-          addonStatus.innerHTML = `<span style="color:#00ff88;font-weight:600;">✓ Active Eclipse Manifest:</span> ${loaded.eclipse_addons[0]}`;
+          setAddonStatus(`✓ Active Eclipse Manifest: ${String(loaded.eclipse_addons[0])}`, "#00ff88", true);
         }
       }
       prioritySelect.value = loaded.priority.join(",");

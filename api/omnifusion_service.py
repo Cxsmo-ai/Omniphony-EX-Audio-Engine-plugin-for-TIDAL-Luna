@@ -178,6 +178,32 @@ SEEK_SETTLE_STABILITY_SECONDS = 0.30
 USER_SEEK_MODE = "absolute"
 
 
+def validate_eclipse_addon_urls(value) -> list[str]:
+    """Validate configured Eclipse manifests before persisting or fetching them."""
+    if not isinstance(value, list) or len(value) > 16:
+        raise ValueError("eclipse_addons must be a list containing at most 16 URLs")
+    validated = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("each Eclipse manifest URL must be a string")
+        candidate = item.strip()
+        if not candidate or len(candidate) > 2048 or any(ord(char) < 0x20 for char in candidate):
+            raise ValueError("Eclipse manifest URLs must be non-empty and at most 2048 characters")
+        try:
+            parsed = urllib.parse.urlsplit(candidate)
+            hostname = (parsed.hostname or "").strip("[]").lower()
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError("Eclipse manifest URL is malformed") from exc
+        local_http = parsed.scheme.lower() == "http" and hostname in {"localhost", "127.0.0.1", "::1"}
+        if (parsed.scheme.lower() != "https" and not local_http) or not hostname:
+            raise ValueError("Eclipse manifests must use HTTPS (HTTP is allowed only for localhost development)")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("Eclipse manifest URLs must not contain embedded credentials")
+        validated.append(candidate)
+    return validated
+
+
 def validate_play_request_id(value) -> str:
     if not isinstance(value, str) or len(value) != 36:
         raise ValueError("requestId must be a UUID")
@@ -2102,6 +2128,13 @@ def load_settings() -> dict:
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     settings = {**DEFAULT_SETTINGS, **json.load(f)}
+                    try:
+                        settings["eclipse_addons"] = validate_eclipse_addon_urls(
+                            settings.get("eclipse_addons", [])
+                        )
+                    except ValueError as exc:
+                        print(f"[-] Ignoring invalid configured Eclipse manifests: {exc}")
+                        settings["eclipse_addons"] = []
                     priority = settings.get("priority")
                     if (not isinstance(priority, list)
                             or len(priority) != len(SUPPORTED_FORMAT_PRIORITY)
@@ -6182,8 +6215,11 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                         "supported": list(SUPPORTED_FORMAT_PRIORITY),
                     }, status=400)
                 updates["priority"] = priority
-            if "eclipse_addons" in body and isinstance(body["eclipse_addons"], list):
-                updates["eclipse_addons"] = body["eclipse_addons"]
+            if "eclipse_addons" in body:
+                try:
+                    updates["eclipse_addons"] = validate_eclipse_addon_urls(body["eclipse_addons"])
+                except ValueError as exc:
+                    return self.send_json({"error": str(exc)}, status=400)
             if "realmax_source" in body and body["realmax_source"] in ("auto", "tidal_only", "amazon_only"):
                 updates["realmax_source"] = body["realmax_source"]
             try:

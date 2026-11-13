@@ -9,6 +9,44 @@ import omnifusion_service as service
 
 
 class ServiceLifecycleTests(unittest.TestCase):
+    def test_eclipse_manifest_urls_allow_https_and_local_development_only(self):
+        self.assertEqual(
+            service.validate_eclipse_addon_urls([
+                " https://example.com/manifest.json ",
+                "http://localhost:3000/manifest.json",
+                "http://127.0.0.1:3000/manifest.json",
+                "http://[::1]:3000/manifest.json",
+            ]),
+            [
+                "https://example.com/manifest.json",
+                "http://localhost:3000/manifest.json",
+                "http://127.0.0.1:3000/manifest.json",
+                "http://[::1]:3000/manifest.json",
+            ],
+        )
+
+    def test_eclipse_manifest_urls_reject_unsafe_schemes_and_credentials(self):
+        for value in (["javascript:alert(1)"], ["http://example.com/manifest.json"],
+                      ["https://user:pass@example.com/manifest.json"], ["https://example.com/" + "a" * 2050]):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                service.validate_eclipse_addon_urls(value)
+
+    def test_eclipse_manifest_urls_require_a_list_of_strings(self):
+        for value in ("https://example.com/manifest.json", [None], ["https://example.com/" for _ in range(17)]):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                service.validate_eclipse_addon_urls(value)
+
+    def test_invalid_saved_eclipse_manifests_are_ignored(self):
+        with TemporaryDirectory() as temp:
+            settings_file = Path(temp) / "settings.json"
+            settings_file.write_text(
+                json.dumps({"eclipse_addons": ["javascript:alert(1)"]}),
+                encoding="utf-8",
+            )
+            with patch.object(service, "SETTINGS_FILE", settings_file):
+                settings = service.load_settings()
+        self.assertEqual(settings["eclipse_addons"], [])
+
     def test_audio_device_default_is_portable_and_saved_device_is_preserved(self):
         self.assertEqual(service.DEFAULT_SETTINGS["audio_device"], "auto")
         with TemporaryDirectory() as temp:
