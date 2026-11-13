@@ -71,6 +71,28 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertTrue(completed.is_set())
 
+    def test_unexpected_post_handler_error_returns_json_instead_of_dropping_connection(self):
+        class FakeRequest:
+            path = "/seek?diagnostic=ignored"
+            close_connection = False
+
+            def _do_POST(self):
+                raise RuntimeError("do not expose this exception message")
+
+            def send_json(self, payload, status=200):
+                self.response = (payload, status)
+
+        request = FakeRequest()
+        with patch("builtins.print") as log:
+            service.RequestHandler.do_POST(request)
+
+        self.assertEqual(request.response, ({
+            "error": "request failed unexpectedly",
+            "code": "INTERNAL_ERROR",
+            "errorType": "RuntimeError",
+        }, 500))
+        log.assert_called_once_with("[-] POST /seek handler failed unexpectedly (RuntimeError)")
+
     def test_root_launcher_checks_health_before_rebasing_config(self):
         root = Path(service.__file__).resolve().parent.parent
         launcher = root / "launch_service.bat"

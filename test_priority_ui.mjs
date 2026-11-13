@@ -10,9 +10,14 @@ const sourcePath = resolve(dirname(fileURLToPath(import.meta.url)), "omniphony.m
 const source = readFileSync(sourcePath, "utf8");
 const manifestPath = resolve(dirname(sourcePath), "omniphony.json");
 const pluginManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+const lunaManifest = JSON.parse(readFileSync(resolve(dirname(sourcePath), "manifest.json"), "utf8"));
 const sourceHash = createHash("sha256").update(readFileSync(sourcePath)).digest("hex").toUpperCase();
 assert.equal(pluginManifest.hash, sourceHash,
   "plugin manifest hash matches the exact module bytes TidaLuna will verify");
+assert.equal(lunaManifest.hash, sourceHash,
+  "Luna store manifest hash matches the exact served module bytes");
+assert.equal(lunaManifest.version, pluginManifest.version,
+  "Luna store manifest version matches the plugin manifest version");
 const requiredServiceVersion = source.match(/^const REQUIRED_SERVICE_VERSION = "([^"]+)";$/m)?.[1];
 assert.ok(requiredServiceVersion, "runtime declares a required service version");
 assert.ok(pluginManifest.main.includes(requiredServiceVersion),
@@ -21,6 +26,13 @@ assert.ok(pluginManifest.main.includes(pluginManifest.version),
   "module cache key identifies the plugin package version");
 assert.match(source, new RegExp(`const PLUGIN_BUILD = "${pluginManifest.version}";`),
   "runtime diagnostics report the same build version as the served manifest");
+const naturalEndHandoffDispatch = source.match(
+  /tracePlaybackEvent\("natural-end-handoff-play-request"[\s\S]*?void triggerEnginePlay\(mediaTrackId,\s*([^,]+),/
+);
+assert.ok(naturalEndHandoffDispatch,
+  "natural-end queue handoff dispatches the newly selected track");
+assert.equal(naturalEndHandoffDispatch[1].trim(), "0",
+  "natural-end handoff starts the next track at zero instead of reusing the completed track position");
 const downloadSettingsFunction = source.match(/function getDownloadSettings\(\) \{[\s\S]*?\n\}/)?.[0];
 assert.ok(downloadSettingsFunction, "downloader settings are defined");
 const downloadSettings = vm.runInNewContext(`${downloadSettingsFunction}; getDownloadSettings();`, {
@@ -29,6 +41,27 @@ const downloadSettings = vm.runInNewContext(`${downloadSettingsFunction}; getDow
 });
 assert.equal(downloadSettings.destinationFolder, "C:\\OmniFusion-Standalone\\downloads",
   "saved Windows download directory retains its path separators");
+assert.doesNotMatch(source, /currentPlaybackMeta/,
+  "the current-track downloader does not reference an undeclared metadata variable");
+assert.match(source, /const meta = getCurrentDownloadTrackMeta\(\);/,
+  "the current-track downloader derives its request from TIDAL's live playback state");
+const downloadMetadataSandbox = {
+  getCurrentTrackId: () => 97874146,
+  getCurrentTrackMeta: () => ({ title: "Machine", artist: "Imagine Dragons" }),
+  getTidalPlayState: () => ({ playbackControls: { mediaProduct: {
+    title: "Machine", artist: { name: "Imagine Dragons" }, album: { name: "Origins" }, trackNumber: 3,
+  } } }),
+  window: { neptune: { store: { getState: () => ({}) } } },
+};
+const downloadMetadata = vm.runInNewContext(
+  `${extractFunction("getCurrentDownloadTrackMeta")}; getCurrentDownloadTrackMeta();`,
+  downloadMetadataSandbox,
+);
+assert.equal(downloadMetadata.id, 97874146, "downloader uses the currently selected TIDAL track id");
+assert.equal(downloadMetadata.title, "Machine");
+assert.equal(downloadMetadata.artist.name, "Imagine Dragons");
+assert.equal(downloadMetadata.album.name, "Origins");
+assert.equal(downloadMetadata.trackNumber, 3);
 const lyricsObserverDeclaration = source.indexOf("const radiantLyricsFetchObserver = {");
 const pluginLoadCall = source.lastIndexOf("onLoad();");
 assert.ok(lyricsObserverDeclaration !== -1 && pluginLoadCall > lyricsObserverDeclaration,

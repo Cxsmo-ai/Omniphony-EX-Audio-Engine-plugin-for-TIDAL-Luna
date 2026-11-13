@@ -18,7 +18,7 @@
 const API_BASE = "http://127.0.0.1:8765";
 const REQUIRED_SERVICE_VERSION = "2.1.27";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.39";
+const PLUGIN_BUILD = "2.1.40";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -130,11 +130,11 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.39");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.40");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.39/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "298B068B21BBECFDFF5F2E75F865530C405EDE3D3C1BA40B2B0C59CE0E6FAE92";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.40/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "7B377F3041C9E4AAA525767F53680FAEC709D53E40B6D5817C9F488A9CD22C89";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -197,7 +197,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.39"
+        return marker.pluginVersion === "2.1.40"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -266,7 +266,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.39", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.40", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -3844,6 +3844,37 @@ function getCurrentTrackMeta() {
   return { title, artist };
 }
 
+function getCurrentDownloadTrackMeta() {
+  const trackId = getCurrentTrackId();
+  if (trackId === null || trackId === undefined || String(trackId).trim() === "") return null;
+
+  let current = null;
+  try {
+    const playState = getTidalPlayState();
+    const state = window.neptune?.store?.getState?.();
+    current = playState?.playbackControls?.mediaProduct
+      || state?.playbackControls?.mediaProduct
+      || state?.playback?.currentTrack
+      || null;
+  } catch (_) {}
+
+  const fallback = getCurrentTrackMeta();
+  return {
+    id: trackId,
+    title: current?.title || current?.name || fallback.title,
+    artist: current?.artist || current?.artists?.[0] || fallback.artist,
+    album: current?.album || current?.albumTitle || "",
+    albumArtist: current?.albumArtist || current?.album?.artist?.name || "",
+    year: current?.year || current?.releaseDate || "",
+    trackNumber: current?.trackNumber || current?.track_number || "",
+    discNumber: current?.discNumber || current?.disc_number || current?.volumeNumber || "",
+    isrc: current?.isrc || "",
+    artworkURL: current?.artworkURL || current?.cover || "",
+    lyrics: current?.lyrics || "",
+    syncedLyrics: current?.syncedLyrics || current?.subtitles || ""
+  };
+}
+
 async function triggerEnginePlay(trackId, timePos = 0, meta = {}, options = {}) {
   const key = String(trackId);
   const allowPaused = options.allowPaused === true;
@@ -4604,7 +4635,11 @@ function startSyncLoop() {
                 targetTrackId: mediaTrackId,
                 tidalIsPlaying,
               });
-              void triggerEnginePlay(mediaTrackId, tidal.position, {
+              // The queue has moved to a new track, but TIDAL can still expose
+              // the completed track's terminal position during this handoff.
+              // Always begin the newly selected stream at zero; a stale offset
+              // makes the service seek the new MPD to the prior track's EOF.
+              void triggerEnginePlay(mediaTrackId, 0, {
                 title: tidal.title,
                 artist: tidal.artist,
               });
@@ -6004,8 +6039,8 @@ function toggleSettingsPanel() {
   dlNowBtn.innerText = "⬇ Download Current Playing Track (RealMAX)";
   dlNowBtn.style.cssText = "width:100%;background:#00d2c4;color:#000;font-weight:700;border:none;border-radius:6px;padding:8px 10px;cursor:pointer;font:inherit;font-size:12px;margin-bottom:6px;";
   dlNowBtn.onclick = async () => {
-    const meta = currentPlaybackMeta;
-    if (!meta || !meta.trackId) {
+    const meta = getCurrentDownloadTrackMeta();
+    if (!meta) {
       alert("No active track is loaded or playing.");
       return;
     }
@@ -6013,7 +6048,7 @@ function toggleSettingsPanel() {
     dlNowBtn.innerText = "Queueing Download...";
     try {
       const q = await queueTrackDownload({
-        id: meta.trackId,
+        ...meta,
         title: meta.title,
         artist: meta.artist,
         album: meta.album,

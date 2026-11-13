@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 import unittest
 from io import BytesIO
@@ -28,6 +29,35 @@ class ProbeResponse:
 
 
 class PlaybackTransportTests(unittest.TestCase):
+    def test_seek_proxy_counters_support_raw_ac4_pcm_without_dash_indexes(self):
+        class RawPcmProxy:
+            def __init__(self):
+                self._counter_lock = threading.Lock()
+                self.segment_requests = 4
+                self.bytes_served = 4096
+
+        self.assertEqual(service.snapshot_seek_proxy_counters(RawPcmProxy()), (4, None))
+
+    def test_seek_proxy_counters_copy_dash_indexes_under_lock(self):
+        class DashProxy:
+            def __init__(self):
+                self._counter_lock = threading.Lock()
+                self.segment_requests = 5
+                self.recent_segment_indices = [1, 2, 3]
+
+        proxy = DashProxy()
+        count, indexes = service.snapshot_seek_proxy_counters(proxy)
+        self.assertEqual((count, indexes), (5, [1, 2, 3]))
+        self.assertIsNot(indexes, proxy.recent_segment_indices)
+
+    def test_ac4_raw_pcm_seek_timeout_scales_with_decode_offset(self):
+        proxy = object.__new__(service.Ac4RawPcmProxy)
+        self.assertEqual(service.seek_settle_timeout_seconds(proxy, 0), 2.0)
+        self.assertAlmostEqual(service.seek_settle_timeout_seconds(proxy, 45.5), 5.64)
+        self.assertAlmostEqual(service.seek_settle_timeout_seconds(proxy, 189.5), 17.16)
+        self.assertEqual(service.seek_settle_timeout_seconds(proxy, 1000), 30.0)
+        self.assertEqual(service.seek_settle_timeout_seconds(object(), 45.5), 2.0)
+
     def test_mp4_transport_selects_mov_demuxer(self):
         calls = []
 

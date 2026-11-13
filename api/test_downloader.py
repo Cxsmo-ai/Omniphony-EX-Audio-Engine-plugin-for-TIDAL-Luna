@@ -11,6 +11,36 @@ from pathlib import Path
 import omnifusion_service as service
 
 class DownloaderTests(unittest.TestCase):
+    def test_joc_export_command_uses_the_live_orender_studio_chain_before_input(self):
+        command = service.build_joc_download_render_command(
+            "http://127.0.0.1:4321/stream.mpd?sig=secret",
+            Path("C:/exports/natural.flac"),
+            "DASH",
+        )
+
+        self.assertEqual(command[0], str(service.MPV_EXE))
+        self.assertLess(command.index("--ad=orender"), command.index("http://127.0.0.1:4321/stream.mpd?sig=secret"))
+        self.assertIn(f"--ad-orender-library={service.ORENDER_DLL}", command)
+        self.assertIn("--ad-orender-bridge-path=" + ";".join(str(path) for path in service.ORENDER_BRIDGE_PATHS), command)
+        self.assertIn("--ad-orender-osc", command)
+        self.assertIn("--audio-channels=stereo", command)
+        self.assertIn("--demuxer=lavf", command)
+        self.assertIn("--demuxer-lavf-format=dash", command)
+        self.assertIn(f"-o={Path('C:/exports/natural.flac')}", command)
+
+    def test_process_error_redacts_signed_urls_and_credentials(self):
+        message = service.safe_process_error(
+            b"failed https://cdn.example/audio.mpd?sig=abc&Policy=xyz",
+            b"token=secret codec unavailable",
+        )
+
+        self.assertNotIn("cdn.example", message)
+        self.assertNotIn("abc", message)
+        self.assertNotIn("xyz", message)
+        self.assertNotIn("secret", message)
+        self.assertIn("<redacted-url>", message)
+        self.assertIn("codec unavailable", message)
+
     def test_sanitize_filename(self):
         self.assertEqual(service.sanitize_filename_component('AC/DC: "Back in Black"'), 'AC_DC_ _Back in Black_')
 

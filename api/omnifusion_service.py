@@ -384,6 +384,25 @@ def mpv_command_succeeded(result: dict | None) -> bool:
     return bool(result) and result.get("error") in (None, "success")
 
 
+def snapshot_seek_proxy_counters(proxy):
+    """Read shared seek counters for DASH and raw-PCM proxy types."""
+    if proxy is None:
+        return None, None
+    counter_lock = getattr(proxy, "_counter_lock", None)
+    if counter_lock is None:
+        request_count = getattr(proxy, "segment_requests", None)
+        recent_indexes = getattr(proxy, "recent_segment_indices", None)
+    else:
+        with counter_lock:
+            request_count = getattr(proxy, "segment_requests", None)
+            recent_indexes = getattr(proxy, "recent_segment_indices", None)
+            if isinstance(recent_indexes, list):
+                recent_indexes = list(recent_indexes)
+    if not isinstance(recent_indexes, list):
+        recent_indexes = None
+    return request_count, recent_indexes
+
+
 def prepare_mpv_audio_device(expected_device: str, command) -> str:
     """Select and verify the configured endpoint before loading a track.
 
@@ -3871,6 +3890,26 @@ class Ac4RawPcmProxy:
                 process.wait(timeout=1)
 
 
+AC4_RAW_PCM_SEEK_TIMEOUT_BASE_SECONDS = 2.0
+AC4_RAW_PCM_SEEK_SECONDS_PER_AUDIO_SECOND = 0.08
+AC4_RAW_PCM_SEEK_TIMEOUT_MAX_SECONDS = 30.0
+
+
+def seek_settle_timeout_seconds(proxy, position: float) -> float:
+    """Allow the raw AC-4 proxy time to re-decode PCM up to the seek offset."""
+    if not isinstance(proxy, Ac4RawPcmProxy):
+        return SEEK_SETTLE_TIMEOUT_SECONDS
+    position = max(0.0, float(position))
+    return min(
+        AC4_RAW_PCM_SEEK_TIMEOUT_MAX_SECONDS,
+        max(
+            SEEK_SETTLE_TIMEOUT_SECONDS,
+            AC4_RAW_PCM_SEEK_TIMEOUT_BASE_SECONDS
+            + position * AC4_RAW_PCM_SEEK_SECONDS_PER_AUDIO_SECOND,
+        ),
+    )
+
+
 _ECLIPSE_AUTH_LOCK = threading.RLock()
 _ECLIPSE_AUTH_CACHE: dict[str, object] = {
     "jwt": None,
@@ -5219,6 +5258,47 @@ def inspect_flac_stream(raw_flac_bytes: bytes) -> dict:
     return {"sampleRate": sample_rate, "channels": channels, "bitsPerSample": bits_per_sample, "totalSamples": total_samples}
 
 
+def build_joc_download_render_command(
+    input_uri: str,
+    output_path: Path,
+    transport: str | None = None,
+) -> list[str]:
+    """Build the export renderer command with the same Omniphony chain as playback."""
+    command = [
+        str(MPV_EXE),
+        "--no-config",
+        "--vid=no",
+        "--vo=null",
+        "--ad=orender",
+        f"--ad-orender-library={ORENDER_DLL}",
+        "--ad-orender-bridge-path=" + ";".join(str(path) for path in ORENDER_BRIDGE_PATHS),
+        "--ad-orender-osc",
+        "--audio-channels=stereo",
+        f"-o={output_path}",
+        "--oac=flac",
+        "--ytdl=no",
+    ]
+    if str(transport or "").strip().upper().replace("-", "_") in {"DASH", "MPEG_DASH", "MPD"}:
+        # Match the live engine's explicit override: these loopback MPD URLs
+        # have no .mpd suffix, so MPV's automatic probe cannot identify them.
+        command.extend(["--demuxer=lavf", "--demuxer-lavf-format=dash"])
+    command.append(input_uri)
+    return command
+
+
+def safe_process_error(stderr: bytes | str, stdout: bytes | str = b"", limit: int = 1600) -> str:
+    """Return useful subprocess diagnostics without leaking signed stream URLs."""
+    def decode(value: bytes | str) -> str:
+        return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value or "")
+
+    text = "\n".join(part for part in (decode(stderr), decode(stdout)) if part.strip())
+    text = re.sub(r"https?://[^\s\"'<>]+", "<redacted-url>", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?i)(token|authorization|signature|sig|key|policy)=([^&\s]+)", r"\1=<redacted>", text)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    text = text.strip()
+    return text[-limit:] if text else "no stderr output"
+
+
 def execute_track_download(job_id: str, payload: dict) -> None:
     track_id = payload.get("trackId")
     title = payload.get("title") or "Unknown Title"
@@ -5428,22 +5508,12 @@ def execute_track_download(job_id: str, payload: dict) -> None:
                 )
                 mpv_input = candidate_proxy.start()
 
-            cmd = [
-                str(MPV_EXE),
-                "--no-config",
-                mpv_input,
-                "--vid=no",
-                "--vo=null",
-                "--ad=orender",
-                "--audio-channels=stereo",
-                f"-o={temp_dest}",
-                "--oac=flac",
-                "--ytdl=no"
-            ]
+            cmd = build_joc_download_render_command(mpv_input, temp_dest, transport)
             try:
                 res = subprocess.run(cmd, capture_output=True, timeout=300)
                 if res.returncode != 0:
-                    raise RuntimeError("mpv binaural FLAC render failed")
+                    detail = safe_process_error(res.stderr, res.stdout)
+                    raise RuntimeError(f"mpv binaural FLAC render failed (exit {res.returncode}): {detail}")
             finally:
                 if candidate_proxy:
                     candidate_proxy.close()
@@ -6168,6 +6238,24 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"error": "not found"}, status=404)
 
     def do_POST(self):
+        try:
+            return self._do_POST()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as exc:
+            route = urllib.parse.urlsplit(getattr(self, "path", "")).path
+            error_type = type(exc).__name__
+            print(f"[-] POST {route} handler failed unexpectedly ({error_type})")
+            try:
+                self.send_json({
+                    "error": "request failed unexpectedly",
+                    "code": "INTERNAL_ERROR",
+                    "errorType": error_type,
+                }, status=500)
+            except OSError:
+                self.close_connection = True
+
+    def _do_POST(self):
         if self.reject_untrusted_origin(require_origin=True):
             return
         parsed = urllib.parse.urlparse(self.path)
@@ -6983,10 +7071,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                                 pre_seek_position_result = engine.cmd(["get_property", "time-pos"])
                                 pre_seek_state_result = engine.cmd(["get_property", "seeking"])
                                 proxy = getattr(engine, "stream_proxy", None)
-                                if proxy is not None:
-                                    with proxy._counter_lock:
-                                        proxy_requests_before = proxy.segment_requests
-                                        proxy_indices_before = list(proxy.recent_segment_indices)
+                                proxy_requests_before, proxy_indices_before = (
+                                    snapshot_seek_proxy_counters(proxy)
+                                )
                                 result = engine.cmd(["seek", pos, USER_SEEK_MODE])
                                 if not mpv_command_succeeded(result):
                                     detail = result.get("error") if result else "no response"
@@ -7002,8 +7089,12 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                                         dispatch_status = 409
             if dispatch_error is not None:
                 return self.send_json({"error": dispatch_error}, status=dispatch_status)
+            seek_timeout = seek_settle_timeout_seconds(
+                getattr(engine, "stream_proxy", None), pos
+            )
             settled, observed_position, settle_error = engine.wait_for_seek_position(
                 pos, seek_sequence, track_id, generation, request_id,
+                timeout=seek_timeout,
                 expected_paused=expected_paused,
                 diagnostic_samples=seek_samples,
             )
@@ -7051,6 +7142,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 seek_diagnostic = {
                     "targetTimePos": pos,
                     "seekMode": USER_SEEK_MODE,
+                    "settleTimeoutSeconds": seek_timeout,
                     "proxyRequestsBefore": proxy_requests_before,
                     "proxyRequestsAfter": None,
                     "settlementError": settle_error,
@@ -7077,10 +7169,13 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 }
                 proxy = getattr(engine, "stream_proxy", None)
                 if proxy is not None:
-                    with proxy._counter_lock:
-                        seek_diagnostic["proxyRequestsAfter"] = proxy.segment_requests
-                        seek_diagnostic["proxyRecentIndexesBefore"] = proxy_indices_before
-                        seek_diagnostic["proxyRecentIndexesAfter"] = list(proxy.recent_segment_indices)
+                    proxy_requests_after, proxy_indices_after = (
+                        snapshot_seek_proxy_counters(proxy)
+                    )
+                    seek_diagnostic["proxyRequestsBefore"] = proxy_requests_before
+                    seek_diagnostic["proxyRequestsAfter"] = proxy_requests_after
+                    seek_diagnostic["proxyRecentIndexesBefore"] = proxy_indices_before
+                    seek_diagnostic["proxyRecentIndexesAfter"] = proxy_indices_after
                 # Retain only the bounded, sanitized native settlement trace
                 # so the local TIDAL status poll can expose why a scrub failed.
                 engine.last_seek_diagnostic = seek_diagnostic
