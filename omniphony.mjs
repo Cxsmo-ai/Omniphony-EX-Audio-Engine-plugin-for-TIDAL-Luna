@@ -16,9 +16,9 @@
  */
 
 const API_BASE = "http://127.0.0.1:8765";
-const REQUIRED_SERVICE_VERSION = "2.1.31";
+const REQUIRED_SERVICE_VERSION = "2.1.32";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.45";
+const PLUGIN_BUILD = "2.1.46";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -121,9 +121,19 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const { spawn, spawnSync } = require("child_process");
     const app = require("electron").app;
     const stateKey = Symbol.for("omniphony-ex.native-service-supervisor");
-    const tidalOwnerPid = Number.isSafeInteger(Number(process.pid)) && Number(process.pid) > 0
-      ? Number(process.pid)
-      : null;
+    const resolveTidalOwnerPid = () => {
+      if (typeof app.getAppMetrics !== "function") return null;
+      try {
+        const metrics = app.getAppMetrics();
+        if (!Array.isArray(metrics)) return null;
+        const browsers = metrics.filter((metric) => metric?.type === "Browser"
+          && Number.isSafeInteger(metric.pid) && metric.pid > 0);
+        return browsers.length === 1 ? browsers[0].pid : null;
+      } catch (_) {
+        return null;
+      }
+    };
+    const tidalOwnerPid = resolveTidalOwnerPid();
     const shared = globalThis[stateKey] ||
       (globalThis[stateKey] = {
         startPromise: null,
@@ -136,15 +146,18 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     if (!app || typeof app.getPath !== "function") {
       return { ready: false, reason: "electron_user_data_unavailable" };
     }
+    if (tidalOwnerPid === null) {
+      return { ready: false, reason: "tidal_owner_pid_unavailable" };
+    }
 
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.45");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.46");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.45/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "2D7CEA7B33F878DBFACE1F59174053944788DDD9D98B90F5A0A5C1A3A1479EA7";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.46/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "6F3563978A4276DB743E12B64B8E50169E99049318B2CDEF6AE11F2FF8CA220B";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -216,7 +229,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.45"
+        return marker.pluginVersion === "2.1.46"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -285,7 +298,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.45", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.46", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();

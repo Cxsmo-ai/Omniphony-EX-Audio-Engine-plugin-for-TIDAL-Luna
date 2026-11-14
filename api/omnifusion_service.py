@@ -90,17 +90,71 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.31"
+SERVICE_VERSION = "2.1.32"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 SHUTDOWN_TOKEN = os.environ.get("OMNIFUSION_SHUTDOWN_TOKEN", "")
 if not re.fullmatch(r"[a-f0-9]{64}", SHUTDOWN_TOKEN):
     SHUTDOWN_TOKEN = ""
+def _process_session_id(pid: int):
+    if os.name != "nt":
+        return None
+    session_id = ctypes.c_ulong()
+    if not ctypes.windll.kernel32.ProcessIdToSessionId(int(pid), ctypes.byref(session_id)):
+        return None
+    return int(session_id.value)
+
+
+def _verified_tidal_parent_pid():
+    """Infer ownership only from a live, same-user/session TIDAL parent in its normal install path."""
+    if os.name != "nt":
+        return None
+    try:
+        child = psutil.Process(os.getpid())
+        parent = child.parent()
+        if parent is None or int(parent.pid) <= 0:
+            return None
+        parent_pid = int(parent.pid)
+        parent_exe = Path(parent.exe()).resolve()
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if not local_app_data:
+            return None
+        tidal_root = (Path(local_app_data) / "TIDAL").resolve()
+        if (
+            parent.name().casefold() != "tidal.exe"
+            or parent_exe.name.casefold() != "tidal.exe"
+            or parent_exe.parent.parent != tidal_root
+            or not parent_exe.parent.name.casefold().startswith("app-")
+            or parent.username().casefold() != child.username().casefold()
+            or parent.create_time() >= child.create_time()
+        ):
+            return None
+        parent_session = _process_session_id(parent_pid)
+        child_session = _process_session_id(os.getpid())
+        if parent_session is None or parent_session != child_session:
+            return None
+        return parent_pid
+    except (psutil.Error, OSError, TypeError, ValueError):
+        return None
+
+
+_raw_tidal_owner_pid = os.environ.get("OMNIFUSION_TIDAL_PID")
+
+
+def _resolve_tidal_owner(raw_value):
+    if raw_value is None:
+        return None, "unavailable"
+    if isinstance(raw_value, str) and not raw_value.strip():
+        owner_pid = _verified_tidal_parent_pid()
+        return owner_pid, "verified_parent_fallback" if owner_pid is not None else "unavailable"
+    try:
+        owner_pid = int(raw_value)
+    except (TypeError, ValueError):
+        return None, "invalid_environment"
+    return (owner_pid, "environment") if owner_pid > 0 else (None, "invalid_environment")
+
+
+TIDAL_OWNER_PID, TIDAL_OWNER_SOURCE = _resolve_tidal_owner(_raw_tidal_owner_pid)
 TIDAL_OWNER_CREATE_TIME = None
-try:
-    _configured_tidal_pid = int(os.environ.get("OMNIFUSION_TIDAL_PID", ""))
-    TIDAL_OWNER_PID = _configured_tidal_pid if _configured_tidal_pid > 0 else None
-except (TypeError, ValueError):
-    TIDAL_OWNER_PID = None
 EOF_REWIND_TIMEOUT_SECONDS = 3.0
 
 
@@ -5989,6 +6043,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 "servicePid": os.getpid(),
                 "tidalOwnerPid": TIDAL_OWNER_PID,
                 "tidalOwnerCreateTime": TIDAL_OWNER_CREATE_TIME,
+                "tidalOwnerSource": TIDAL_OWNER_SOURCE,
                 "tidalOwnerAlive": (
                     _tidal_process_create_time(TIDAL_OWNER_PID) == TIDAL_OWNER_CREATE_TIME
                     if TIDAL_OWNER_PID is not None else None
@@ -7457,58 +7512,34 @@ def _tidal_process_create_time(pid):
 
 
 def tidal_process_watchdog(engine, server, owner_pid=None):
-    """Stop the service when its owning TIDAL process exits; use a fallback for standalone launches."""
-    import psutil
-
+    """Stop only the service bound to its exact verified TIDAL process identity."""
     owner_pid = owner_pid if owner_pid is not None else TIDAL_OWNER_PID
-    if owner_pid is not None:
-        owner_create_time = (
-            TIDAL_OWNER_CREATE_TIME
-            if owner_pid == TIDAL_OWNER_PID and TIDAL_OWNER_CREATE_TIME is not None
-            else _tidal_process_create_time(owner_pid)
-        )
-        if owner_create_time is None:
-            print("[*] TIDAL owner process is already gone. Shutting down OmniFusion service...")
+    if owner_pid is None:
+        print("[-] Service watchdog requires a verified TIDAL owner; refusing ownerless operation.")
+        if hasattr(server, "shutdown_requested"):
+            server.shutdown_requested.set()
+        server.shutdown()
+        return
+    owner_create_time = (
+        TIDAL_OWNER_CREATE_TIME
+        if owner_pid == TIDAL_OWNER_PID and TIDAL_OWNER_CREATE_TIME is not None
+        else _tidal_process_create_time(owner_pid)
+    )
+    if owner_create_time is None:
+        print("[*] TIDAL owner process is already gone. Shutting down OmniFusion service...")
+        if hasattr(server, "shutdown_requested"):
+            server.shutdown_requested.set()
+        server.shutdown()
+        return
+    while True:
+        time.sleep(0.5)
+        current_create_time = _tidal_process_create_time(owner_pid)
+        if current_create_time is None or current_create_time != owner_create_time:
+            print("[*] Owning TIDAL process exited. Stopping OmniFusion service and its owned mpv process...")
             if hasattr(server, "shutdown_requested"):
                 server.shutdown_requested.set()
             server.shutdown()
             return
-        while True:
-            time.sleep(0.5)
-            current_create_time = _tidal_process_create_time(owner_pid)
-            if current_create_time is None or current_create_time != owner_create_time:
-                print("[*] Owning TIDAL process exited. Stopping OmniFusion service and its owned mpv process...")
-                if hasattr(server, "shutdown_requested"):
-                    server.shutdown_requested.set()
-                server.shutdown()
-                return
-
-    has_seen_tidal = False
-    startup_time = time.monotonic()
-    last_tidal_seen = time.monotonic()
-    while True:
-        time.sleep(2.0)
-        try:
-            tidal_running = any(
-                p.info.get("name") and p.info["name"].lower() == "tidal.exe"
-                for p in psutil.process_iter(["name"])
-            )
-            if tidal_running:
-                has_seen_tidal = True
-                last_tidal_seen = time.monotonic()
-            else:
-                now = time.monotonic()
-                if not has_seen_tidal:
-                    if now - startup_time > 90.0:
-                        print("[*] TIDAL not detected within startup grace window. Shutting down service...")
-                        server.shutdown()
-                        return
-                elif now - last_tidal_seen > 20.0:
-                    print("[*] TIDAL exited: stopping OmniFusion service and its owned mpv process...")
-                    server.shutdown()
-                    return
-        except Exception:
-            pass
 
 _SINGLE_INSTANCE_MUTEX = None
 
@@ -7566,11 +7597,13 @@ def ensure_single_instance() -> bool:
 
 def run():
     global TIDAL_OWNER_CREATE_TIME
-    if TIDAL_OWNER_PID is not None:
-        TIDAL_OWNER_CREATE_TIME = _tidal_process_create_time(TIDAL_OWNER_PID)
-        if TIDAL_OWNER_CREATE_TIME is None:
-            print("[-] Refusing to start: the configured TIDAL owner PID is not a verifiable live TIDAL process.")
-            sys.exit(1)
+    if TIDAL_OWNER_PID is None:
+        print(f"[-] Refusing to start without a verified TIDAL owner (source: {TIDAL_OWNER_SOURCE}).")
+        sys.exit(1)
+    TIDAL_OWNER_CREATE_TIME = _tidal_process_create_time(TIDAL_OWNER_PID)
+    if TIDAL_OWNER_CREATE_TIME is None:
+        print("[-] Refusing to start: the configured TIDAL owner PID is not a verifiable live TIDAL process.")
+        sys.exit(1)
     if not ensure_single_instance():
         sys.exit(0)
 
@@ -7607,8 +7640,7 @@ def run():
     try:
         if MPV_EXE.is_file():
             if (not server.shutdown_requested.is_set()
-                    and (TIDAL_OWNER_PID is None
-                         or _tidal_process_create_time(TIDAL_OWNER_PID) == TIDAL_OWNER_CREATE_TIME)):
+                    and _tidal_process_create_time(TIDAL_OWNER_PID) == TIDAL_OWNER_CREATE_TIME):
                 try:
                     engine.ensure_mpv(device=settings.get("audio_device", "auto"))
                 except Exception as exc:

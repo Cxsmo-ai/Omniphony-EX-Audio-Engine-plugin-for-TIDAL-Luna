@@ -13,6 +13,55 @@ import tidalapi
 
 
 class ServiceLifecycleTests(unittest.TestCase):
+    def test_owner_resolution_falls_back_only_for_empty_environment_value(self):
+        with patch.object(service, "_verified_tidal_parent_pid", return_value=4567) as resolve_parent:
+            self.assertEqual(service._resolve_tidal_owner(""), (4567, "verified_parent_fallback"))
+            self.assertEqual(service._resolve_tidal_owner(None), (None, "unavailable"))
+            self.assertEqual(service._resolve_tidal_owner("not-a-pid"), (None, "invalid_environment"))
+            self.assertEqual(service._resolve_tidal_owner("1234"), (1234, "environment"))
+            self.assertEqual(service._resolve_tidal_owner("0"), (None, "invalid_environment"))
+            resolve_parent.assert_called_once_with()
+        with patch.object(service, "_verified_tidal_parent_pid", return_value=None):
+            self.assertEqual(service._resolve_tidal_owner(""), (None, "unavailable"))
+
+    def test_missing_owner_environment_uses_verified_tidal_parent(self):
+        parent = Mock()
+        parent.name.return_value = "TIDAL.exe"
+        parent.exe.return_value = r"C:\Users\tester\AppData\Local\TIDAL\app-2.48.0\TIDAL.exe"
+        parent.username.return_value = r"MACHINE\tester"
+        parent.create_time.return_value = 100.0
+        parent.pid = 4567
+        child = Mock()
+        child.username.return_value = r"MACHINE\tester"
+        child.create_time.return_value = 200.0
+        child.parent.return_value = parent
+
+        with patch.object(service.os, "name", "nt"), \
+                patch.object(service.os, "getpid", return_value=8901), \
+                patch.dict(service.os.environ, {"LOCALAPPDATA": r"C:\Users\tester\AppData\Local"}), \
+                patch.object(service.psutil, "Process", return_value=child), \
+                patch.object(service, "_process_session_id", side_effect=[1, 1]):
+            self.assertEqual(service._verified_tidal_parent_pid(), 4567)
+
+    def test_parent_fallback_rejects_wrong_executable_path_or_session(self):
+        parent = Mock()
+        parent.name.return_value = "TIDAL.exe"
+        parent.exe.return_value = r"C:\Temp\TIDAL.exe"
+        parent.username.return_value = r"MACHINE\tester"
+        parent.create_time.return_value = 100.0
+        parent.pid = 4567
+        child = Mock()
+        child.username.return_value = r"MACHINE\tester"
+        child.create_time.return_value = 200.0
+        child.parent.return_value = parent
+
+        with patch.object(service.os, "name", "nt"), \
+                patch.object(service.os, "getpid", return_value=8901), \
+                patch.dict(service.os.environ, {"LOCALAPPDATA": r"C:\Users\tester\AppData\Local"}), \
+                patch.object(service.psutil, "Process", return_value=child), \
+                patch.object(service, "_process_session_id", side_effect=[1, 1]):
+            self.assertIsNone(service._verified_tidal_parent_pid())
+
     def test_tidal_watchdog_stops_when_its_owner_exits_even_if_another_tidal_process_exists(self):
         server = Mock()
         with patch.object(service, "_tidal_process_create_time", side_effect=[123.0, None]), \
@@ -30,6 +79,27 @@ class ServiceLifecycleTests(unittest.TestCase):
                 patch("builtins.print"):
             service.tidal_process_watchdog(Mock(), server, owner_pid=4567)
         server.shutdown.assert_called_once_with()
+
+    def test_tidal_watchdog_never_falls_back_to_any_running_tidal_process(self):
+        server = Mock()
+        with patch.object(service.time, "sleep"), \
+                patch.object(service.psutil, "process_iter") as process_iter, \
+                patch("builtins.print"):
+            service.tidal_process_watchdog(Mock(), server, owner_pid=None)
+        server.shutdown.assert_called_once_with()
+        process_iter.assert_not_called()
+
+    def test_run_refuses_to_bind_or_start_mpv_without_verified_owner(self):
+        with patch.object(service, "TIDAL_OWNER_PID", None), \
+                patch.object(service, "TIDAL_OWNER_SOURCE", "unavailable"), \
+                patch.object(service.sys, "exit", side_effect=SystemExit(1)), \
+                patch.object(service, "ensure_single_instance") as ensure_single_instance, \
+                patch.object(service, "ThreadedHTTPServer") as server:
+            with self.assertRaises(SystemExit) as raised:
+                service.run()
+        self.assertEqual(raised.exception.code, 1)
+        ensure_single_instance.assert_not_called()
+        server.assert_not_called()
 
     def test_watchdog_shutdown_after_serving_loop_is_ready_does_not_deadlock(self):
         server = service.ThreadedHTTPServer(("127.0.0.1", 0), service.RequestHandler)
@@ -56,11 +126,13 @@ class ServiceLifecycleTests(unittest.TestCase):
         handler.reject_untrusted_origin = Mock(return_value=False)
         handler.send_json = Mock()
 
-        with patch.object(service, "TIDAL_OWNER_PID", 4567):
+        with patch.object(service, "TIDAL_OWNER_PID", 4567), \
+                patch.object(service, "TIDAL_OWNER_SOURCE", "verified_parent_fallback"):
             service.RequestHandler.do_GET(handler)
 
         payload = handler.send_json.call_args.args[0]
         self.assertEqual(payload["tidalOwnerPid"], 4567)
+        self.assertEqual(payload["tidalOwnerSource"], "verified_parent_fallback")
         self.assertNotIn("shutdownToken", payload)
 
     def test_shutdown_requires_matching_secret_and_service_instance(self):
@@ -680,6 +752,8 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.assertIn("for /l %%I in (1,1,20)", source)
         self.assertIn(f'findstr /C:"{service.SERVICE_VERSION}"', source)
         self.assertIn("different OmniFusion service build owns port 8765", source)
+        self.assertIn("if not defined OMNIFUSION_TIDAL_PID", source)
+        self.assertIn("must be started by the Omniphony EX plugin inside TIDAL", source)
 
 
 if __name__ == "__main__":

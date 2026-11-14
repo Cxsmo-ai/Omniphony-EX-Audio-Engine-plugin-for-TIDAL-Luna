@@ -13,6 +13,10 @@ const supervisorCode = moduleSource.match(
   /const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String\.raw`([\s\S]*?)`;/,
 )?.[1];
 assert.ok(supervisorCode, "the native service supervisor is embedded in the plugin entrypoint");
+assert.match(legacyBootstrapSource, /^\/\/ Compatibility entrypoint:[\s\S]*export \* from ["']\.\/omniphony\.mjs["'];?\s*$/,
+  "the alternate entrypoint delegates all startup and shutdown behavior to the canonical module");
+assert.doesNotMatch(legacyBootstrapSource, /spawn\(|child_process|ensureLocalServiceRunning|shutdown/,
+  "the alternate entrypoint must not duplicate service lifecycle logic");
 assert.doesNotMatch(
   legacyBootstrapSource,
   /path\.join\(path\.dirname\(studioExe\),\s*['"]orender\.exe['"]\)/,
@@ -29,8 +33,11 @@ function makeHarness({
   mpvDir,
   studioExe,
   createRuntimeFiles = true,
-  localServiceVersion = "2.1.31",
+  localServiceVersion = "2.1.32",
   verifiedBundle = false,
+  processPid = 4321,
+  browserPid = 4321,
+  browserMetrics = null,
 }) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omniphony-supervisor-test-"));
   const pluginRoot = path.join(userData, "plugins", "omniphony-tidal-luna-plugin");
@@ -70,7 +77,7 @@ function makeHarness({
     `SERVICE_VERSION = "${localServiceVersion}"\n`,
   );
   if (verifiedBundle) {
-    const bundleRoot = path.join(pluginRoot, "runtime-bundles", "2.1.45");
+    const bundleRoot = path.join(pluginRoot, "runtime-bundles", "2.1.46");
     const bundledApiRoot = path.join(bundleRoot, "api");
     for (const file of [
       "runtime/python.exe",
@@ -84,12 +91,12 @@ function makeHarness({
       "harletty/v0.9.0/harletty_iamf_bridge.dll",
       "harletty/v0.9.0/LICENSE",
     ]) touch(path.join(bundledApiRoot, file));
-    fs.writeFileSync(path.join(bundledApiRoot, "omnifusion_service.py"), 'SERVICE_VERSION = "2.1.31"\n');
+    fs.writeFileSync(path.join(bundledApiRoot, "omnifusion_service.py"), 'SERVICE_VERSION = "2.1.32"\n');
     const bundleSha256 = moduleSource.match(/const bundleSha256 = "([A-F0-9]+)";/)?.[1];
     assert.ok(bundleSha256, "the runtime archive digest is pinned in the plugin");
     fs.writeFileSync(path.join(bundleRoot, "bundle-version.json"), JSON.stringify({
-      pluginVersion: "2.1.45",
-      serviceVersion: "2.1.31",
+      pluginVersion: "2.1.46",
+      serviceVersion: "2.1.32",
       sha256: bundleSha256,
     }));
   }
@@ -137,7 +144,7 @@ function makeHarness({
   const module = { exports: {} };
   const sandbox = {
     module,
-    process: { pid: 4321, env: {} },
+    process: { pid: processPid, env: {} },
     URL,
     setTimeout: (callback) => queueMicrotask(callback),
     console: { info() {}, error() {} },
@@ -159,7 +166,12 @@ function makeHarness({
         },
         spawnSync() { throw new Error("unexpected bundle extraction in offline test"); },
       };
-      if (name === "electron") return { app: { getPath: () => userData } };
+      if (name === "electron") return {
+        app: {
+          getPath: () => userData,
+          getAppMetrics: () => browserMetrics ?? (browserPid === null ? [] : [{ type: "Browser", pid: browserPid }]),
+        },
+      };
       throw new Error(`unexpected module ${name}`);
     },
   };
@@ -167,10 +179,10 @@ function makeHarness({
   vm.runInContext(supervisorCode, sandbox, { filename: "service-supervisor.native.js" });
   const health = {
     status: "ok",
-    version: "2.1.31",
+    version: "2.1.32",
     servicePid: 5678,
     serviceInstanceId: "test-instance-1",
-    tidalOwnerPid: 4321,
+    tidalOwnerPid: browserPid ?? processPid,
     tidalOwnerAlive: true,
     pluginRoot,
     dataRoot,
@@ -189,8 +201,40 @@ function makeHarness({
       vm.runInContext('globalThis[Symbol.for("omniphony-ex.native-service-supervisor")].shutdownToken = null', sandbox);
     },
     cleanup: () => fs.rmSync(userData, { recursive: true, force: true }),
-    ensure: () => module.exports.ensureService("2.1.31", {}),
+    ensure: () => module.exports.ensureService("2.1.32", {}),
   };
+}
+
+{
+  const harness = makeHarness({ healthResponses: [null], processPid: 4321, browserPid: null });
+  try {
+    const result = await harness.ensure();
+    assert.equal(result.ready, false);
+    assert.equal(result.reason, "tidal_owner_pid_unavailable");
+    assert.equal(harness.spawned.length, 0, "no service starts without an unambiguous Electron Browser PID");
+  } finally {
+    harness.cleanup();
+  }
+}
+
+{
+  const harness = makeHarness({
+    healthResponses: [null],
+    processPid: 1010,
+    browserPid: null,
+    browserMetrics: [
+      { type: "Browser", pid: 4321 },
+      { type: "Browser", pid: 4322 },
+    ],
+  });
+  try {
+    const result = await harness.ensure();
+    assert.equal(result.ready, false);
+    assert.equal(result.reason, "tidal_owner_pid_unavailable");
+    assert.equal(harness.spawned.length, 0, "ambiguous Browser metrics are rejected");
+  } finally {
+    harness.cleanup();
+  }
 }
 
 {
@@ -202,6 +246,17 @@ function makeHarness({
     assert.equal(result.ready, false);
     assert.equal(result.reason, "spawned_service_identity_mismatch");
     assert.equal(harness.spawned.length, 1, "the supervisor rejects health from a different Python process");
+  } finally {
+    harness.cleanup();
+  }
+}
+
+{
+  const harness = makeHarness({ healthResponses: [null], processPid: 1010, browserPid: 4321 });
+  try {
+    const result = await harness.ensure();
+    assert.equal(result.ready, true);
+    assert.equal(harness.spawned[0][2].env.OMNIFUSION_TIDAL_PID, "4321");
   } finally {
     harness.cleanup();
   }
@@ -288,7 +343,7 @@ function makeHarness({
     assert.equal(result.ready, true, "a matching verified bundle replaces stale local development API files");
     assert.match(
       harness.spawned[0][1][0],
-      /runtime-bundles[\\/]2\.1\.45[\\/]api[\\/]omnifusion_service\.py$/,
+      /runtime-bundles[\\/]2\.1\.46[\\/]api[\\/]omnifusion_service\.py$/,
       "stale checked-out service code is never spawned over the required release bundle",
     );
   } finally {
