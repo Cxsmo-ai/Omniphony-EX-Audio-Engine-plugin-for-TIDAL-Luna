@@ -17,6 +17,7 @@ assert.ok(nativeCode, "renderer startup uses the TidaLuna native supervisor");
 
 function makeHarness(result, { ipc = true, mpvDir = "", studioExe = "" } = {}) {
   const calls = [];
+  const errors = [];
   const storage = new Map([
     ["omniphony_mpv_path", mpvDir],
     ["omniphony_studio_path", studioExe],
@@ -30,7 +31,7 @@ function makeHarness(result, { ipc = true, mpvDir = "", studioExe = "" } = {}) {
       getItem: (key) => storage.get(key) || null,
       setItem: (key, value) => storage.set(key, value),
     },
-    console: { info() {}, error() {} },
+    console: { info() {}, error(...args) { errors.push(args); } },
     window: ipc ? {
       __ipcRenderer: {
         async invoke(...args) {
@@ -46,7 +47,7 @@ function makeHarness(result, { ipc = true, mpvDir = "", studioExe = "" } = {}) {
     `${startupCode}\nglobalThis.ensureLocalOmniFusionService = ensureLocalOmniFusionService;`,
     sandbox,
   );
-  return { calls, storage, run: () => sandbox.ensureLocalOmniFusionService() };
+  return { calls, errors, storage, run: () => sandbox.ensureLocalOmniFusionService() };
 }
 
 {
@@ -74,6 +75,24 @@ function makeHarness(result, { ipc = true, mpvDir = "", studioExe = "" } = {}) {
 {
   const harness = makeHarness({ ready: false }, { ipc: false });
   assert.equal(await harness.run(), false, "missing native IPC reports startup failure cleanly");
+}
+
+{
+  const failure = {
+    ready: false,
+    reason: "runtime_paths_invalid",
+    missingFiles: ["C:\\\\OmniphonyEX\\\\mpv.exe"],
+  };
+  const harness = makeHarness(failure);
+  assert.equal(await harness.run(), false, "native supervisor failures remain unavailable");
+  assert.deepEqual(
+    harness.errors[0],
+    [
+      "[Omniphony EX] Native service supervisor could not start OmniFusion:",
+      JSON.stringify(failure),
+    ],
+    "structured native startup failures are serialized instead of becoming [object Object] in TIDAL logs",
+  );
 }
 
 console.log("Renderer-to-native startup and settings synchronization checks passed.");

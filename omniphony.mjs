@@ -18,7 +18,7 @@
 const API_BASE = "http://127.0.0.1:8765";
 const REQUIRED_SERVICE_VERSION = "2.1.33";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.47";
+const PLUGIN_BUILD = "2.1.48";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -153,10 +153,10 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.47");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.48");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.47/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.48/OmniphonyEX-API-win-x64.tar.gz";
     const bundleSha256 = "B2B45DE9FEF06CF28E571679EDE1959C3AA4C83ABAFB7A755E13BFA84CFE78FE";
     const readPersistedRuntimePaths = () => {
       try {
@@ -229,7 +229,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.47"
+        return marker.pluginVersion === "2.1.48"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -298,7 +298,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.47", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.48", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -362,6 +362,54 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
       return false;
+    };
+    const waitForChildExit = (target, timeoutMs = 2000) => new Promise((resolve) => {
+      if (!target || target.exitCode !== null || target.signalCode !== null) {
+        resolve(true);
+        return;
+      }
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        target.removeListener("exit", finish);
+        target.removeListener("close", finish);
+        clearTimeout(timer);
+        resolve(target.exitCode !== null || target.signalCode !== null);
+      };
+      const timer = setTimeout(finish, timeoutMs);
+      target.once("exit", finish);
+      target.once("close", finish);
+    });
+    const stopFailedStartupChild = async (target, shutdownToken) => {
+      if (!target) return true;
+      if (target.exitCode !== null || target.signalCode !== null) return true;
+      if (!Number.isSafeInteger(Number(target.pid)) || Number(target.pid) <= 0) return true;
+
+      const health = await readHealth();
+      if (health?.status === "ok"
+          && Number(health.servicePid) === Number(target.pid)
+          && typeof health.serviceInstanceId === "string"
+          && health.serviceInstanceId) {
+        const stopped = await stopOwnedService(shutdownToken, health.serviceInstanceId);
+        if (stopped && await waitUntilStopped()) return true;
+      }
+
+      // A startup failure may leave this detached Python process alive. Kill only
+      // the exact child tree created above so its owned MPV cannot outlive it.
+      const taskkillExe = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe");
+      try {
+        const result = spawnSync(taskkillExe, ["/PID", String(target.pid), "/T", "/F"], {
+          encoding: "utf8",
+          windowsHide: true,
+          timeout: 5000,
+          maxBuffer: 1024 * 1024,
+        });
+        if (result.error) return false;
+        return await waitForChildExit(target);
+      } catch (_) {
+        return false;
+      }
     };
     const nativeSupervisorOwns = (health) => Boolean(
       shared.child
@@ -472,25 +520,36 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         return { ready: false, reason: "spawn_failed", message: String(error) };
       }
 
+      const failedStartup = async (failure) => {
+        const cleanupSucceeded = await stopFailedStartupChild(child, shutdownToken);
+        if (cleanupSucceeded && shared.child === child) {
+          shared.child = null;
+          shared.servicePid = null;
+          shared.shutdownToken = null;
+          shared.serviceInstanceId = null;
+        }
+        return { ...failure, cleanupSucceeded };
+      };
+
       for (let attempt = 0; attempt < 30; attempt += 1) {
         if (spawnError) {
-          return { ready: false, reason: "spawn_failed", message: String(spawnError) };
+          return await failedStartup({ ready: false, reason: "spawn_failed", message: String(spawnError) });
         }
         await new Promise((resolve) => setTimeout(resolve, 500));
         const health = await readHealth();
         if (health?.status === "ok") {
           if (!Number.isSafeInteger(Number(child.pid)) || Number(health.servicePid) !== Number(child.pid)) {
-            return { ready: false, reason: "spawned_service_identity_mismatch", servicePid: health.servicePid || null };
+            return await failedStartup({ ready: false, reason: "spawned_service_identity_mismatch", servicePid: health.servicePid || null });
           }
           if (health.version !== requiredVersion || Number(health.tidalOwnerPid) !== tidalOwnerPid
               || health.tidalOwnerAlive !== true
               || !samePath(health.pluginRoot, pluginRoot)
               || !samePath(health.dataRoot, dataRoot) || !samePath(health.mpvDirectory, mpvDir)
               || !samePath(health.studioExecutable, studioExe)) {
-            return { ready: false, reason: "incompatible_service", version: health.version || null };
+            return await failedStartup({ ready: false, reason: "incompatible_service", version: health.version || null });
           }
           if (!health.serviceInstanceId) {
-            return { ready: false, reason: "service_instance_identity_missing" };
+            return await failedStartup({ ready: false, reason: "service_instance_identity_missing" });
           }
           shared.servicePid = Number(health.servicePid);
           shared.serviceInstanceId = health.serviceInstanceId;
@@ -504,7 +563,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
           };
         }
       }
-      return { ready: false, reason: "health_timeout" };
+      return await failedStartup({ ready: false, reason: "health_timeout" });
     })();
 
     try {
@@ -732,7 +791,7 @@ async function ensureLocalOmniFusionService() {
         console.info(`[Omniphony EX] OmniFusion service ${result.version} is healthy${result.alreadyRunning ? " (already running)" : " (started)"}.`);
         return true;
       }
-      console.error("[Omniphony EX] Native service supervisor could not start OmniFusion:", result);
+      console.error("[Omniphony EX] Native service supervisor could not start OmniFusion:", JSON.stringify(result));
       return false;
     } catch (error) {
       console.error("[Omniphony EX] Native service startup request failed:", error);

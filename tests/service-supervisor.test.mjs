@@ -9,10 +9,12 @@ import vm from "node:vm";
 const root = path.dirname(fileURLToPath(import.meta.url));
 const moduleSource = fs.readFileSync(path.join(root, "..", "omniphony.mjs"), "utf8");
 const legacyBootstrapSource = fs.readFileSync(path.join(root, "..", "index.js"), "utf8");
+const pluginVersion = moduleSource.match(/^const PLUGIN_BUILD = "([^"]+)";$/m)?.[1];
 const supervisorCode = moduleSource.match(
   /const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String\.raw`([\s\S]*?)`;/,
 )?.[1];
 assert.ok(supervisorCode, "the native service supervisor is embedded in the plugin entrypoint");
+assert.ok(pluginVersion, "the plugin build version is declared in the canonical entrypoint");
 assert.match(legacyBootstrapSource, /^\/\/ Compatibility entrypoint:[\s\S]*export \* from ["']\.\/omniphony\.mjs["'];?\s*$/,
   "the alternate entrypoint delegates all startup and shutdown behavior to the canonical module");
 assert.doesNotMatch(legacyBootstrapSource, /spawn\(|child_process|ensureLocalServiceRunning|shutdown/,
@@ -77,7 +79,7 @@ function makeHarness({
     `SERVICE_VERSION = "${localServiceVersion}"\n`,
   );
   if (verifiedBundle) {
-    const bundleRoot = path.join(pluginRoot, "runtime-bundles", "2.1.47");
+    const bundleRoot = path.join(pluginRoot, "runtime-bundles", pluginVersion);
     const bundledApiRoot = path.join(bundleRoot, "api");
     for (const file of [
       "runtime/python.exe",
@@ -95,7 +97,7 @@ function makeHarness({
     const bundleSha256 = moduleSource.match(/const bundleSha256 = "([A-F0-9]+)";/)?.[1];
     assert.ok(bundleSha256, "the runtime archive digest is pinned in the plugin");
     fs.writeFileSync(path.join(bundleRoot, "bundle-version.json"), JSON.stringify({
-      pluginVersion: "2.1.47",
+      pluginVersion,
       serviceVersion: "2.1.33",
       sha256: bundleSha256,
     }));
@@ -105,6 +107,8 @@ function makeHarness({
   let defaultHealth = null;
   const requests = [];
   const spawned = [];
+  const children = [];
+  const syncCalls = [];
   const http = {
     get(_options, callback) {
       const request = new EventEmitter();
@@ -147,6 +151,7 @@ function makeHarness({
     process: { pid: processPid, env: {} },
     URL,
     setTimeout: (callback) => queueMicrotask(callback),
+    clearTimeout() {},
     console: { info() {}, error() {} },
     require(name) {
       if (name === "fs") return fs;
@@ -162,9 +167,25 @@ function makeHarness({
           child.signalCode = null;
           child.killed = false;
           child.unref = () => {};
+          child.kill = () => {
+            child.killed = true;
+            child.signalCode = "SIGTERM";
+            child.emit("exit", null, "SIGTERM");
+            return true;
+          };
+          children.push(child);
           return child;
         },
-        spawnSync() { throw new Error("unexpected bundle extraction in offline test"); },
+        spawnSync(...args) {
+          syncCalls.push(args);
+          const targetPid = Number(args[1]?.[1]);
+          const target = children.find((candidate) => candidate.pid === targetPid);
+          if (args[0].endsWith("taskkill.exe") && target) {
+            target.kill();
+            return { status: 0, error: null, stdout: "SUCCESS", stderr: "" };
+          }
+          throw new Error("unexpected bundle extraction in offline test");
+        },
       };
       if (name === "electron") return {
         app: {
@@ -195,8 +216,11 @@ function makeHarness({
     health,
     healthResponses: queuedHealth,
     setHealthResponses: (responses) => queuedHealth.splice(0, queuedHealth.length, ...responses),
+    setDefaultHealth: (value) => { defaultHealth = value; },
     requests,
     spawned,
+    children,
+    syncCalls,
     loseSupervisorToken: () => {
       vm.runInContext('globalThis[Symbol.for("omniphony-ex.native-service-supervisor")].shutdownToken = null', sandbox);
     },
@@ -241,11 +265,34 @@ function makeHarness({
   const harness = makeHarness({ healthResponses: [null] });
   const unrelatedHealthyService = { ...harness.health, servicePid: 9999 };
   harness.setHealthResponses([null, unrelatedHealthyService]);
+  harness.setDefaultHealth(null);
   try {
     const result = await harness.ensure();
     assert.equal(result.ready, false);
     assert.equal(result.reason, "spawned_service_identity_mismatch");
+    assert.equal(result.cleanupSucceeded, true, "the supervisor reaps its exact child after rejecting unrelated health");
     assert.equal(harness.spawned.length, 1, "the supervisor rejects health from a different Python process");
+    assert.equal(harness.requests.length, 0, "the unrelated healthy port owner is never sent shutdown");
+    assert.deepEqual(
+      Array.from(harness.syncCalls[0][1]),
+      ["/PID", "5678", "/T", "/F"],
+      "failed startup cleanup targets only the spawned child's process tree",
+    );
+  } finally {
+    harness.cleanup();
+  }
+}
+
+{
+  const harness = makeHarness({ healthResponses: [null] });
+  harness.setDefaultHealth(null);
+  try {
+    const result = await harness.ensure();
+    assert.equal(result.ready, false);
+    assert.equal(result.reason, "health_timeout");
+    assert.equal(result.cleanupSucceeded, true, "the service child tree is reaped when health never comes up");
+    assert.equal(harness.children[0].killed, true);
+    assert.deepEqual(Array.from(harness.syncCalls[0][1]), ["/PID", "5678", "/T", "/F"]);
   } finally {
     harness.cleanup();
   }
@@ -341,9 +388,9 @@ function makeHarness({
   try {
     const result = await harness.ensure();
     assert.equal(result.ready, true, "a matching verified bundle replaces stale local development API files");
-    assert.match(
+    assert.equal(
       harness.spawned[0][1][0],
-      /runtime-bundles[\\/]2\.1\.47[\\/]api[\\/]omnifusion_service\.py$/,
+      path.join(harness.health.pluginRoot, "runtime-bundles", pluginVersion, "api", "omnifusion_service.py"),
       "stale checked-out service code is never spawned over the required release bundle",
     );
   } finally {
