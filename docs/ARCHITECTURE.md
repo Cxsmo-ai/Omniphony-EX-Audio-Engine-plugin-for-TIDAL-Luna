@@ -40,7 +40,7 @@ The loopback API responds with `Access-Control-Allow-Origin: *` for any browser 
 
 | Method & Path | Purpose |
 | :--- | :--- |
-| `GET /health` | Returns service version (`2.1.32`), the owning TIDAL PID, ownership source and process creation time, whether that exact process is still alive, plugin/data/MPV/Studio path identities, `serviceInstanceId`, active `mpvInstanceId`, and capability flags (`prepared-playback-v1`, `playback-clock-v1`). It never returns the shutdown credential. |
+| `GET /health` | Returns service version (`2.1.33`), the owning TIDAL PID, ownership source and process creation time, whether that exact process is still alive, plugin/data/MPV/Studio path identities, `serviceInstanceId`, active `mpvInstanceId`, and capability flags (`prepared-playback-v1`, `playback-clock-v1`). It never returns the shutdown credential. |
 | `GET /clock` | Lightweight 50 ms position and pause-state sample with IPC timing brackets. |
 | `GET /status` | Full track, codec, bitrate, WASAPI output, and Omniphony Studio route telemetry. |
 | `GET /config` / `POST /config` | Reads or atomically updates `priority`, `realmax_source` (`auto`, `tidal_only`, `amazon_only`), and `eclipse_addons`. |

@@ -33,7 +33,7 @@ function makeHarness({
   mpvDir,
   studioExe,
   createRuntimeFiles = true,
-  localServiceVersion = "2.1.32",
+  localServiceVersion = "2.1.33",
   verifiedBundle = false,
   processPid = 4321,
   browserPid = 4321,
@@ -77,7 +77,7 @@ function makeHarness({
     `SERVICE_VERSION = "${localServiceVersion}"\n`,
   );
   if (verifiedBundle) {
-    const bundleRoot = path.join(pluginRoot, "runtime-bundles", "2.1.46");
+    const bundleRoot = path.join(pluginRoot, "runtime-bundles", "2.1.47");
     const bundledApiRoot = path.join(bundleRoot, "api");
     for (const file of [
       "runtime/python.exe",
@@ -91,12 +91,12 @@ function makeHarness({
       "harletty/v0.9.0/harletty_iamf_bridge.dll",
       "harletty/v0.9.0/LICENSE",
     ]) touch(path.join(bundledApiRoot, file));
-    fs.writeFileSync(path.join(bundledApiRoot, "omnifusion_service.py"), 'SERVICE_VERSION = "2.1.32"\n');
+    fs.writeFileSync(path.join(bundledApiRoot, "omnifusion_service.py"), 'SERVICE_VERSION = "2.1.33"\n');
     const bundleSha256 = moduleSource.match(/const bundleSha256 = "([A-F0-9]+)";/)?.[1];
     assert.ok(bundleSha256, "the runtime archive digest is pinned in the plugin");
     fs.writeFileSync(path.join(bundleRoot, "bundle-version.json"), JSON.stringify({
-      pluginVersion: "2.1.46",
-      serviceVersion: "2.1.32",
+      pluginVersion: "2.1.47",
+      serviceVersion: "2.1.33",
       sha256: bundleSha256,
     }));
   }
@@ -179,7 +179,7 @@ function makeHarness({
   vm.runInContext(supervisorCode, sandbox, { filename: "service-supervisor.native.js" });
   const health = {
     status: "ok",
-    version: "2.1.32",
+    version: "2.1.33",
     servicePid: 5678,
     serviceInstanceId: "test-instance-1",
     tidalOwnerPid: browserPid ?? processPid,
@@ -201,7 +201,7 @@ function makeHarness({
       vm.runInContext('globalThis[Symbol.for("omniphony-ex.native-service-supervisor")].shutdownToken = null', sandbox);
     },
     cleanup: () => fs.rmSync(userData, { recursive: true, force: true }),
-    ensure: () => module.exports.ensureService("2.1.32", {}),
+    ensure: () => module.exports.ensureService("2.1.33", {}),
   };
 }
 
@@ -343,7 +343,7 @@ function makeHarness({
     assert.equal(result.ready, true, "a matching verified bundle replaces stale local development API files");
     assert.match(
       harness.spawned[0][1][0],
-      /runtime-bundles[\\/]2\.1\.46[\\/]api[\\/]omnifusion_service\.py$/,
+      /runtime-bundles[\\/]2\.1\.47[\\/]api[\\/]omnifusion_service\.py$/,
       "stale checked-out service code is never spawned over the required release bundle",
     );
   } finally {

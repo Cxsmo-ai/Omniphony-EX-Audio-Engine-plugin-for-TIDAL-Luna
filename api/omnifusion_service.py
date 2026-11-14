@@ -79,6 +79,21 @@ ORENDER_BRIDGE_PATHS = (
     ORENDER_BRIDGE_DIR / "harletty_iamf_bridge.dll",
 )
 STRICT_RENDER_DECODER = "orender"
+STREAM_TRANSPORT_TIDAL_DASH_PROXY = "tidal-dash-proxy"
+STREAM_TRANSPORT_OXIDEAV_RAW_S16LE = "oxideav-raw-s16le"
+
+
+def stream_transport_label(proxy) -> str | None:
+    """Classify concrete proxy types without guessing from codec or field presence."""
+    if proxy is None:
+        return None
+    if isinstance(proxy, Ac4RawPcmProxy):
+        return STREAM_TRANSPORT_OXIDEAV_RAW_S16LE
+    if isinstance(proxy, TidalDashProxy):
+        return STREAM_TRANSPORT_TIDAL_DASH_PROXY
+    return None
+
+
 CONFIG_DIR = DATA_DIR / "config"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 STUDIO_CONFIG_FILE = CONFIG_DIR / "omniphony" / "config.yaml"
@@ -90,7 +105,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.32"
+SERVICE_VERSION = "2.1.33"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 SHUTDOWN_TOKEN = os.environ.get("OMNIFUSION_SHUTDOWN_TOKEN", "")
 if not re.fullmatch(r"[a-f0-9]{64}", SHUTDOWN_TOKEN):
@@ -303,6 +318,7 @@ TRACK_STATUS_FIELDS = (
     "decodedSampleRate",
     "decodedChannels",
     "requestId",
+    "streamTransport",
 )
 
 
@@ -6388,7 +6404,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             if not joc_snapshot:
                 refresh_invalidated_joc_route_telemetry(engine)
             
-            track_status = public_track_status(engine.current_meta, playback_state)
+            with engine.playback_generation_lock:
+                status_metadata = dict(engine.current_meta)
+                status_proxy = engine.stream_proxy
+            track_status = public_track_status(status_metadata, playback_state)
             self.send_json({
                 **track_status,
                 "timePos": position if position is not None else 0.0,
@@ -6416,24 +6435,26 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 "audioBitrate": bitrate_res.get("data", 0) if bitrate_res else 0,
                 "lastSeekDiagnostic": engine.last_seek_diagnostic,
                 "activeDecoder": decoder_res.get("data", "") if decoder_res else "",
-                "streamTransport": (
-                    "tidal-dash-proxy"
-                    if track_status["trackId"] is not None and engine.stream_proxy is not None
-                    else None
-                ),
+                "streamTransport": track_status.get("streamTransport"),
                 "streamProxyRequests": (
-                    engine.stream_proxy.segment_requests
-                    if track_status["trackId"] is not None and engine.stream_proxy is not None
+                    status_proxy.segment_requests
+                    if track_status["trackId"] is not None
+                    and track_status.get("streamTransport") is not None
+                    and status_proxy is not None
                     else 0
                 ),
                 "streamProxyBytes": (
-                    engine.stream_proxy.bytes_served
-                    if track_status["trackId"] is not None and engine.stream_proxy is not None
+                    status_proxy.bytes_served
+                    if track_status["trackId"] is not None
+                    and track_status.get("streamTransport") is not None
+                    and status_proxy is not None
                     else 0
                 ),
                 "streamProxyFailures": (
-                    engine.stream_proxy.failed_segments
-                    if track_status["trackId"] is not None and engine.stream_proxy is not None
+                    status_proxy.failed_segments
+                    if track_status["trackId"] is not None
+                    and track_status.get("streamTransport") is not None
+                    and status_proxy is not None
                     else 0
                 ),
             })
@@ -6844,6 +6865,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                         "trackId": track_id,
                         "generation": generation,
                         "playbackState": "loading",
+                        "streamTransport": None,
                         "format": fmt,
                         "codec": stream_info.get("codec"),
                         "label": stream_info.get("label"),
@@ -6911,8 +6933,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 engine.finish_mpv_media_load(media_load_epoch, resolved=True)
                 # MPV confirmed the replacement; the prior file can no longer
                 # request its segments, so release that proxy now.
-                previous_proxy = engine.stream_proxy
-                engine.stream_proxy = None
+                with engine.playback_generation_lock:
+                    previous_proxy = engine.stream_proxy
+                    engine.stream_proxy = None
                 if previous_proxy is not None:
                     previous_proxy.close()
                 decoded_params_result = engine.cmd(["get_property", "audio-params"])
@@ -6951,13 +6974,14 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                         or actual_channels != 2
                         or actual_rate != source_rate
                     ):
-                        engine.current_meta = {
-                            **engine.current_meta,
-                            "trackId": None,
-                            "playbackState": "failed",
-                            "label": "AC-4 IMS PCM verification failed",
-                        }
-                        engine.active_generation = 0
+                        with engine.playback_generation_lock:
+                            engine.current_meta = {
+                                **engine.current_meta,
+                                "trackId": None,
+                                "playbackState": "failed",
+                                "label": "AC-4 IMS PCM verification failed",
+                            }
+                            engine.active_generation = 0
                         return self.send_json({
                             "error": "OxideAV raw playback did not produce the verified AC-4 IMS stereo sample rate",
                             "format": "AC4_UNVERIFIED",
@@ -7098,6 +7122,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                         "cover": body.get("cover") or body.get("art") or stream_info.get("cover", ""),
                         "artworkURL": body.get("cover") or body.get("art") or stream_info.get("cover", ""),
                         "requestId": request_id,
+                        "streamTransport": stream_transport_label(candidate_proxy),
                     }
                     engine.active_generation = 0 if start_paused else generation
                     engine.prepared_generation = generation if start_paused else 0
@@ -7660,7 +7685,8 @@ def run():
                     engine.stream_proxy.close()
                 except Exception as exc:
                     print(f"[-] Could not close the owned stream proxy: {type(exc).__name__}")
-                engine.stream_proxy = None
+                with engine.playback_generation_lock:
+                    engine.stream_proxy = None
             if engine.pipe:
                 try:
                     engine.pipe.close()
