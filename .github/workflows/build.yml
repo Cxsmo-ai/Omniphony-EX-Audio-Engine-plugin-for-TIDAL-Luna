@@ -45,6 +45,9 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Test loopback TidaLuna dev store
+        run: python -m unittest discover -s tests -p "test_*.py"
+
       - name: Test GitHub release asset naming
         run: python -m unittest tools.test_prepare_release
 

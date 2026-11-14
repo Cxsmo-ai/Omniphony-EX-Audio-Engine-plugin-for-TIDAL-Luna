@@ -178,7 +178,7 @@ https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/rele
 
 The store installs one bundled TidaLuna module plus its package metadata. On first launch, the module fetches the version-pinned API runtime archive from the matching GitHub release and checks its SHA-256 before extraction. Users do not install Python, `python-tidal`, or a separate API service.
 
-For local development, run `pnpm install` and `pnpm run watch` from the repository. TidaLuna exposes the loopback DEV store on port `3000`; install the Omniphony EX entry from Plugin Store. The server binds only to `127.0.0.1` and serves the generated catalog and the plugin's `.json`/`.mjs` pair.
+For local development, run `pnpm install` and `pnpm run watch` from the repository. TidaLuna exposes the loopback DEV store on port `3000`; install the Omniphony EX entry from Plugin Store. The server binds only to `127.0.0.1`, serves the generated catalog and the plugin's `.json`/`.mjs` pair, and sends wildcard CORS headers—including on preflight and error responses—to support TidaLuna's webview.
 
 The plugin-managed API archive includes the embedded Python runtime, EbbLabs `python-tidal`, its dependencies, and the licensed AC-4 and Harletty support binaries. It does not contain account tokens. Plugin settings, TIDAL auth sessions, logs, cache, and downloads are written under the TIDAL user-data plugin directory in `data/` and survive plugin code updates.
 

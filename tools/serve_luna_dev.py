@@ -1,4 +1,4 @@
-"""Loopback-only development store server for the generated TidaLuna artifacts."""
+"""Loopback-only development store server with wildcard CORS for TidaLuna artifacts."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
 PLUGIN_BASE = "Omniphony EX Audio Engine"
-ALLOWED_ORIGINS = {"https://desktop.tidal.com"}
 ARTIFACTS = {
     "/store.json": (DIST / "store.json", "application/json; charset=utf-8"),
     f"/{PLUGIN_BASE}.json": (DIST / f"{PLUGIN_BASE}.json", "application/json; charset=utf-8"),
@@ -23,10 +22,7 @@ class LunaDevHandler(BaseHTTPRequestHandler):
     server_version = "OmniphonyLunaDev/1.0"
 
     def _cors_headers(self) -> None:
-        origin = self.headers.get("Origin")
-        if origin in ALLOWED_ORIGINS:
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         if self.headers.get("Access-Control-Request-Private-Network", "").lower() == "true":
@@ -34,9 +30,12 @@ class LunaDevHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
 
+    def end_headers(self) -> None:
+        self._cors_headers()
+        super().end_headers()
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(204)
-        self._cors_headers()
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -57,7 +56,6 @@ class LunaDevHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
-        self._cors_headers()
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
