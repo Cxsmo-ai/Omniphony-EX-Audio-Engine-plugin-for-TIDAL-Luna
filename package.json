@@ -13,7 +13,7 @@
     "url": "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna.git"
   },
   "scripts": {
-    "build": "rimraf ./dist && tsx esbuild.config.ts",
+    "build": "rimraf ./dist && tsx esbuild.config.ts && node tools/sync-manifest-hash.mjs",
     "watch:build": "rimraf ./dist && tsx esbuild.config.ts --watch",
     "serve": "python tools/serve_luna_dev.py --port 3000",
     "watch": "concurrently \"pnpm:watch:build\" \"pnpm:serve\""
