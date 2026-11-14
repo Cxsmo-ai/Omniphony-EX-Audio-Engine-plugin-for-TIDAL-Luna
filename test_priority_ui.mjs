@@ -32,11 +32,14 @@ const builtPlugin = builtPluginEntries.find((entry) => entry.package.name === "O
 assert.ok(builtPlugin, "built TidaLuna catalog includes the Omniphony EX module");
 const builtPackage = builtPlugin.package;
 const builtModuleBytes = builtPlugin.moduleBytes;
-const builtModuleSha256 = createHash("sha256").update(builtModuleBytes).digest("hex").toUpperCase();
-assert.equal(pluginManifest.hash, builtModuleSha256,
-  "development manifest SHA-256 matches the built module bytes");
-assert.equal(lunaManifest.hash, builtModuleSha256,
-  "repository manifest SHA-256 matches the built module bytes");
+const sourceModuleSha256 = createHash("sha256")
+  .update(Buffer.from(source.replace(/\r\n/g, "\n"), "utf8"))
+  .digest("hex")
+  .toUpperCase();
+assert.equal(pluginManifest.hash, sourceModuleSha256,
+  "development manifest SHA-256 matches the source module bytes served by its main URL");
+assert.equal(lunaManifest.hash, sourceModuleSha256,
+  "repository manifest SHA-256 matches the source module bytes served by its main URL");
 assert.equal(builtPackage.name, "Omniphony EX Audio Engine",
   "built module metadata identifies the expected Luna plugin");
 assert.equal(builtPackage.version, store.version,
@@ -1926,6 +1929,7 @@ const syncClockSandbox = {
   injectUI() {},
   startSyncLoop() {},
   pluginDisposed: false,
+  localServiceStartupPending: false,
   unloadCallbacks: new Set(),
   unloads: {
     add(callback) { syncClockSandbox.unloadCallbacks.add(callback); },
@@ -2135,7 +2139,9 @@ vm.runInContext(`
   ${extractFunction("schedulePluginTimeout")}
   ${extractFunction("scheduleRadiantLyricsRecovery")}
   ${extractFunction("installRadiantLyricsPersistenceOverlay")}
-  ${extractFunction("inspectRadiantLyricsReduxState")}  ${extractFunction("localRequestFailureSummary")}
+  ${extractFunction("inspectRadiantLyricsReduxState")}
+  ${extractFunction("localRequestFailureSummary")}
+  ${extractFunction("canPollLocalServiceStatus")}
   ${extractFunction("startSyncLoop")}
   globalThis.inspectLyricsReduxState = inspectRadiantLyricsReduxState;
   globalThis.captureRadiantLyricsSnapshot = captureRadiantSyntheticLyricsSnapshot;
@@ -2758,7 +2764,7 @@ sandbox.refreshSettingsTelemetry({
 });
 assert.equal(panelFormat.innerText, "AC-4 IMS · Paused");
 assert.match(panelSub.innerText, /Source AC-4 \u00b7 48 kHz \u00b7 2 source ch \u00b7 256 kbps avg source \u00b7 MP4 packet average/);
-assert.match(panelSub.innerText, /Decoded 48 kHz \u00b7 Stereo \u00b7 PCM S16/);
+assert.match(panelSub.innerText, /Decoded program 48 kHz \u00b7 Stereo \u00b7 PCM S16/);
 assert.match(panelSub.innerText, /Output 96 kHz \u00b7 8 ch \u00b7 PCM S16 \u00b7 12288 kbps PCM payload/);
 assert.match(panelSub.innerText, /Voicemeeter Input · WASAPI/);
 assert.equal(panelDot.style.background, "#ffc34d", "paused playback is never shown as clock advancing");
@@ -2959,7 +2965,7 @@ assert.equal(activeBadge.innerText, "[TIDAL] AC-4 IMS \u00b7 256 kbps avg\n48 kH
   "native footer badge shows source codec, measured bitrate, sample rate, and channel count");
 assert.match(activeBadge.title, /Natural .*AC-4 IMS .*Engine clock advancing via OmniFusion/);
 assert.match(activeBadge.title, /Source AC-4 \u00b7 48 kHz \u00b7 2 source ch \u00b7 256 kbps avg source \u00b7 MP4 packet average/);
-assert.match(activeBadge.title, /Decoded 48 kHz \u00b7 Stereo \u00b7 PCM S16/);
+assert.match(activeBadge.title, /Decoded program 48 kHz \u00b7 Stereo \u00b7 PCM S16/);
 assert.match(activeBadge.title, /Output 96 kHz \u00b7 8 ch \u00b7 PCM S16 \u00b7 12288 kbps PCM payload \u00b7 Voicemeeter Input \u00b7 WASAPI/);
 const ac4StatusForBadge = sandbox.currentStatusData;
 sandbox.currentStatusData = { trackId: 227401768, format: "EAC3_JOC", audioCodec: "eac3", audioBitrate: 768000 };
@@ -3047,7 +3053,7 @@ assert.equal(sandbox.getPcmOutputBitrate(unknownSourceStatus), 0,
   "decoder parameters and mpv bitrate are never substituted for missing endpoint parameters");
 const unknownDetails = sandbox.getEngineOutputDetails(unknownSourceStatus);
 assert.match(unknownDetails, /Source codec unavailable.*source rate unavailable.*source channels unavailable.*source bitrate unavailable/);
-assert.match(unknownDetails, /Decoded 48 kHz.*Stereo.*PCM S16/);
+assert.match(unknownDetails, /Decoded program 48 kHz.*Stereo.*PCM S16/);
 assert.match(unknownDetails, /Output unavailable/);
 assert.doesNotMatch(unknownDetails, /768 kbps/,
   "an encoded source bitrate is not inferred from mpv's bitrate field");
@@ -3085,7 +3091,7 @@ assert.match(sandbox.getEngineOutputDetails({
   audioParams: { samplerate: 48000, "channel-count": 2, format: "s16" },
   audioCodec: "pcm_s16le",
   device: "wasapi/{30714dd9-2d0e-4cfb-9b98-558a8c5992da}"
-}), /Decoded 48 kHz · Stereo · PCM S16/);
+}), /Decoded program 48 kHz · Stereo · PCM S16/);
 assert.doesNotMatch(sandbox.getEngineOutputDetails({ audioParams: {}, device: "auto" }), /48000|FLAC|Multi/);
 sandbox.currentStatusData.engineClockAdvancing = false;
 sandbox.updateBadgeUI("Dolby AC-4 IMS");
