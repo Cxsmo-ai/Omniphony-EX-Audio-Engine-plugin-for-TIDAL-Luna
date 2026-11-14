@@ -1,7 +1,7 @@
 {
   "name": "@cxsmo-ai/omniphony-ex",
   "description": "Omniphony EX Audio Engine for TidaLuna",
-  "version": "2.1.43",
+  "version": "2.1.44",
   "type": "module",
   "author": {
     "name": "Pickymarker",

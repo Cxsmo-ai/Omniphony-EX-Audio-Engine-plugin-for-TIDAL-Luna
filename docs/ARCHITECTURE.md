@@ -36,11 +36,11 @@ The service configures the existing headless MPV instance for each resolved tran
 
 ## 3. Loopback HTTP API (`127.0.0.1:8765`)
 
-All state-changing `POST` endpoints enforce strict CORS origin validation (`https://listen.tidal.com`, `https://desktop.tidal.com`, `http://localhost`, `http://127.0.0.1`).
+The loopback API responds with `Access-Control-Allow-Origin: *` for any browser origin, without credentialed cookies. Preflight remains limited to `GET`, `POST`, and the `Content-Type` / `Cache-Control` request headers.
 
 | Method & Path | Purpose |
 | :--- | :--- |
-| `GET /health` | Returns service version (`2.1.29`), plugin/data/MPV/Studio path identities, `serviceInstanceId`, active `mpvInstanceId`, and capability flags (`prepared-playback-v1`, `playback-clock-v1`). |
+| `GET /health` | Returns service version (`2.1.30`), plugin/data/MPV/Studio path identities, `serviceInstanceId`, active `mpvInstanceId`, and capability flags (`prepared-playback-v1`, `playback-clock-v1`). |
 | `GET /clock` | Lightweight 50 ms position and pause-state sample with IPC timing brackets. |
 | `GET /status` | Full track, codec, bitrate, WASAPI output, and Omniphony Studio route telemetry. |
 | `GET /config` / `POST /config` | Reads or atomically updates `priority`, `realmax_source` (`auto`, `tidal_only`, `amazon_only`), and `eclipse_addons`. |

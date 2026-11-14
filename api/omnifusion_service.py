@@ -89,7 +89,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.29"
+SERVICE_VERSION = "2.1.30"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 EOF_REWIND_TIMEOUT_SECONDS = 3.0
 
@@ -340,15 +340,6 @@ def mpv_loading_status_payload(engine) -> dict:
         "streamProxyBytes": 0,
         "streamProxyFailures": 0,
     }
-ALLOWED_BROWSER_ORIGINS = frozenset({
-    "https://desktop.tidal.com",
-    "https://listen.tidal.com",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:8088",
-    "http://127.0.0.1:8088",
-    "null",
-})
 SETTINGS_LOCK = threading.RLock()
 
 # python-tidal is the source of truth for TIDAL track capabilities and the
@@ -5890,28 +5881,17 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def end_headers(self):
-        origin = self.headers.get("Origin")
-        if origin and (origin in ALLOWED_BROWSER_ORIGINS or origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1") or origin.startswith("tidal:") or origin.startswith("file:")):
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Access-Control-Allow-Credentials", "true")
-            self.send_header("Vary", "Origin")
-        elif origin is None:
-            self.send_header("Access-Control-Allow-Origin", "*")
+        # This loopback API is intentionally callable from any browser origin.
+        # Wildcard CORS cannot be combined with credentialed cookies, which
+        # this local service does not use for its API requests.
+        self.send_header("Access-Control-Allow-Origin", "*")
         super().end_headers()
 
     def reject_untrusted_origin(self, require_origin=False):
         origin = self.headers.get("Origin")
-        if origin is None and not require_origin:
+        if origin is not None or not require_origin:
             return False
-        if isinstance(origin, str) and (
-            origin in ALLOWED_BROWSER_ORIGINS
-            or origin.startswith("http://localhost")
-            or origin.startswith("http://127.0.0.1")
-            or origin.startswith("tidal:")
-            or origin.startswith("file:")
-        ):
-            return False
-        self.send_json({"error": "origin is not allowed"}, status=403)
+        self.send_json({"error": "Origin header is required for preflight"}, status=403)
         return True
 
     def do_OPTIONS(self):

@@ -29,7 +29,7 @@ function makeHarness({
   mpvDir,
   studioExe,
   createRuntimeFiles = true,
-  localServiceVersion = "2.1.29",
+  localServiceVersion = "2.1.30",
   verifiedBundle = false,
 }) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omniphony-supervisor-test-"));
@@ -70,7 +70,7 @@ function makeHarness({
     `SERVICE_VERSION = "${localServiceVersion}"\n`,
   );
   if (verifiedBundle) {
-    const bundleRoot = path.join(pluginRoot, "runtime-bundles", "2.1.43");
+    const bundleRoot = path.join(pluginRoot, "runtime-bundles", "2.1.44");
     const bundledApiRoot = path.join(bundleRoot, "api");
     for (const file of [
       "runtime/python.exe",
@@ -84,12 +84,12 @@ function makeHarness({
       "harletty/v0.9.0/harletty_iamf_bridge.dll",
       "harletty/v0.9.0/LICENSE",
     ]) touch(path.join(bundledApiRoot, file));
-    fs.writeFileSync(path.join(bundledApiRoot, "omnifusion_service.py"), 'SERVICE_VERSION = "2.1.29"\n');
+    fs.writeFileSync(path.join(bundledApiRoot, "omnifusion_service.py"), 'SERVICE_VERSION = "2.1.30"\n');
     const bundleSha256 = moduleSource.match(/const bundleSha256 = "([A-F0-9]+)";/)?.[1];
     assert.ok(bundleSha256, "the runtime archive digest is pinned in the plugin");
     fs.writeFileSync(path.join(bundleRoot, "bundle-version.json"), JSON.stringify({
-      pluginVersion: "2.1.43",
-      serviceVersion: "2.1.29",
+      pluginVersion: "2.1.44",
+      serviceVersion: "2.1.30",
       sha256: bundleSha256,
     }));
   }
@@ -161,7 +161,7 @@ function makeHarness({
   vm.runInContext(supervisorCode, sandbox, { filename: "service-supervisor.native.js" });
   const health = {
     status: "ok",
-    version: "2.1.29",
+    version: "2.1.30",
     pluginRoot,
     dataRoot,
     mpvDirectory: paths.mpvDir,
@@ -176,7 +176,7 @@ function makeHarness({
     requests,
     spawned,
     cleanup: () => fs.rmSync(userData, { recursive: true, force: true }),
-    ensure: () => module.exports.ensureService("2.1.29", {}),
+    ensure: () => module.exports.ensureService("2.1.30", {}),
   };
 }
 
@@ -229,7 +229,7 @@ function makeHarness({
     assert.equal(result.ready, true, "a matching verified bundle replaces stale local development API files");
     assert.match(
       harness.spawned[0][1][0],
-      /runtime-bundles[\\/]2\.1\.43[\\/]api[\\/]omnifusion_service\.py$/,
+      /runtime-bundles[\\/]2\.1\.44[\\/]api[\\/]omnifusion_service\.py$/,
       "stale checked-out service code is never spawned over the required release bundle",
     );
   } finally {

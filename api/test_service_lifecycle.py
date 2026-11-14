@@ -10,6 +10,30 @@ import tidalapi
 
 
 class ServiceLifecycleTests(unittest.TestCase):
+    def test_cors_allows_any_origin_without_cookie_credentials(self):
+        handler = object.__new__(service.RequestHandler)
+        handler.headers = {"Origin": "https://unlisted-origin.example"}
+        handler.send_json = Mock()
+
+        with patch.object(service.RequestHandler, "send_header") as send_header, \
+                patch.object(service.http.server.BaseHTTPRequestHandler, "end_headers") as base_end_headers:
+            service.RequestHandler.end_headers(handler)
+
+        send_header.assert_called_once_with("Access-Control-Allow-Origin", "*")
+        base_end_headers.assert_called_once()
+        self.assertFalse(service.RequestHandler.reject_untrusted_origin(handler))
+        handler.send_json.assert_not_called()
+
+    def test_cors_preflight_still_requires_an_origin_header(self):
+        handler = object.__new__(service.RequestHandler)
+        handler.headers = {}
+        handler.send_json = Mock()
+
+        self.assertTrue(service.RequestHandler.reject_untrusted_origin(handler, require_origin=True))
+        handler.send_json.assert_called_once_with(
+            {"error": "Origin header is required for preflight"}, status=403,
+        )
+
     def test_mobile_ac4_profile_refreshes_with_mobile_client_before_stream_use(self):
         with TemporaryDirectory() as temp:
             session_file = Path(temp) / "tidal-session-oauth.json"
