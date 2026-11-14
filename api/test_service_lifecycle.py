@@ -1,6 +1,9 @@
 import json
+import io
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -10,6 +13,172 @@ import tidalapi
 
 
 class ServiceLifecycleTests(unittest.TestCase):
+    def test_tidal_watchdog_stops_when_its_owner_exits_even_if_another_tidal_process_exists(self):
+        server = Mock()
+        with patch.object(service, "_tidal_process_create_time", side_effect=[123.0, None]), \
+                patch.object(service.time, "sleep"), \
+                patch.object(service.psutil, "process_iter") as process_iter:
+            service.tidal_process_watchdog(Mock(), server, owner_pid=4567)
+
+        server.shutdown.assert_called_once_with()
+        process_iter.assert_not_called()
+
+    def test_tidal_watchdog_fails_closed_when_owner_cannot_be_verified(self):
+        server = Mock()
+        with patch.object(service, "_tidal_process_create_time", return_value=None), \
+                patch.object(service.time, "sleep"), \
+                patch("builtins.print"):
+            service.tidal_process_watchdog(Mock(), server, owner_pid=4567)
+        server.shutdown.assert_called_once_with()
+
+    def test_watchdog_shutdown_after_serving_loop_is_ready_does_not_deadlock(self):
+        server = service.ThreadedHTTPServer(("127.0.0.1", 0), service.RequestHandler)
+        serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        serve_thread.start()
+        try:
+            self.assertTrue(server.serve_ready.wait(timeout=2))
+            with patch.object(service, "_tidal_process_create_time", return_value=None), \
+                    patch("builtins.print"):
+                service.tidal_process_watchdog(Mock(), server, owner_pid=4567)
+            self.assertTrue(server.shutdown_requested.is_set())
+            serve_thread.join(timeout=2)
+            self.assertFalse(serve_thread.is_alive())
+        finally:
+            if serve_thread.is_alive():
+                server.shutdown()
+                serve_thread.join(timeout=2)
+            server.server_close()
+
+    def test_tidal_owner_pid_is_reported_by_health(self):
+        handler = object.__new__(service.RequestHandler)
+        handler.path = "/health"
+        handler.headers = {}
+        handler.reject_untrusted_origin = Mock(return_value=False)
+        handler.send_json = Mock()
+
+        with patch.object(service, "TIDAL_OWNER_PID", 4567):
+            service.RequestHandler.do_GET(handler)
+
+        payload = handler.send_json.call_args.args[0]
+        self.assertEqual(payload["tidalOwnerPid"], 4567)
+        self.assertNotIn("shutdownToken", payload)
+
+    def test_shutdown_requires_matching_secret_and_service_instance(self):
+        with patch.object(service, "SHUTDOWN_TOKEN", "a" * 64), \
+                patch.object(service, "SERVICE_INSTANCE_ID", "instance-1"):
+            self.assertFalse(service.shutdown_request_authorized({}))
+            self.assertFalse(service.shutdown_request_authorized({
+                "Authorization": "Bearer " + "b" * 64,
+                "X-Omniphony-Service-Instance": "instance-1",
+            }))
+            self.assertFalse(service.shutdown_request_authorized({
+                "Authorization": "Bearer " + "a" * 64,
+                "X-Omniphony-Service-Instance": "instance-2",
+            }))
+            self.assertTrue(service.shutdown_request_authorized({
+                "Authorization": "Bearer " + "a" * 64,
+                "X-Omniphony-Service-Instance": "instance-1",
+            }))
+
+    def test_shutdown_is_denied_when_no_launch_secret_was_configured(self):
+        with patch.object(service, "SHUTDOWN_TOKEN", ""):
+            self.assertFalse(service.shutdown_request_authorized({
+                "Authorization": "Bearer " + "a" * 64,
+                "X-Omniphony-Service-Instance": service.SERVICE_INSTANCE_ID,
+            }))
+
+    def test_shutdown_http_handler_rejects_unauthenticated_request_before_dispatch(self):
+        handler = object.__new__(service.RequestHandler)
+        handler.path = "/shutdown"
+        handler.headers = {"Origin": "https://arbitrary.example", "Content-Length": "0"}
+        handler.send_json = Mock()
+
+        service.RequestHandler._do_POST(handler)
+
+        handler.send_json.assert_called_once_with(
+            {"error": "service shutdown authorization failed"}, status=403,
+        )
+
+    def test_shutdown_http_handler_dispatches_only_the_authenticated_instance(self):
+        handler = object.__new__(service.RequestHandler)
+        handler.path = "/shutdown"
+        handler.headers = {
+            "Origin": "http://127.0.0.1:8765",
+            "Content-Length": "0",
+            "Authorization": "Bearer " + "a" * 64,
+            "X-Omniphony-Service-Instance": "instance-1",
+        }
+        handler.rfile = io.BytesIO()
+        handler.connection = Mock()
+        handler.server = Mock()
+        handler.send_json = Mock()
+
+        with patch.object(service, "SHUTDOWN_TOKEN", "a" * 64), \
+                patch.object(service, "SERVICE_INSTANCE_ID", "instance-1"), \
+                patch.object(service, "schedule_server_shutdown") as schedule:
+            service.RequestHandler._do_POST(handler)
+
+        handler.send_json.assert_called_once_with({"status": "shutting_down"})
+        schedule.assert_called_once_with(handler.server)
+
+    def test_shutdown_authentication_over_real_loopback_http(self):
+        token = "c" * 64
+        with patch.object(service, "SHUTDOWN_TOKEN", token), \
+                patch.object(service, "SERVICE_INSTANCE_ID", "loopback-instance"):
+            server = service.ThreadedHTTPServer(("127.0.0.1", 0), service.RequestHandler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                unauthorized = urllib.request.Request(
+                    base + "/shutdown", data=b"{}", method="POST",
+                    headers={"Origin": "https://untrusted.example", "Content-Type": "application/json"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as response:
+                    urllib.request.urlopen(unauthorized, timeout=2)
+                self.assertEqual(response.exception.code, 403)
+
+                with urllib.request.urlopen(base + "/health", timeout=2) as health:
+                    self.assertEqual(health.status, 200)
+
+                authorized = urllib.request.Request(
+                    base + "/shutdown", data=b"{}", method="POST",
+                    headers={
+                        "Origin": "http://127.0.0.1:8765",
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer " + token,
+                        "X-Omniphony-Service-Instance": "loopback-instance",
+                    },
+                )
+                with patch.object(service, "schedule_server_shutdown") as schedule:
+                    with urllib.request.urlopen(authorized, timeout=2) as accepted:
+                        self.assertEqual(accepted.status, 200)
+                        self.assertEqual(json.load(accepted), {"status": "shutting_down"})
+                    schedule.assert_called_once_with(server)
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
+    def test_shutdown_credentials_are_not_enabled_for_browser_cors(self):
+        handler = object.__new__(service.RequestHandler)
+        handler.headers = {
+            "Origin": "https://arbitrary.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization, x-omniphony-service-instance",
+        }
+        handler.send_response = Mock()
+        handler.send_header = Mock()
+        handler.end_headers = Mock()
+        handler.send_json = Mock()
+
+        service.RequestHandler.do_OPTIONS(handler)
+
+        handler.send_json.assert_called_once_with(
+            {"error": "preflight request is not allowed"}, status=403,
+        )
+        handler.send_response.assert_not_called()
+
     def test_cors_allows_any_origin_without_cookie_credentials(self):
         handler = object.__new__(service.RequestHandler)
         handler.headers = {"Origin": "https://unlisted-origin.example"}

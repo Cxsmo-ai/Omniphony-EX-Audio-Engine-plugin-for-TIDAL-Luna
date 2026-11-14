@@ -4,8 +4,8 @@
 
 <br />
 
-[![Plugin Version](https://img.shields.io/badge/Plugin-v2.1.44-00d2c4?style=for-the-badge&logo=tidal&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna)
-[![API Service](https://img.shields.io/badge/API_Service-v2.1.30-31d8ff?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases)
+[![Plugin Version](https://img.shields.io/badge/Plugin-v2.1.45-00d2c4?style=for-the-badge&logo=tidal&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna)
+[![API Service](https://img.shields.io/badge/API_Service-v2.1.31-31d8ff?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases)
 [![Dolby Atmos](https://img.shields.io/badge/Dolby_Atmos-AC--4_IMS_%7C_E--AC--3_JOC-f5c400?style=for-the-badge)](docs/ARCHITECTURE.md)
 [![Hi-Res Audio](https://img.shields.io/badge/FLAC-24--bit_%2F_192_kHz-00ff88?style=for-the-badge)](docs/ARCHITECTURE.md)
 [![Bundled API](https://img.shields.io/badge/API-Python%20%2B%20python--tidal-00ff88?style=for-the-badge)](docs/ARCHITECTURE.md)
@@ -181,6 +181,8 @@ The store installs one bundled TidaLuna module plus its package metadata. On fir
 For local development, run `pnpm install` and `pnpm run watch` from the repository. TidaLuna exposes the loopback DEV store on port `3000`; install the Omniphony EX entry from Plugin Store. The server binds only to `127.0.0.1`, serves the generated catalog and the plugin's `.json`/`.mjs` pair, and sends wildcard CORS headers—including on preflight and error responses—to support TidaLuna's webview.
 
 The plugin-managed API archive includes the embedded Python runtime, EbbLabs `python-tidal`, its dependencies, and the licensed AC-4 and Harletty support binaries. It does not contain account tokens. Plugin settings, TIDAL auth sessions, logs, cache, and downloads are written under the TIDAL user-data plugin directory in `data/` and survive plugin code updates.
+
+The API and its `mpv` child are tied to the exact TIDAL application process that launched them. A private, in-memory shutdown credential is kept in TidaLuna's native supervisor and is never sent to the renderer or returned by `/health`; normal TIDAL exit is detected by the API's owner watchdog. During an upgrade from a legacy service that has no owner identity, close all TIDAL windows and wait about 25 seconds for its old watchdog to stop the service before reopening TIDAL. The new plugin reports a clear legacy-owner error instead of terminating an unverifiable service.
 
 ### Step 2 — Select the two external engine paths
 In **TIDAL Settings → Plugins → Omniphony EX**, set:

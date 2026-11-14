@@ -10,6 +10,7 @@ import binascii
 import ctypes
 import datetime
 import hashlib
+import hmac
 import http.server
 import json
 import math
@@ -89,8 +90,17 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.30"
+SERVICE_VERSION = "2.1.31"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
+SHUTDOWN_TOKEN = os.environ.get("OMNIFUSION_SHUTDOWN_TOKEN", "")
+if not re.fullmatch(r"[a-f0-9]{64}", SHUTDOWN_TOKEN):
+    SHUTDOWN_TOKEN = ""
+TIDAL_OWNER_CREATE_TIME = None
+try:
+    _configured_tidal_pid = int(os.environ.get("OMNIFUSION_TIDAL_PID", ""))
+    TIDAL_OWNER_PID = _configured_tidal_pid if _configured_tidal_pid > 0 else None
+except (TypeError, ValueError):
+    TIDAL_OWNER_PID = None
 EOF_REWIND_TIMEOUT_SECONDS = 3.0
 
 
@@ -5977,6 +5987,12 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 "version": SERVICE_VERSION,
                 "serviceInstanceId": SERVICE_INSTANCE_ID,
                 "servicePid": os.getpid(),
+                "tidalOwnerPid": TIDAL_OWNER_PID,
+                "tidalOwnerCreateTime": TIDAL_OWNER_CREATE_TIME,
+                "tidalOwnerAlive": (
+                    _tidal_process_create_time(TIDAL_OWNER_PID) == TIDAL_OWNER_CREATE_TIME
+                    if TIDAL_OWNER_PID is not None else None
+                ),
                 "pluginRoot": str(PLUGIN_DIR),
                 "dataRoot": str(DATA_DIR),
                 "mpvDirectory": str(MPV_DIR),
@@ -6392,6 +6408,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         if self.reject_untrusted_origin(require_origin=True):
             return
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/shutdown":
+            if not shutdown_request_authorized(self.headers):
+                return self.send_json({"error": "service shutdown authorization failed"}, status=403)
         try:
             length = int(self.headers.get("Content-Length", 0))
             if length < 0 or length > 5000000:
@@ -7390,17 +7409,80 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def __init__(self, *args, **kwargs):
+        self.serve_ready = threading.Event()
+        self.shutdown_requested = threading.Event()
+        super().__init__(*args, **kwargs)
+
+    def service_actions(self):
+        # BaseServer calls this only from inside its active serve_forever loop.
+        self.serve_ready.set()
+
 
 def schedule_server_shutdown(server):
     """Request orderly HTTP shutdown without blocking a request worker."""
+    if hasattr(server, "shutdown_requested"):
+        server.shutdown_requested.set()
     worker = threading.Thread(target=server.shutdown, daemon=True)
     worker.start()
     return worker
 
 
-def tidal_process_watchdog(engine, server):
-    """Monitor TIDAL.exe; shut down mpv and exit when TIDAL is completely closed."""
+def shutdown_request_authorized(headers):
+    """Require a private per-launch credential and the exact service instance."""
+    authorization = headers.get("Authorization", "")
+    supplied_token = authorization[7:] if authorization.startswith("Bearer ") else ""
+    supplied_instance = headers.get("X-Omniphony-Service-Instance", "")
+    return bool(
+        SHUTDOWN_TOKEN
+        and hmac.compare_digest(supplied_token, SHUTDOWN_TOKEN)
+        and hmac.compare_digest(supplied_instance, SERVICE_INSTANCE_ID)
+    )
+
+
+def _tidal_process_create_time(pid):
+    """Return the start time for a live TIDAL.exe process, or None if it is gone."""
     import psutil
+
+    try:
+        process = psutil.Process(int(pid))
+        if process.name().casefold() != "tidal.exe":
+            return None
+        return process.create_time()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess, TypeError, ValueError):
+        return None
+    except psutil.AccessDenied:
+        print(f"[-] Cannot verify TIDAL owner PID {pid}; stopping the bound service rather than treating it as alive.")
+        return None
+
+
+def tidal_process_watchdog(engine, server, owner_pid=None):
+    """Stop the service when its owning TIDAL process exits; use a fallback for standalone launches."""
+    import psutil
+
+    owner_pid = owner_pid if owner_pid is not None else TIDAL_OWNER_PID
+    if owner_pid is not None:
+        owner_create_time = (
+            TIDAL_OWNER_CREATE_TIME
+            if owner_pid == TIDAL_OWNER_PID and TIDAL_OWNER_CREATE_TIME is not None
+            else _tidal_process_create_time(owner_pid)
+        )
+        if owner_create_time is None:
+            print("[*] TIDAL owner process is already gone. Shutting down OmniFusion service...")
+            if hasattr(server, "shutdown_requested"):
+                server.shutdown_requested.set()
+            server.shutdown()
+            return
+        while True:
+            time.sleep(0.5)
+            current_create_time = _tidal_process_create_time(owner_pid)
+            if current_create_time is None or current_create_time != owner_create_time:
+                print("[*] Owning TIDAL process exited. Stopping OmniFusion service and its owned mpv process...")
+                if hasattr(server, "shutdown_requested"):
+                    server.shutdown_requested.set()
+                server.shutdown()
+                return
+
     has_seen_tidal = False
     startup_time = time.monotonic()
     last_tidal_seen = time.monotonic()
@@ -7483,6 +7565,12 @@ def ensure_single_instance() -> bool:
     return True
 
 def run():
+    global TIDAL_OWNER_CREATE_TIME
+    if TIDAL_OWNER_PID is not None:
+        TIDAL_OWNER_CREATE_TIME = _tidal_process_create_time(TIDAL_OWNER_PID)
+        if TIDAL_OWNER_CREATE_TIME is None:
+            print("[-] Refusing to start: the configured TIDAL owner PID is not a verifiable live TIDAL process.")
+            sys.exit(1)
     if not ensure_single_instance():
         sys.exit(0)
 
@@ -7500,36 +7588,66 @@ def run():
         print(f"[-] Fatal: could not bind port {PORT}: {exc}")
         sys.exit(1)
 
-    print(f"[+] OmniFusion Standalone Audio Service listening on http://127.0.0.1:{PORT}")
-    threading.Thread(target=tidal_process_watchdog, args=(engine, server), daemon=True).start()
     settings = load_settings()
     save_settings(settings)
-    if MPV_EXE.is_file():
-        threading.Thread(
-            target=engine.ensure_mpv,
-            kwargs={"device": settings.get("audio_device", "auto")},
-            daemon=True,
-        ).start()
-    else:
-        print("[!] External MPV folder is not configured; set it in Omniphony EX settings.")
+    serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    serve_thread.start()
+    if not server.serve_ready.wait(timeout=5.0) or not serve_thread.is_alive():
+        print("[-] HTTP server did not enter its serving loop; refusing to start the lifecycle watchdog or mpv.")
+        server.server_close()
+        sys.exit(1)
+
+    print(f"[+] OmniFusion Standalone Audio Service listening on http://127.0.0.1:{PORT}")
+    threading.Thread(
+        target=tidal_process_watchdog,
+        args=(engine, server),
+        kwargs={"owner_pid": TIDAL_OWNER_PID},
+        daemon=True,
+    ).start()
     try:
-        server.serve_forever()
+        if MPV_EXE.is_file():
+            if (not server.shutdown_requested.is_set()
+                    and (TIDAL_OWNER_PID is None
+                         or _tidal_process_create_time(TIDAL_OWNER_PID) == TIDAL_OWNER_CREATE_TIME)):
+                try:
+                    engine.ensure_mpv(device=settings.get("audio_device", "auto"))
+                except Exception as exc:
+                    print(f"[-] Could not start the owned mpv engine: {type(exc).__name__}")
+        else:
+            print("[!] External MPV folder is not configured; set it in Omniphony EX settings.")
+        serve_thread.join()
     except KeyboardInterrupt:
-        pass
+        if not server.shutdown_requested.is_set():
+            server.shutdown_requested.set()
+            server.shutdown()
+        serve_thread.join(timeout=5.0)
     finally:
-        if engine.stream_proxy is not None:
-            engine.stream_proxy.close()
-            engine.stream_proxy = None
-        if engine.pipe:
-            engine.pipe.close()
-        if engine.proc and engine.proc.poll() is None:
-            try:
-                engine.proc.terminate()
-                engine.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                engine.proc.kill()
-                engine.proc.wait(timeout=3)
-        engine.stop_owned_omniphony_studio()
+        try:
+            if engine.stream_proxy is not None:
+                try:
+                    engine.stream_proxy.close()
+                except Exception as exc:
+                    print(f"[-] Could not close the owned stream proxy: {type(exc).__name__}")
+                engine.stream_proxy = None
+            if engine.pipe:
+                try:
+                    engine.pipe.close()
+                except Exception as exc:
+                    print(f"[-] Could not close the owned mpv pipe: {type(exc).__name__}")
+            if engine.proc and engine.proc.poll() is None:
+                try:
+                    engine.proc.terminate()
+                    engine.proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        engine.proc.kill()
+                        engine.proc.wait(timeout=3)
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        print(f"[-] Could not reap the owned mpv process: {type(exc).__name__}")
+                except OSError as exc:
+                    print(f"[-] Could not stop the owned mpv process: {type(exc).__name__}")
+        finally:
+            engine.stop_owned_omniphony_studio()
 
 if __name__ == "__main__":
     run()

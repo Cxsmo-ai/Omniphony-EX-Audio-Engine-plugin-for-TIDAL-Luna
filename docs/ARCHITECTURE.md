@@ -40,7 +40,7 @@ The loopback API responds with `Access-Control-Allow-Origin: *` for any browser 
 
 | Method & Path | Purpose |
 | :--- | :--- |
-| `GET /health` | Returns service version (`2.1.30`), plugin/data/MPV/Studio path identities, `serviceInstanceId`, active `mpvInstanceId`, and capability flags (`prepared-playback-v1`, `playback-clock-v1`). |
+| `GET /health` | Returns service version (`2.1.31`), the owning TIDAL PID and process creation time, whether that exact process is still alive, plugin/data/MPV/Studio path identities, `serviceInstanceId`, active `mpvInstanceId`, and capability flags (`prepared-playback-v1`, `playback-clock-v1`). It never returns the shutdown credential. |
 | `GET /clock` | Lightweight 50 ms position and pause-state sample with IPC timing brackets. |
 | `GET /status` | Full track, codec, bitrate, WASAPI output, and Omniphony Studio route telemetry. |
 | `GET /config` / `POST /config` | Reads or atomically updates `priority`, `realmax_source` (`auto`, `tidal_only`, `amazon_only`), and `eclipse_addons`. |
@@ -48,4 +48,6 @@ The loopback API responds with `Access-Control-Allow-Origin: *` for any browser 
 | `POST /play` | Resolves the requested track via `resolve_with_priority()`, initializes `TidalDashProxy`, validated MP4, or AC-4 raw-PCM transport, verifies WASAPI + Omniphony Studio routing, and loads the stream into `libmpv`. |
 | `POST /pause` / `POST /resume` / `POST /seek` | Generation-checked transport controls with settled seek verification. |
 | `POST /login/start` / `GET /login/status` | Initiates and polls EbbLabs `python-tidal` device link authorization. |
-| `POST /shutdown` | Gracefully terminates `libmpv` and exits the service when TIDAL Desktop closes. |
+| `POST /shutdown` | Gracefully terminates `libmpv` and exits the service. Requires the per-launch bearer secret and matching `X-Omniphony-Service-Instance` header; the credential is used only by the native supervisor and is not exposed to browser code. |
+
+The loopback service intentionally keeps wildcard origin support for the normal API, but CORS preflight does not allow the shutdown authorization headers. The plugin renderer does not request shutdown on unload; the API watchdog binds cleanup to the exact owner process. A new TIDAL process never adopts or shuts down a service owned by another live process. Legacy services with no owner identity are reported as unverifiable and must be allowed to exit through their existing lifecycle before the new service starts.

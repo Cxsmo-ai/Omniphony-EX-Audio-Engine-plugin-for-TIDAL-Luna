@@ -9,9 +9,9 @@ if not exist "%PYTHON%" (
 
 set "HEALTH="
 for /f "delims=" %%V in ('curl.exe --silent --fail --max-time 2 http://127.0.0.1:8765/health 2^>nul') do set "HEALTH=%%V"
-echo(%HEALTH%| findstr /C:"2.1.30" >nul 2>&1
+echo(%HEALTH%| findstr /C:"2.1.31" >nul 2>&1
 if not errorlevel 1 (
-    echo OmniFusion service 2.1.30 is already healthy on port 8765.
+    echo OmniFusion service 2.1.31 is already healthy on port 8765.
     exit /b 0
 )
 echo(%HEALTH%| findstr /C:"OmniFusion Standalone Audio Engine" >nul 2>&1
@@ -26,9 +26,9 @@ start "" /b "%PYTHON%" "%API_ROOT%\omnifusion_service.py"
 for /l %%I in (1,1,20) do (
     set "HEALTH="
     for /f "delims=" %%V in ('curl.exe --silent --fail --max-time 2 http://127.0.0.1:8765/health 2^>nul') do set "HEALTH=%%V"
-    echo(!HEALTH!| findstr /C:"2.1.30" >nul 2>&1
+    echo(!HEALTH!| findstr /C:"2.1.31" >nul 2>&1
     if not errorlevel 1 (
-        echo OmniFusion service 2.1.30 is healthy on port 8765.
+        echo OmniFusion service 2.1.31 is healthy on port 8765.
         exit /b 0
     )
     timeout /t 1 /nobreak >nul

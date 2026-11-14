@@ -16,9 +16,9 @@
  */
 
 const API_BASE = "http://127.0.0.1:8765";
-const REQUIRED_SERVICE_VERSION = "2.1.30";
+const REQUIRED_SERVICE_VERSION = "2.1.31";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.44";
+const PLUGIN_BUILD = "2.1.45";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -117,11 +117,21 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const fs = require("fs");
     const path = require("path");
     const http = require("http");
+    const crypto = require("crypto");
     const { spawn, spawnSync } = require("child_process");
     const app = require("electron").app;
     const stateKey = Symbol.for("omniphony-ex.native-service-supervisor");
+    const tidalOwnerPid = Number.isSafeInteger(Number(process.pid)) && Number(process.pid) > 0
+      ? Number(process.pid)
+      : null;
     const shared = globalThis[stateKey] ||
-      (globalThis[stateKey] = { startPromise: null, child: null });
+      (globalThis[stateKey] = {
+        startPromise: null,
+        child: null,
+        servicePid: null,
+        shutdownToken: null,
+        serviceInstanceId: null,
+      });
 
     if (!app || typeof app.getPath !== "function") {
       return { ready: false, reason: "electron_user_data_unavailable" };
@@ -130,11 +140,11 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.44");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.45");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.44/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "18AD0ECB58D20B0D7B8F351250D82600B0B8ED4F26CC9631287BCD775FE80101";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.45/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "2D7CEA7B33F878DBFACE1F59174053944788DDD9D98B90F5A0A5C1A3A1479EA7";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -206,7 +216,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.44"
+        return marker.pluginVersion === "2.1.45"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -275,7 +285,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.44", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.45", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -316,13 +326,17 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
       request.on("timeout", () => request.destroy(new Error("health request timed out")));
     });
 
-    const stopOwnedService = () => new Promise((resolve) => {
+    const stopOwnedService = (shutdownToken, serviceInstanceId) => new Promise((resolve) => {
       const request = http.request({
         hostname: "127.0.0.1", port: 8765, path: "/shutdown", method: "POST", timeout: 1500,
-        headers: { Origin: "http://127.0.0.1:8765" },
+        headers: {
+          Origin: "http://127.0.0.1:8765",
+          Authorization: "Bearer " + shutdownToken,
+          "X-Omniphony-Service-Instance": serviceInstanceId,
+        },
       }, (response) => {
         response.resume();
-        response.on("end", () => resolve(true));
+        response.on("end", () => resolve(response.statusCode === 200));
       });
       request.on("error", () => resolve(false));
       request.on("timeout", () => request.destroy(new Error("shutdown request timed out")));
@@ -336,6 +350,17 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
       }
       return false;
     };
+    const nativeSupervisorOwns = (health) => Boolean(
+      shared.child
+      && Number(shared.child.pid) === Number(health.servicePid)
+      && shared.child.exitCode === null
+      && shared.child.signalCode === null
+      && !shared.child.killed
+      && health.tidalOwnerAlive === true
+      && Number(shared.servicePid) === Number(health.servicePid)
+      && shared.shutdownToken
+      && shared.serviceInstanceId === health.serviceInstanceId
+    );
 
     if (shared.startPromise) return shared.startPromise;
     shared.startPromise = (async () => {
@@ -358,18 +383,43 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         }
         const settingsMatch = samePath(existing.mpvDirectory, mpvDir)
           && samePath(existing.studioExecutable, studioExe);
-        if (existing.version === requiredVersion && settingsMatch) {
+        const ownerMatches = tidalOwnerPid !== null
+          && Number(existing.tidalOwnerPid) === tidalOwnerPid;
+        const ownerAlive = existing.tidalOwnerAlive === true;
+        const nativeOwnsService = nativeSupervisorOwns(existing);
+        if (existing.version === requiredVersion && settingsMatch && ownerMatches && ownerAlive) {
+          if (!nativeOwnsService) {
+            return { ready: false, reason: "service_identity_unavailable", servicePid: existing.servicePid || null };
+          }
           return {
             ready: true,
             version: existing.version,
             alreadyRunning: true,
+            tidalOwnerPid: existing.tidalOwnerPid,
             mpvDirectory: existing.mpvDirectory,
             studioExecutable: existing.studioExecutable,
           };
         }
-        await stopOwnedService();
-        if (!(await waitUntilStopped())) {
-          return { ready: false, reason: "owned_service_would_not_stop", version: existing.version || null };
+        if (ownerMatches) {
+          if (!nativeOwnsService) {
+            return { ready: false, reason: "service_identity_unavailable", servicePid: existing.servicePid || null };
+          }
+          const stopped = await stopOwnedService(shared.shutdownToken, existing.serviceInstanceId);
+          if (!stopped || !(await waitUntilStopped())) {
+            return { ready: false, reason: "owned_service_would_not_stop", version: existing.version || null };
+          }
+          shared.servicePid = null;
+          shared.serviceInstanceId = null;
+          shared.shutdownToken = null;
+        } else if (existing.tidalOwnerPid !== null && existing.tidalOwnerPid !== undefined) {
+          if (existing.tidalOwnerAlive !== false) {
+            return { ready: false, reason: "service_owned_by_another_live_tidal", servicePid: existing.servicePid || null };
+          }
+          if (!(await waitUntilStopped())) {
+            return { ready: false, reason: "stale_service_did_not_exit", version: existing.version || null };
+          }
+        } else {
+          return { ready: false, reason: "legacy_service_owner_unverifiable", servicePid: existing.servicePid || null };
         }
       }
 
@@ -380,6 +430,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
 
       let spawnError = null;
       let child;
+      const shutdownToken = crypto.randomBytes(32).toString("hex");
       try {
         child = spawn(pythonExe, [serviceScript], {
           cwd: apiRoot,
@@ -390,6 +441,8 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
             ...process.env,
             OMNIFUSION_PLUGIN_DIR: pluginRoot,
             OMNIFUSION_DATA_DIR: dataRoot,
+            OMNIFUSION_TIDAL_PID: tidalOwnerPid === null ? "" : String(tidalOwnerPid),
+            OMNIFUSION_SHUTDOWN_TOKEN: shutdownToken,
             OMNIFUSION_MPV_DIR: mpvDir,
             OMNIFUSION_STUDIO_EXE: studioExe,
             OMNIFUSION_OXIDE_DIR: path.join(apiRoot, "oxideav"),
@@ -399,6 +452,9 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         child.once("error", (error) => { spawnError = error; });
         child.unref();
         shared.child = child;
+        shared.servicePid = null;
+        shared.shutdownToken = shutdownToken;
+        shared.serviceInstanceId = null;
       } catch (error) {
         return { ready: false, reason: "spawn_failed", message: String(error) };
       }
@@ -410,15 +466,26 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         await new Promise((resolve) => setTimeout(resolve, 500));
         const health = await readHealth();
         if (health?.status === "ok") {
-          if (health.version !== requiredVersion || !samePath(health.pluginRoot, pluginRoot)
+          if (!Number.isSafeInteger(Number(child.pid)) || Number(health.servicePid) !== Number(child.pid)) {
+            return { ready: false, reason: "spawned_service_identity_mismatch", servicePid: health.servicePid || null };
+          }
+          if (health.version !== requiredVersion || Number(health.tidalOwnerPid) !== tidalOwnerPid
+              || health.tidalOwnerAlive !== true
+              || !samePath(health.pluginRoot, pluginRoot)
               || !samePath(health.dataRoot, dataRoot) || !samePath(health.mpvDirectory, mpvDir)
               || !samePath(health.studioExecutable, studioExe)) {
             return { ready: false, reason: "incompatible_service", version: health.version || null };
           }
+          if (!health.serviceInstanceId) {
+            return { ready: false, reason: "service_instance_identity_missing" };
+          }
+          shared.servicePid = Number(health.servicePid);
+          shared.serviceInstanceId = health.serviceInstanceId;
           return {
             ready: true,
             version: health.version,
             alreadyRunning: false,
+            tidalOwnerPid: health.tidalOwnerPid,
             mpvDirectory: health.mpvDirectory,
             studioExecutable: health.studioExecutable,
           };
@@ -697,28 +764,9 @@ function onLoad() {
 unloads.add(() => {
   pluginDisposed = true;
   console.log("[Omniphony EX] Cleaning up plugin resources...");
-  // Pause background libmpv engine so audio stops when TIDAL closes or plugin unloads
-  try {
-    if (typeof navigator !== "undefined" && navigator.sendBeacon) {
-      const blob = new Blob([JSON.stringify({
-        trackId: currentStatusData?.trackId,
-        playbackGeneration: currentStatusData?.playbackGeneration,
-        requestId: currentStatusData?.requestId
-      })], { type: 'application/json' });
-      navigator.sendBeacon(`${API_BASE}/shutdown`, blob);
-    } else {
-      fetch(`${API_BASE}/shutdown`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          trackId: currentStatusData?.trackId,
-          playbackGeneration: currentStatusData?.playbackGeneration,
-          requestId: currentStatusData?.requestId
-        }),
-        keepalive: true
-      }).catch(() => {});
-    }
-  } catch (_) {}
+  // The Python service is owned by this TIDAL process and its watchdog shuts
+  // it down on application exit. Renderer unloads are not an authorization
+  // boundary and must never be allowed to terminate the native service.
   if (pollTimer) clearInterval(pollTimer);
   if (clockPollTimer) clearInterval(clockPollTimer);
   if (mediaInterceptTimer) clearInterval(mediaInterceptTimer);
