@@ -11,13 +11,40 @@ const source = readFileSync(sourcePath, "utf8");
 const manifestPath = resolve(dirname(sourcePath), "omniphony.json");
 const pluginManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
 const lunaManifest = JSON.parse(readFileSync(resolve(dirname(sourcePath), "manifest.json"), "utf8"));
-const sourceHash = createHash("sha256").update(readFileSync(sourcePath)).digest("hex").toUpperCase();
-assert.equal(pluginManifest.hash, sourceHash,
-  "plugin manifest hash matches the exact module bytes TidaLuna will verify");
-assert.equal(lunaManifest.hash, sourceHash,
-  "Luna store manifest hash matches the exact served module bytes");
 assert.equal(lunaManifest.version, pluginManifest.version,
-  "Luna store manifest version matches the plugin manifest version");
+  "repository manifest version matches the development plugin manifest version");
+
+const distPath = resolve(dirname(sourcePath), "dist");
+const store = JSON.parse(readFileSync(resolve(distPath, "store.json"), "utf8"));
+assert.ok(Array.isArray(store.plugins) && store.plugins.length > 0,
+  "built TidaLuna store catalog lists at least one plugin");
+const builtPluginEntries = store.plugins
+  .filter((name) => typeof name === "string" && name.endsWith(".mjs") && path.basename(name) === name)
+  .map((name) => {
+    const modulePath = resolve(distPath, name);
+    return {
+      name,
+      moduleBytes: readFileSync(modulePath),
+      package: JSON.parse(readFileSync(modulePath.replace(/\.mjs$/, ".json"), "utf8")),
+    };
+  });
+const builtPlugin = builtPluginEntries.find((entry) => entry.package.name === "Omniphony EX Audio Engine");
+assert.ok(builtPlugin, "built TidaLuna catalog includes the Omniphony EX module");
+const builtPackage = builtPlugin.package;
+const builtModuleBytes = builtPlugin.moduleBytes;
+const builtModuleSha256 = createHash("sha256").update(builtModuleBytes).digest("hex").toUpperCase();
+assert.equal(pluginManifest.hash, builtModuleSha256,
+  "development manifest SHA-256 matches the built module bytes");
+assert.equal(lunaManifest.hash, builtModuleSha256,
+  "repository manifest SHA-256 matches the built module bytes");
+assert.equal(builtPackage.name, "Omniphony EX Audio Engine",
+  "built module metadata identifies the expected Luna plugin");
+assert.equal(builtPackage.version, store.version,
+  "built plugin package version matches the TidaLuna store version");
+assert.ok(typeof builtPackage.hash === "string" && builtPackage.hash.length > 0,
+  "built Luna package contains the esbuild output hash");
+assert.ok(builtModuleBytes.length > 0,
+  "built Luna plugin module is nonempty");
 const requiredServiceVersion = source.match(/^const REQUIRED_SERVICE_VERSION = "([^"]+)";$/m)?.[1];
 assert.ok(requiredServiceVersion, "runtime declares a required service version");
 assert.ok(pluginManifest.main.includes(requiredServiceVersion),
