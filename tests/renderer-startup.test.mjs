@@ -5,15 +5,116 @@ import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(path.join(root, "..", "omniphony.mjs"), "utf8");
+const source = readFileSync(path.join(root, "..", "omniphony.mjs"), "utf8").replace(/\r\n/g, "\n");
 const startupCode = source.match(
   /function getConfiguredRuntimePaths\(\) \{[\s\S]*?(?=\nfunction onLoad\(\) \{)/,
 )?.[0];
 const nativeCode = source.match(
   /const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String\.raw`([\s\S]*?)`;/,
 )?.[1];
+const pollGateSource = source.match(
+  /function canPollLocalServiceStatus\(startupPending\) \{[\s\S]*?\n\}/,
+)?.[0];
+const syncLoopStart = source.indexOf("function startSyncLoop() {");
+const syncLoopEnd = source.indexOf(
+  "\n// ---------------------------------------------------------------------------\n// Native In-TIDAL UI Elements",
+  syncLoopStart,
+);
+const syncLoopSource = syncLoopStart >= 0 && syncLoopEnd > syncLoopStart
+  ? source.slice(syncLoopStart, syncLoopEnd).trimEnd()
+  : null;
+const onLoadSource = source.match(
+  /function onLoad\(\) \{[\s\S]*?(?=\nunloads\.add\()/,
+)?.[0];
 assert.ok(startupCode, "renderer startup reads and passes persisted runtime paths");
 assert.ok(nativeCode, "renderer startup uses the TidaLuna native supervisor");
+assert.ok(pollGateSource, "service status polling has an explicit startup gate");
+assert.ok(syncLoopSource, "the actual sync loop can be exercised in a controlled harness");
+assert.ok(onLoadSource, "the actual renderer startup lifecycle can be exercised");
+
+const pollGateSandbox = {};
+vm.createContext(pollGateSandbox);
+vm.runInContext(
+  `${pollGateSource}\nglobalThis.canPollLocalServiceStatus = canPollLocalServiceStatus;`,
+  pollGateSandbox,
+);
+assert.equal(
+  pollGateSandbox.canPollLocalServiceStatus(true),
+  false,
+  "status polling remains suppressed while native service startup is pending",
+);
+assert.equal(
+  pollGateSandbox.canPollLocalServiceStatus(false),
+  true,
+  "status polling resumes after service startup has settled",
+);
+
+{
+  let settleStartup;
+  const startupSandbox = {
+    pluginDisposed: true,
+    localServiceStartupPending: false,
+    PLUGIN_BUILD: "test",
+    console: { log() {}, error() {} },
+    ensureLocalOmniFusionService: () => new Promise((resolve) => { settleStartup = resolve; }),
+    tracePlaybackEvent() {},
+    window: {},
+    installRadiantLyricsFetchObserver: () => true,
+    interceptMediaElements() {},
+    installLyricsClickListener() {},
+    injectUI() {},
+    startSyncLoop() {},
+  };
+  vm.createContext(startupSandbox);
+  vm.runInContext(`${onLoadSource}\nglobalThis.onLoad = onLoad;`, startupSandbox);
+  startupSandbox.onLoad();
+  assert.equal(startupSandbox.localServiceStartupPending, true,
+    "onLoad closes the status poll gate before launching the native supervisor");
+  settleStartup(true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(startupSandbox.localServiceStartupPending, false,
+    "the gate reopens after successful native service startup");
+}
+
+{
+  const intervals = [];
+  const requests = [];
+  const warnings = [];
+  const syncSandbox = {
+    pollTimer: null,
+    clockPollTimer: null,
+    pluginDisposed: false,
+    localServiceStartupPending: true,
+    API_BASE: "http://127.0.0.1:8765",
+    SYNC_POLL_INTERVAL_MS: 100,
+    CLOCK_POLL_INTERVAL_MS: 50,
+    canPollLocalServiceStatus: (pending) => pending !== true,
+    setInterval(callback, delay) {
+      intervals.push({ callback, delay });
+      return intervals.length;
+    },
+    clearInterval() {},
+    installPlaybackObservers() {},
+    requestWithTimeout: async (...args) => {
+      requests.push(args);
+      throw new Error("connection refused");
+    },
+    invalidateEngineStatus() {},
+    localRequestFailureSummary: () => "connection refused",
+    console: { warn(...args) { warnings.push(args); }, debug() {}, info() {}, error() {} },
+  };
+  vm.createContext(syncSandbox);
+  vm.runInContext(`${syncLoopSource}\nglobalThis.startSyncLoop = startSyncLoop;`, syncSandbox);
+  syncSandbox.startSyncLoop();
+  await intervals[0].callback();
+  assert.equal(requests.length, 0, "pending startup sends no /status request and emits no fetch warning");
+  assert.equal(warnings.length, 0);
+
+  syncSandbox.localServiceStartupPending = false;
+  await intervals[0].callback();
+  assert.equal(requests.length, 1, "a settled startup resumes normal service health polling");
+  assert.equal(warnings.length, 1, "real post-start connection failures remain visible");
+}
 
 function makeHarness(result, { ipc = true, mpvDir = "", studioExe = "" } = {}) {
   const calls = [];

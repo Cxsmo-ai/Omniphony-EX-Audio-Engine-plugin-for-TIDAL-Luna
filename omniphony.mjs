@@ -18,7 +18,7 @@
 const API_BASE = "http://127.0.0.1:8765";
 const REQUIRED_SERVICE_VERSION = "2.1.33";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.49";
+const PLUGIN_BUILD = "2.1.50";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -153,11 +153,11 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.49");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.50");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.49/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "FC7EA6DA52B58EED525A01D3586C4E7DDDAE7963A97918BC31D5F89A768C6D17";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.50/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "06B0E08FF81D4A8CD352A6143F73AD9F054FED6EF220AA859C48A833526470EA";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -229,7 +229,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.49"
+        return marker.pluginVersion === "2.1.50"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -298,7 +298,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.49", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.50", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -626,6 +626,7 @@ let seekToEndPlaybackIdentity = null;
 let seekToEndTargetPosition = null;
 let seekToEndProgressObserved = false;
 let pluginDisposed = false;
+let localServiceStartupPending = false;
 let currentFormatLabel = "Omniphony EX";
 let currentStatusData = {};
 let settingsButtonTimer = null;
@@ -810,8 +811,11 @@ async function ensureLocalOmniFusionService() {
 function onLoad() {
   pluginDisposed = false;
   console.log(`[Omniphony EX] Initializing ultra-native TidaLuna audio bridge (${PLUGIN_BUILD})...`);
+  localServiceStartupPending = true;
   void ensureLocalOmniFusionService().catch((error) => {
     console.error("[Omniphony EX] Unexpected local service startup failure:", error);
+  }).finally(() => {
+    localServiceStartupPending = false;
   });
   tracePlaybackEvent("plugin-initialized");
   try {
@@ -4729,6 +4733,10 @@ function shouldSuppressStaleZeroSeek(currentPosition, status, trackId, now = Dat
     && !hasRecentTidalSeekIntent(trackId, currentPosition, now);
 }
 
+function canPollLocalServiceStatus(startupPending) {
+  return startupPending !== true;
+}
+
 function invalidateEngineStatus(message = "OmniFusion status unavailable") {
   clearNativeTimelineProjection();
   currentStatusData = {
@@ -4790,7 +4798,7 @@ function startSyncLoop() {
     });
   };
   const runSync = async () => {
-    if (syncBusy || pluginDisposed) return;
+    if (syncBusy || pluginDisposed || !canPollLocalServiceStatus(localServiceStartupPending)) return;
     syncBusy = true;
     try {
       const res = await requestWithTimeout(`${API_BASE}/status`, { cache: "no-store" }, 2500);
