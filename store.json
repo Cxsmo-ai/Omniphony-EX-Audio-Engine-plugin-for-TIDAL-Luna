@@ -3,7 +3,7 @@
   "description": "RealMAX playback for TIDAL and Eclipse Amazon Music with AC-4 IMS, E-AC-3 JOC routing, FLAC quality selection, and native transport controls.",
   "type": "module",
   "author": "Pickymarker",
-  "version": "2.1.48",
+  "version": "2.1.49",
   "plugins": [
     "omniphony.mjs"
   ]

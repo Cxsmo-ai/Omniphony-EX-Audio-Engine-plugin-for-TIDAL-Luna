@@ -29,6 +29,124 @@ class ProbeResponse:
 
 
 class PlaybackTransportTests(unittest.TestCase):
+    def test_immersive_formats_request_stereo_wasapi_output(self):
+        for fmt in ("AC4_IMS", "EAC3_JOC"):
+            with self.subTest(fmt=fmt):
+                calls = []
+
+                def command(args):
+                    calls.append(args)
+                    return {"error": "success"}
+
+                result = service.prepare_mpv_output_channel_mode(fmt, command)
+
+                self.assertEqual(result, "stereo")
+                self.assertIn(["set_property", "audio-channels", "stereo"], calls)
+
+    def test_non_immersive_format_keeps_automatic_channel_mode(self):
+        calls = []
+
+        def command(args):
+            calls.append(args)
+            return {"error": "success"}
+
+        result = service.prepare_mpv_output_channel_mode("HI_RES_LOSSLESS", command)
+
+        self.assertEqual(result, "auto")
+        self.assertIn(["set_property", "audio-channels", "auto"], calls)
+
+    def test_configured_immersive_profile_accepts_exact_stereo_output(self):
+        for fmt in ("AC4_IMS", "EAC3_JOC"):
+            with self.subTest(fmt=fmt):
+                calls = []
+
+                def command(args):
+                    calls.append(args)
+                    if args == ["get_property", "current-ao"]:
+                        return {"error": "success", "data": "wasapi"}
+                    if args == ["get_property", "audio-device"]:
+                        return {"error": "success", "data": "wasapi/test-device"}
+                    if args == ["get_property", "audio-out-params"]:
+                        return {
+                            "error": "success",
+                            "data": {"samplerate": 96000, "channel-count": 2},
+                        }
+                    return {"error": "success"}
+
+                result = service.configure_mpv_output_profile(
+                    engine=object(),
+                    fmt=fmt,
+                    input_params={"samplerate": 48000, "channel-count": 2},
+                    command=command,
+                    expected_device="wasapi/test-device",
+                )
+
+                self.assertEqual(result["outputChannels"], 2)
+                self.assertEqual(result["channelMode"], "stereo")
+                self.assertIn(["set_property", "audio-channels", "stereo"], calls)
+
+    def test_configured_immersive_profile_rejects_eight_channel_output(self):
+        for fmt in ("AC4_IMS", "EAC3_JOC"):
+            with self.subTest(fmt=fmt):
+                calls = []
+
+                def command(args):
+                    calls.append(args)
+                    if args == ["get_property", "current-ao"]:
+                        return {"error": "success", "data": "wasapi"}
+                    if args == ["get_property", "audio-device"]:
+                        return {"error": "success", "data": "wasapi/test-device"}
+                    if args == ["get_property", "audio-out-params"]:
+                        return {
+                            "error": "success",
+                            "data": {"samplerate": 96000, "channel-count": 8},
+                        }
+                    return {"error": "success"}
+
+                clock = iter((0.0, 0.001, 0.002, 0.003, 0.004, 0.02))
+                with patch.object(service.time, "monotonic", side_effect=lambda: next(clock)), \
+                        patch.object(service.time, "sleep", return_value=None):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        rf"WASAPI negotiated 8-channel output; {fmt} headphone playback requires two-channel stereo",
+                    ):
+                        service.configure_mpv_output_profile(
+                            engine=object(),
+                            fmt=fmt,
+                            input_params={"samplerate": 48000, "channel-count": 2},
+                            timeout=0.01,
+                            command=command,
+                            expected_device="wasapi/test-device",
+                        )
+
+                self.assertIn(["set_property", "audio-channels", "stereo"], calls)
+
+    def test_joc_profile_fails_closed_when_output_parameters_never_arrive(self):
+        def command(args):
+            if args == ["get_property", "current-ao"]:
+                return {"error": "success", "data": "wasapi"}
+            if args == ["get_property", "audio-device"]:
+                return {"error": "success", "data": "wasapi/test-device"}
+            if args == ["get_property", "audio-out-params"]:
+                return {"error": "success", "data": {}}
+            return {"error": "success"}
+
+        clock = iter((0.0, 0.001, 0.002, 0.003, 0.02))
+        with patch.object(service.time, "monotonic", side_effect=lambda: next(clock)), \
+                patch.object(service.time, "sleep", return_value=None):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "MPV did not report a valid audio API output format",
+            ):
+                service.configure_mpv_output_profile(
+                    engine=object(),
+                    fmt="EAC3_JOC",
+                    input_params={"samplerate": 48000, "channel-count": 2},
+                    timeout=0.01,
+                    command=command,
+                    expected_device="wasapi/test-device",
+                )
+
     def test_seek_proxy_counters_support_raw_ac4_pcm_without_dash_indexes(self):
         class RawPcmProxy:
             def __init__(self):

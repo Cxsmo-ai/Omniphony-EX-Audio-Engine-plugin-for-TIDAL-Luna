@@ -508,7 +508,7 @@ def prepare_mpv_audio_device(expected_device: str, command) -> str:
 
 def prepare_mpv_output_channel_mode(fmt: str, command) -> str:
     """Set per-format WASAPI and channel policy before loadfile."""
-    is_ac4_ims = fmt == "AC4_IMS"
+    requires_stereo_output = fmt in {"AC4_IMS", "EAC3_JOC"}
     exclusive_mode = "no"
     result = command(["set_property", "options/audio-exclusive", exclusive_mode])
     if not mpv_command_succeeded(result):
@@ -517,7 +517,7 @@ def prepare_mpv_output_channel_mode(fmt: str, command) -> str:
             f"{result.get('error')}"
         )
 
-    channel_mode = "stereo" if is_ac4_ims else "auto"
+    channel_mode = "stereo" if requires_stereo_output else "auto"
     result = command(["set_property", "audio-channels", channel_mode])
     if not mpv_command_succeeded(result):
         raise RuntimeError(f"MPV rejected output profile property audio-channels: {result.get('error')}")
@@ -618,7 +618,8 @@ def configure_mpv_output_profile(
         raise RuntimeError("AC-4 IMS must arrive from OxideAV as binaural stereo")
 
     is_ac4_ims = fmt == "AC4_IMS"
-    channel_mode = "stereo" if is_ac4_ims else "auto"
+    requires_stereo_output = fmt in {"AC4_IMS", "EAC3_JOC"}
+    channel_mode = "stereo" if requires_stereo_output else "auto"
     exclusive_mode = "no"
     send_command = command or engine.cmd
     if not channel_mode_preconfigured:
@@ -658,6 +659,7 @@ def configure_mpv_output_profile(
 
     deadline = time.monotonic() + timeout
     mono_output_seen = False
+    non_stereo_output_channels = None
     while time.monotonic() < deadline:
         result = send_command(["get_property", "audio-out-params"])
         output = result.get("data") if result and result.get("error") in (None, "success") else None
@@ -668,14 +670,12 @@ def configure_mpv_output_profile(
             except (TypeError, ValueError, OverflowError):
                 output_rate = output_channels = 0
             if 8000 <= output_rate <= 384000 and output_channels >= 1:
-                if fmt == "AC4_IMS" and output_channels < 2:
-                    mono_output_seen = True
+                if requires_stereo_output and output_channels != 2:
+                    non_stereo_output_channels = output_channels
+                    if fmt == "AC4_IMS" and output_channels < 2:
+                        mono_output_seen = True
                     time.sleep(0.05)
                     continue
-                # Validate the decoded AC-4 IMS stream as stereo above. The
-                # selected WASAPI endpoint may negotiate a different shared
-                # format (for example 96 kHz / 7.1), but must retain at least
-                # two channels so binaural separation is not collapsed.
                 return {
                     "inputSampleRate": sample_rate,
                     "inputChannels": input_channels,
@@ -690,9 +690,15 @@ def configure_mpv_output_profile(
     if fmt == "AC4_IMS":
         if mono_output_seen:
             raise RuntimeError(
-                "WASAPI negotiated mono output; AC-4 IMS requires at least "
-                "two output channels to preserve binaural separation"
+                "WASAPI negotiated mono output; AC-4 IMS headphone playback "
+                "requires two-channel stereo"
             )
+    if non_stereo_output_channels is not None:
+        raise RuntimeError(
+            f"WASAPI negotiated {non_stereo_output_channels}-channel output; "
+            f"{fmt} headphone playback requires two-channel stereo"
+        )
+    if fmt == "AC4_IMS":
         raise RuntimeError(
             "MPV did not report a valid WASAPI output format for AC-4 IMS "
             f"(decoded input {sample_rate} Hz, {input_channels} channels)"
