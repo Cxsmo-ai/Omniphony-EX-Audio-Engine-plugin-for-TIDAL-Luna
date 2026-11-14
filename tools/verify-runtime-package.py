@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the runtime archive layout, pin, licenses, and embedded imports."""
+"""Verify the runtime archive layout, licenses, imports, and optional exact digest."""
 
 from __future__ import annotations
 
@@ -30,14 +30,17 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--plugin-module", type=Path, required=True)
+    parser.add_argument(
+        "--expected-sha256",
+        help="Optionally require an exact digest when checking a specific published/downloaded archive.",
+    )
     args = parser.parse_args()
     archive_path = args.archive.resolve()
-    module_path = args.plugin_module.resolve()
-    archive_hash = hashlib.sha256(archive_path.read_bytes()).hexdigest().upper()
-    module = module_path.read_text(encoding="utf-8")
-    pinned = re.search(r'bundleSha256\s*=\s*"([A-Fa-f0-9]{64})"', module)
-    if not pinned or pinned.group(1).upper() != archive_hash:
-        raise SystemExit("runtime archive digest does not match the plugin's pinned SHA-256")
+    try:
+        archive_hash, pinned_hash = inspect_hashes(archive_path, args.plugin_module.resolve())
+        validate_expected_sha256(args.expected_sha256, archive_hash)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
     with tarfile.open(archive_path, "r:gz") as bundle:
         members = bundle.getmembers()
@@ -89,9 +92,33 @@ def main() -> int:
             print(result.stdout.strip())
 
     print(f"Runtime archive verified: {archive_path}")
-    print(f"SHA-256: {archive_hash}")
+    print(f"Built archive SHA-256: {archive_hash}")
+    print(f"Pinned download SHA-256: {pinned_hash}")
     print(f"Members: {len(names)}")
     return 0
+
+
+def inspect_hashes(archive_path: Path, module_path: Path) -> tuple[str, str]:
+    """Inspect the build digest and the independent published-download pin."""
+    archive_hash = hashlib.sha256(archive_path.read_bytes()).hexdigest().upper()
+    module = module_path.read_text(encoding="utf-8")
+    assignments = re.findall(r"\bbundleSha256\s*=\s*([^;\r\n]+)", module)
+    if len(assignments) != 1 or not re.fullmatch(
+        r'"[A-Fa-f0-9]{64}"', assignments[0].strip()
+    ):
+        raise ValueError("plugin module must contain exactly one valid bundleSha256 pin")
+    return archive_hash, assignments[0].strip()[1:-1].upper()
+
+
+def validate_expected_sha256(expected_sha256: str | None, archive_hash: str) -> None:
+    """Optionally enforce exact bytes when the caller is checking a specific asset."""
+    if expected_sha256 is None:
+        return
+    expected_hash = expected_sha256.strip().upper()
+    if not re.fullmatch(r"[A-F0-9]{64}", expected_hash):
+        raise ValueError("expected SHA-256 must contain exactly 64 hexadecimal characters")
+    if expected_hash != archive_hash:
+        raise ValueError("runtime archive digest does not match the expected SHA-256")
 
 
 if __name__ == "__main__":

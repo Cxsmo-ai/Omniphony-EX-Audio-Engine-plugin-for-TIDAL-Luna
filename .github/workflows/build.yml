@@ -51,6 +51,9 @@ jobs:
       - name: Test GitHub release asset naming
         run: python -m unittest tools.test_prepare_release
 
+      - name: Test runtime digest contracts
+        run: python -m unittest discover -s tests -p "test_runtime_package_verifier.py"
+
       - name: Run embedded API and downloader tests
         shell: pwsh
         run: |
