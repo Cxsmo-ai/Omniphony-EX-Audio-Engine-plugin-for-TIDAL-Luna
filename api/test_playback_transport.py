@@ -82,10 +82,12 @@ class PlaybackTransportTests(unittest.TestCase):
                 )
 
                 self.assertEqual(result["outputChannels"], 2)
+                self.assertEqual(result["programChannels"], 2)
+                self.assertEqual(result["audioApiChannels"], 2)
                 self.assertEqual(result["channelMode"], "stereo")
                 self.assertIn(["set_property", "audio-channels", "stereo"], calls)
 
-    def test_configured_immersive_profile_rejects_eight_channel_output(self):
+    def test_configured_immersive_profile_separates_stereo_program_from_eight_channel_api(self):
         for fmt in ("AC4_IMS", "EAC3_JOC"):
             with self.subTest(fmt=fmt):
                 calls = []
@@ -103,13 +105,39 @@ class PlaybackTransportTests(unittest.TestCase):
                         }
                     return {"error": "success"}
 
+                result = service.configure_mpv_output_profile(
+                    engine=object(),
+                    fmt=fmt,
+                    input_params={"samplerate": 48000, "channel-count": 2},
+                    timeout=0.01,
+                    command=command,
+                    expected_device="wasapi/test-device",
+                )
+
+                self.assertEqual(result["programChannels"], 2)
+                self.assertEqual(result["outputChannels"], 8)
+                self.assertEqual(result["audioApiChannels"], 8)
+                self.assertIn(["set_property", "audio-channels", "stereo"], calls)
+
+    def test_configured_immersive_profile_rejects_mono_audio_api_output(self):
+        for fmt in ("AC4_IMS", "EAC3_JOC"):
+            with self.subTest(fmt=fmt):
+                def command(args):
+                    if args == ["get_property", "current-ao"]:
+                        return {"error": "success", "data": "wasapi"}
+                    if args == ["get_property", "audio-device"]:
+                        return {"error": "success", "data": "wasapi/test-device"}
+                    if args == ["get_property", "audio-out-params"]:
+                        return {
+                            "error": "success",
+                            "data": {"samplerate": 96000, "channel-count": 1},
+                        }
+                    return {"error": "success"}
+
                 clock = iter((0.0, 0.001, 0.002, 0.003, 0.004, 0.02))
                 with patch.object(service.time, "monotonic", side_effect=lambda: next(clock)), \
                         patch.object(service.time, "sleep", return_value=None):
-                    with self.assertRaisesRegex(
-                        RuntimeError,
-                        rf"WASAPI negotiated 8-channel output; {fmt} headphone playback requires two-channel stereo",
-                    ):
+                    with self.assertRaisesRegex(RuntimeError, "negotiated mono output"):
                         service.configure_mpv_output_profile(
                             engine=object(),
                             fmt=fmt,
@@ -119,7 +147,26 @@ class PlaybackTransportTests(unittest.TestCase):
                             expected_device="wasapi/test-device",
                         )
 
-                self.assertIn(["set_property", "audio-channels", "stereo"], calls)
+    def test_joc_rejects_non_stereo_rendered_program_even_when_audio_api_is_stereo(self):
+        with self.assertRaisesRegex(RuntimeError, "two-channel rendered program"):
+            service.configure_mpv_output_profile(
+                engine=object(),
+                fmt="EAC3_JOC",
+                input_params={"samplerate": 48000, "channel-count": 6},
+                command=lambda args: {"error": "success"},
+                expected_device="wasapi/test-device",
+            )
+
+    def test_eight_channel_audio_api_does_not_bypass_unverified_joc_route(self):
+        route = {
+            "ready": False,
+            "checks": {
+                "headphoneBinauralConfigured": True,
+                "studioRendererConnected": False,
+                "processIdentity": False,
+            },
+        }
+        self.assertFalse(service.joc_route_is_verified(route, "orender"))
 
     def test_joc_profile_fails_closed_when_output_parameters_never_arrive(self):
         def command(args):

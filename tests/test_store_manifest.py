@@ -18,8 +18,8 @@ class SourceManifestTests(unittest.TestCase):
     def _write_manifests(self, root: Path, module: bytes, digest: str) -> None:
         (root / "omniphony.mjs").write_bytes(module)
         manifest = {
-            "main": "omniphony.mjs?version=2.1.50&service=2.1.33",
-            "version": "2.1.50",
+            "main": "omniphony.mjs?version=2.1.51&service=2.1.34",
+            "version": "2.1.51",
             "hash": digest,
         }
         for filename in ("manifest.json", "omniphony.json"):

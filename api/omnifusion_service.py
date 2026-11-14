@@ -105,7 +105,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.33"
+SERVICE_VERSION = "2.1.34"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 SHUTDOWN_TOKEN = os.environ.get("OMNIFUSION_SHUTDOWN_TOKEN", "")
 if not re.fullmatch(r"[a-f0-9]{64}", SHUTDOWN_TOKEN):
@@ -614,11 +614,13 @@ def configure_mpv_output_profile(
     if not 8000 <= sample_rate <= 192000 or input_channels < 1:
         raise RuntimeError("MPV reported an unsupported decoded audio profile")
 
-    if fmt == "AC4_IMS" and input_channels != 2:
-        raise RuntimeError("AC-4 IMS must arrive from OxideAV as binaural stereo")
-
-    is_ac4_ims = fmt == "AC4_IMS"
     requires_stereo_output = fmt in {"AC4_IMS", "EAC3_JOC"}
+    if requires_stereo_output and input_channels != 2:
+        raise RuntimeError(
+            f"{fmt} headphone playback requires a two-channel rendered program "
+            f"(MPV decoder reported {input_channels} channels)"
+        )
+
     channel_mode = "stereo" if requires_stereo_output else "auto"
     exclusive_mode = "no"
     send_command = command or engine.cmd
@@ -670,33 +672,39 @@ def configure_mpv_output_profile(
             except (TypeError, ValueError, OverflowError):
                 output_rate = output_channels = 0
             if 8000 <= output_rate <= 384000 and output_channels >= 1:
-                if requires_stereo_output and output_channels != 2:
+                # audio-params and audio-out-params describe different stages.
+                # Keep both visible; a wider audio-API layout is not itself
+                # proof that the renderer delivered stereo to the headphones.
+                # JOC still requires the downstream Studio/orender route.
+                if requires_stereo_output and output_channels < 2:
                     non_stereo_output_channels = output_channels
-                    if fmt == "AC4_IMS" and output_channels < 2:
+                    if output_channels == 1:
                         mono_output_seen = True
                     time.sleep(0.05)
                     continue
                 return {
                     "inputSampleRate": sample_rate,
                     "inputChannels": input_channels,
+                    "programSampleRate": sample_rate,
+                    "programChannels": input_channels,
                     "outputSampleRate": output_rate,
                     "outputChannels": output_channels,
+                    "audioApiSampleRate": output_rate,
+                    "audioApiChannels": output_channels,
                     "channelMode": channel_mode,
                     "exclusiveMode": exclusive_mode,
                     "outputConverted": output_rate != sample_rate or output_channels != input_channels,
                 }
         time.sleep(0.05)
 
-    if fmt == "AC4_IMS":
-        if mono_output_seen:
-            raise RuntimeError(
-                "WASAPI negotiated mono output; AC-4 IMS headphone playback "
-                "requires two-channel stereo"
-            )
+    if mono_output_seen:
+        raise RuntimeError(
+            f"WASAPI negotiated mono output; {fmt} headphone playback requires stereo"
+        )
     if non_stereo_output_channels is not None:
         raise RuntimeError(
             f"WASAPI negotiated {non_stereo_output_channels}-channel output; "
-            f"{fmt} headphone playback requires two-channel stereo"
+            f"{fmt} headphone playback requires at least two channels"
         )
     if fmt == "AC4_IMS":
         raise RuntimeError(

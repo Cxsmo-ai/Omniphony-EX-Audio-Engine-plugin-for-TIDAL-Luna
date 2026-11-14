@@ -16,9 +16,9 @@
  */
 
 const API_BASE = "http://127.0.0.1:8765";
-const REQUIRED_SERVICE_VERSION = "2.1.33";
+const REQUIRED_SERVICE_VERSION = "2.1.34";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.50";
+const PLUGIN_BUILD = "2.1.51";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -153,11 +153,11 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.50");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.51");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.50/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "06B0E08FF81D4A8CD352A6143F73AD9F054FED6EF220AA859C48A833526470EA";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.51/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "63732B0F13641CB18A5312CB584C7C13F47AEB47439AC11283546F2E6B0E09BA";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -229,7 +229,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.50"
+        return marker.pluginVersion === "2.1.51"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -298,7 +298,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.50", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.51", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -5930,7 +5930,12 @@ function getEngineOutputDetails(status) {
   if (decodedRate > 0) decodedParts.push(formatSampleRate(decodedRate));
   if (decodedChannels > 0) decodedParts.push(formatChannelCount(decodedChannels));
   if (decodedFormat) decodedParts.push(`PCM ${decodedFormat}`);
-  parts.push(`Decoded ${decodedParts.length ? decodedParts.join(" · ") : "unavailable"}`);
+  const programLabel = status?.format === "EAC3_JOC" && isVerifiedOmniphonyJocRoute(status)
+    ? "Binaural program"
+    : status?.format === "AC4_IMS" && status?.presentationVerified === true
+      ? "AC-4 IMS PCM program"
+      : "Decoded program";
+  parts.push(`${programLabel} ${decodedParts.length ? decodedParts.join(" · ") : "unavailable"}`);
 
   const outputParts = [];
   if (outputRate > 0) outputParts.push(formatSampleRate(outputRate));

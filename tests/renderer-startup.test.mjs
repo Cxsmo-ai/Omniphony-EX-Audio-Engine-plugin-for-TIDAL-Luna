@@ -125,7 +125,7 @@ function makeHarness(result, { ipc = true, mpvDir = "", studioExe = "" } = {}) {
   ]);
   const sandbox = {
     SERVICE_STARTUP_STATE_KEY: Symbol.for("omniphony-ex.service-startup-state"),
-    REQUIRED_SERVICE_VERSION: "2.1.33",
+    REQUIRED_SERVICE_VERSION: "2.1.34",
     NATIVE_SERVICE_SUPERVISOR_MODULE_ID: "OmniphonyEX/service-supervisor.native.js",
     NATIVE_SERVICE_SUPERVISOR_MODULE_CODE: nativeCode,
     localStorage: {
@@ -154,7 +154,7 @@ function makeHarness(result, { ipc = true, mpvDir = "", studioExe = "" } = {}) {
 {
   const result = {
     ready: true,
-    version: "2.1.33",
+    version: "2.1.34",
     mpvDirectory: "C:\\OmniFusion-Standalone\\mpv",
     studioExecutable: "C:\\OmniFusion\\studio\\omniphony-studio-egui.exe",
   };

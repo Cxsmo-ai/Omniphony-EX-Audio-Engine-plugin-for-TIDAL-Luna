@@ -35,7 +35,7 @@ function makeHarness({
   mpvDir,
   studioExe,
   createRuntimeFiles = true,
-  localServiceVersion = "2.1.33",
+  localServiceVersion = "2.1.34",
   verifiedBundle = false,
   processPid = 4321,
   browserPid = 4321,
@@ -93,12 +93,12 @@ function makeHarness({
       "harletty/v0.9.0/harletty_iamf_bridge.dll",
       "harletty/v0.9.0/LICENSE",
     ]) touch(path.join(bundledApiRoot, file));
-    fs.writeFileSync(path.join(bundledApiRoot, "omnifusion_service.py"), 'SERVICE_VERSION = "2.1.33"\n');
+    fs.writeFileSync(path.join(bundledApiRoot, "omnifusion_service.py"), 'SERVICE_VERSION = "2.1.34"\n');
     const bundleSha256 = moduleSource.match(/const bundleSha256 = "([A-F0-9]+)";/)?.[1];
     assert.ok(bundleSha256, "the runtime archive digest is pinned in the plugin");
     fs.writeFileSync(path.join(bundleRoot, "bundle-version.json"), JSON.stringify({
       pluginVersion,
-      serviceVersion: "2.1.33",
+      serviceVersion: "2.1.34",
       sha256: bundleSha256,
     }));
   }
@@ -200,7 +200,7 @@ function makeHarness({
   vm.runInContext(supervisorCode, sandbox, { filename: "service-supervisor.native.js" });
   const health = {
     status: "ok",
-    version: "2.1.33",
+    version: "2.1.34",
     servicePid: 5678,
     serviceInstanceId: "test-instance-1",
     tidalOwnerPid: browserPid ?? processPid,
@@ -225,7 +225,7 @@ function makeHarness({
       vm.runInContext('globalThis[Symbol.for("omniphony-ex.native-service-supervisor")].shutdownToken = null', sandbox);
     },
     cleanup: () => fs.rmSync(userData, { recursive: true, force: true }),
-    ensure: () => module.exports.ensureService("2.1.33", {}),
+    ensure: () => module.exports.ensureService("2.1.34", {}),
   };
 }
 
