@@ -354,10 +354,19 @@ class ServiceLifecycleTests(unittest.TestCase):
 
     def test_route_requires_embedded_renderer_and_rejects_standalone_renderer(self):
         self.assertTrue(service.omniphony_route_is_ready(
-            1, 1, True, True, True, standalone_renderer_absent=True,
+            1, 1, True, True, True,
+            sofa_file_container_verified=True,
+            standalone_renderer_absent=True,
         ))
         self.assertFalse(service.omniphony_route_is_ready(
-            1, 1, True, True, True, standalone_renderer_absent=False,
+            1, 1, True, True, True,
+            sofa_file_container_verified=True,
+            standalone_renderer_absent=False,
+        ))
+        self.assertFalse(service.omniphony_route_is_ready(
+            1, 1, True, True, True,
+            sofa_file_container_verified=False,
+            standalone_renderer_absent=True,
         ))
 
     def test_joc_route_start_tracks_and_closes_only_its_owned_studio(self):
@@ -738,7 +747,8 @@ class ServiceLifecycleTests(unittest.TestCase):
             self.skipTest("standalone root launcher is not part of this repository layout")
         source = launcher.read_text(encoding="utf-8")
         self.assertLess(source.index("/health"), source.index("prepare_portable_omniphony_config.py"))
-        self.assertIn(f'findstr /C:"{service.SERVICE_VERSION}"', source)
+        self.assertIn("check_service_health.py", source)
+        self.assertNotIn("findstr /C:", source)
 
     def test_packaged_launcher_waits_for_health_and_rejects_other_build(self):
         root = Path(service.__file__).resolve().parent.parent
@@ -750,8 +760,12 @@ class ServiceLifecycleTests(unittest.TestCase):
             self.skipTest("packaged API launcher is not present")
         source = launcher.read_text(encoding="utf-8")
         self.assertIn("for /l %%I in (1,1,20)", source)
-        self.assertIn(f'findstr /C:"{service.SERVICE_VERSION}"', source)
-        self.assertIn("different OmniFusion service build owns port 8765", source)
+        self.assertIn("check_service_health.py", source)
+        self.assertIn(f"--version {service.SERVICE_VERSION}", source)
+        self.assertIn("OMNIFUSION_TIDAL_PID", source)
+        self.assertIn("OMNIFUSION_PLUGIN_DIR", source)
+        self.assertIn('if not "!HEALTH_CHECK!"=="2"', source)
+        self.assertNotIn("findstr /C:", source)
         self.assertIn("if not defined OMNIFUSION_TIDAL_PID", source)
         self.assertIn("must be started by the Omniphony EX plugin inside TIDAL", source)
 

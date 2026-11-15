@@ -3042,6 +3042,18 @@ assert.equal(sandbox.getEngineOutputSummary({ audioParams: { samplerate: 48000, 
   "decoder parameters are never labeled as endpoint output parameters");
 assert.equal(sandbox.getEngineOutputSummary({ audioParams: {} }), "Output unavailable");
 assert.equal(sandbox.getEngineOutputSummary({ audioOutputParams: {} }), "Output unavailable");
+assert.equal(sandbox.getEngineOutputSummary({
+  decodedChannels: 2,
+  audioOutputProfile: { programChannels: 2, audioApiChannels: 8 },
+  audioOutputParams: { samplerate: 96000, "channel-count": 8 },
+}), "96 kHz · Stereo program → 8 ch API",
+"the diagnostics distinguish a stereo program from an eight-channel WASAPI API layout");
+assert.equal(sandbox.getEngineOutputSummary({
+  decodedChannels: 2,
+  audioOutputProfile: { programChannels: 2, audioApiChannels: 2 },
+  audioOutputParams: { samplerate: 48000, "channel-count": 2 },
+}), "48 kHz · Stereo",
+"matching program and API channel counts remain concise");
 const unknownSourceStatus = {
   format: "EAC3_JOC", audioCodec: "eac3", audioBitrate: 768000,
   audioParams: { samplerate: 48000, "channel-count": 2, format: "s16" },

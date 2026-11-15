@@ -16,9 +16,9 @@
  */
 
 const API_BASE = "http://127.0.0.1:8765";
-const REQUIRED_SERVICE_VERSION = "2.1.34";
+const REQUIRED_SERVICE_VERSION = "2.1.35";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.52";
+const PLUGIN_BUILD = "2.1.53";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -153,11 +153,11 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.52");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.53");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.52/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "63732B0F13641CB18A5312CB584C7C13F47AEB47439AC11283546F2E6B0E09BA";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.53/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "3689288FDC1E83D017F95322F63D8D11B6B34AF3987CB8A2D308B9EB5424C6A9";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -229,7 +229,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.52"
+        return marker.pluginVersion === "2.1.53"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -298,7 +298,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.52", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.53", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -5961,10 +5961,18 @@ function getEngineOutputSummary(status) {
   const params = status?.audioOutputParams;
   if (!params || typeof params !== "object" || Array.isArray(params)) return "Output unavailable";
   const sampleRate = getAudioParam(params, "samplerate", "sample-rate");
-  const channelCount = getAudioParam(params, "channel-count", "channelcount");
+  const apiChannels = getAudioParam(params, "channel-count", "channelcount");
+  const profileProgramChannels = Number(status?.audioOutputProfile?.programChannels);
+  const programChannels = Number.isInteger(profileProgramChannels) && profileProgramChannels > 0
+    ? profileProgramChannels
+    : getAudioParam({ value: status?.decodedChannels }, "value");
   const parts = [];
   if (sampleRate > 0) parts.push(formatSampleRate(sampleRate));
-  if (channelCount > 0) parts.push(formatChannelCount(channelCount));
+  if (apiChannels > 0 && programChannels > 0 && apiChannels !== programChannels) {
+    parts.push(`${formatChannelCount(programChannels)} program → ${formatChannelCount(apiChannels)} API`);
+  } else if (apiChannels > 0) {
+    parts.push(formatChannelCount(apiChannels));
+  }
   return parts.length ? parts.join(" · ") : "Output unavailable";
 }
 
