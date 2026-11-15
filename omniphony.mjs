@@ -18,7 +18,7 @@
 const API_BASE = "http://127.0.0.1:8765";
 const REQUIRED_SERVICE_VERSION = "2.1.37";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.56";
+const PLUGIN_BUILD = "2.1.57";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -1136,15 +1136,17 @@ function readNativeMediaClockDiagnostic({ resetCounts = false } = {}) {
     }
   }
 
-  let playStatePosition = null;
   let reduxPosition = null;
   let playState = null;
   try {
     playState = getTidalPlayState();
-    playStatePosition = parsePlaybackPosition(playState?.currentTime);
+    // PlayState.currentTime is a lazy TidaLuna getter that scans TIDAL's
+    // webpack modules for an `activePlayer` export. TIDAL 2.48 no longer
+    // exposes that shape, so reading it emits a core warning on startup.
+    // The supported Redux-backed playTime is the clock used by this adapter.
     reduxPosition = parsePlaybackPosition(playState?.playTime);
   } catch (_) {
-    // A TidaLuna getter can be unavailable during app/plugin startup.
+    // TidaLuna state can be unavailable during app/plugin startup.
   }
 
   const counts = nativeMediaClockObserver.counts
@@ -1162,7 +1164,7 @@ function readNativeMediaClockDiagnostic({ resetCounts = false } = {}) {
   const snapshot = {
     candidateCount: candidates.length,
     uniqueLoadedElement: Boolean(media),
-    playStateCurrentTime: playStatePosition,
+    playStateCurrentTime: null,
     reduxPlayTime: reduxPosition,
     playState: String(playState?.state ?? "").toUpperCase() || null,
     media: media ? {
@@ -1979,14 +1981,13 @@ function getMonotonicNow() {
 }
 
 function getTidalPosition(playState) {
-  // TIDAL currently exposes `currentTime` as a stale zero in some PlayState
-  // snapshots while `playTime` contains the advancing playback clock. Prefer
-  // the live clock and fall back only when it is absent or invalid.
-  for (const candidate of [playState?.playTime, playState?.currentTime]) {
-    const position = parsePlaybackPosition(candidate);
-    if (position !== null) return position;
+  // Use the Redux-backed public clock. PlayState.currentTime invokes a
+  // webpack-module selector that no longer matches TIDAL 2.48's active player.
+  try {
+    return parsePlaybackPosition(playState?.playTime);
+  } catch (_) {
+    return null;
   }
-  return null;
 }
 
 // Temporary, privacy-bounded trace for the startup position reset. Deliberately
@@ -2022,12 +2023,6 @@ function dispatchTidalAction(type, payload) {
     action(payload);
     if (type === "playbackControls/TIME_UPDATE") {
       const numericPosition = parsePlaybackPosition(payload);
-      const activePlayer = window.luna?.lib?.PlayState?.activePlayer;
-      if (numericPosition !== null && activePlayer && typeof activePlayer === "object") {
-        try {
-          activePlayer.currentTime = numericPosition;
-        } catch (_) {}
-      }
       nativeTimelineDispatchHistory.push({
         sequence: ++nativeTimelineDispatchSequence,
         position: numericPosition,

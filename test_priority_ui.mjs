@@ -1900,9 +1900,9 @@ vm.runInContext(`
 `, sandbox);
 
 assert.equal(sandbox.getTidalPosition({ currentTime: 0, playTime: 0.122 }), 0.122,
-  "the live playTime wins when TIDAL exposes a stale zero currentTime");
-assert.equal(sandbox.getTidalPosition({ currentTime: 12.5 }), 12.5,
-  "currentTime remains a fallback when playTime is unavailable");
+  "the Redux-backed playTime is used without consulting the legacy live-player clock");
+assert.equal(sandbox.getTidalPosition({ currentTime: 12.5 }), null,
+  "an unavailable Redux clock remains unavailable instead of invoking currentTime discovery");
 assert.equal(sandbox.localRequestFailureSummary("GET /config", { name: "AbortError" }),
   "GET /config: request timed out or was canceled");
 assert.equal(sandbox.localRequestFailureSummary("GET /devices", { name: "TypeError" }),
@@ -1911,8 +1911,8 @@ assert.equal(sandbox.localRequestFailureSummary("GET /status", { httpStatus: 503
   "GET /status: HTTP 503");
 assert.equal(sandbox.getTidalPosition({ currentTime: 0, playTime: 0 }), 0,
   "a genuine zero position is preserved");
-assert.equal(sandbox.getTidalPosition({ currentTime: 4, playTime: "invalid" }), 4,
-  "an invalid playTime falls back to a valid currentTime");
+assert.equal(sandbox.getTidalPosition({ currentTime: 4, playTime: "invalid" }), null,
+  "an invalid Redux clock stays unavailable; callers choose the engine clock explicitly");
 assert.equal(sandbox.shouldHoldEngineClockAfterTidalSeek(
   { trackId: 99, position: 104.71616, pending: true }, 99,
   { paused: true, timePos: 209.599826 }, 1000
@@ -3802,15 +3802,15 @@ Object.assign(diagnosticAudio, {
 });
 sandbox.mediaElements = [diagnosticAudio];
 sandbox.window.luna = { lib: { PlayState: {
-  currentTime: 32.124,
+  get currentTime() { throw new Error("legacy activePlayer getter must not be read"); },
   playTime: 32.123,
   state: "PAUSED",
 } } };
 const initialNativeClockDiagnostic = sandbox.readNativeMediaClockDiagnostic();
 assert.equal(initialNativeClockDiagnostic.uniqueLoadedElement, true,
   "passive native-clock diagnostics attach only to one uniquely loaded audio element");
-assert.equal(initialNativeClockDiagnostic.playStateCurrentTime, 32.124,
-  "diagnostics capture TidaLuna's active-player currentTime separately");
+assert.equal(initialNativeClockDiagnostic.playStateCurrentTime, null,
+  "diagnostics do not invoke TidaLuna's legacy active-player currentTime getter");
 assert.equal(initialNativeClockDiagnostic.reduxPlayTime, 32.123,
   "diagnostics capture TidaLuna's Redux playTime separately");
 assert.equal(initialNativeClockDiagnostic.media.currentTime, 32.125,
@@ -3981,11 +3981,8 @@ const timelineProjectionSandbox = {
   getCurrentTrackId: () => 42,
   getTidalPlayState() { return timelineProjectionSandbox.tidalPlayState; },
   getTidalPosition(playState) {
-    for (const candidate of [playState?.playTime, playState?.currentTime]) {
-      const parsed = Number(candidate);
-      if (Number.isFinite(parsed) && parsed >= 0) return parsed;
-    }
-    return null;
+    const parsed = Number(playState?.playTime);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
   },
   hasVisibleLayout: (element) => element.visible === true && element.isConnected !== false,
   dispatchTidalAction(action, value) {
