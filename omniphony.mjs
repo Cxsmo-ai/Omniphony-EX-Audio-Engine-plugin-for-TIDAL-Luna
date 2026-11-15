@@ -16,9 +16,9 @@
  */
 
 const API_BASE = "http://127.0.0.1:8765";
-const REQUIRED_SERVICE_VERSION = "2.1.36";
+const REQUIRED_SERVICE_VERSION = "2.1.37";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.55";
+const PLUGIN_BUILD = "2.1.56";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -153,11 +153,11 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.55");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.56");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.55/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "01CC20FFB71BFBB7C4B63FA7417045FBAD41B489570D3CE2F0F57DF667245825";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.56/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "2131BEE36E7A9F30D4B7D1652F9BCD02C08F1F737FEB32EA0654B05BE1B8BFCD";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -229,7 +229,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.55"
+        return marker.pluginVersion === "2.1.56"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -298,7 +298,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.55", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.56", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
