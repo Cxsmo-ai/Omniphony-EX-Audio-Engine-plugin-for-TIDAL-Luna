@@ -235,6 +235,32 @@ class StatusEndpointIntegrationTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=3)
 
+    def test_unready_route_preserves_unrelated_failure(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), service.RequestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        engine = self.FakeEngine("MPV audio output failed")
+        route = {"ready": False, "checks": {}}
+
+        try:
+            thread.start()
+            with patch.object(service, "engine", engine), \
+                    patch.object(service, "mpv_path_matches", return_value=True), \
+                    patch.object(service, "get_omniphony_route_status", return_value=route), \
+                    patch.object(service, "is_active_orender_decoder", return_value=False), \
+                    patch.object(service, "joc_route_is_verified", return_value=False), \
+                    patch.object(service, "refresh_invalidated_joc_route_telemetry"):
+                status = self.fetch_status(server)
+
+            self.assertFalse(status["omniphonyRoute"]["ready"])
+            self.assertEqual(status["lastFailure"], "MPV audio output failed")
+            self.assertEqual(status["label"], "Omniphony decoder not active")
+            self.assertEqual(status["playbackState"], "failed")
+            self.assertEqual(engine.command_calls, [["set_property", "pause", True]])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
 
 if __name__ == "__main__":
     unittest.main()

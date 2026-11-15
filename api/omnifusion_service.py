@@ -6567,7 +6567,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                                 playback_state = "failed"
                                 current_meta["playbackState"] = playback_state
                                 if pause_succeeded:
-                                    current_meta.pop("lastFailure", None)
+                                    if current_meta.get("lastFailure") == "Omniphony renderer disconnected":
+                                        current_meta.pop("lastFailure", None)
                                     current_meta["label"] = (
                                         "Omniphony decoder not active" if not decoder_confirmed
                                         else "Omniphony renderer disconnected"
