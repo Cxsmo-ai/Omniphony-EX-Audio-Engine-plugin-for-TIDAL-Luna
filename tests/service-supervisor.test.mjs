@@ -10,11 +10,15 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const moduleSource = fs.readFileSync(path.join(root, "..", "omniphony.mjs"), "utf8");
 const legacyBootstrapSource = fs.readFileSync(path.join(root, "..", "index.js"), "utf8");
 const pluginVersion = moduleSource.match(/^const PLUGIN_BUILD = "([^"]+)";$/m)?.[1];
+const runtimeBundleVersion = moduleSource.match(
+  /const bundledRuntimeRoot = path\.join\(pluginRoot, "runtime-bundles", "([^"]+)"\);/,
+)?.[1];
 const supervisorCode = moduleSource.match(
   /const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String\.raw`([\s\S]*?)`;/,
 )?.[1];
 assert.ok(supervisorCode, "the native service supervisor is embedded in the plugin entrypoint");
 assert.ok(pluginVersion, "the plugin build version is declared in the canonical entrypoint");
+assert.ok(runtimeBundleVersion, "the separately versioned API runtime bundle is declared in the supervisor");
 assert.match(legacyBootstrapSource, /^\/\/ Compatibility entrypoint:[\s\S]*export \* from ["']\.\/omniphony\.mjs["'];?\s*$/,
   "the alternate entrypoint delegates all startup and shutdown behavior to the canonical module");
 assert.doesNotMatch(legacyBootstrapSource, /spawn\(|child_process|ensureLocalServiceRunning|shutdown/,
@@ -79,7 +83,7 @@ function makeHarness({
     `SERVICE_VERSION = "${localServiceVersion}"\n`,
   );
   if (verifiedBundle) {
-    const bundleRoot = path.join(pluginRoot, "runtime-bundles", pluginVersion);
+    const bundleRoot = path.join(pluginRoot, "runtime-bundles", runtimeBundleVersion);
     const bundledApiRoot = path.join(bundleRoot, "api");
     for (const file of [
       "runtime/python.exe",
@@ -97,7 +101,7 @@ function makeHarness({
     const bundleSha256 = moduleSource.match(/const bundleSha256 = "([A-F0-9]+)";/)?.[1];
     assert.ok(bundleSha256, "the runtime archive digest is pinned in the plugin");
     fs.writeFileSync(path.join(bundleRoot, "bundle-version.json"), JSON.stringify({
-      pluginVersion,
+      pluginVersion: runtimeBundleVersion,
       serviceVersion: "2.1.36",
       sha256: bundleSha256,
     }));
@@ -406,7 +410,7 @@ function makeHarness({
     assert.equal(result.ready, true, "a matching verified bundle replaces stale local development API files");
     assert.equal(
       harness.spawned[0][1][0],
-      path.join(harness.health.pluginRoot, "runtime-bundles", pluginVersion, "api", "omnifusion_service.py"),
+      path.join(harness.health.pluginRoot, "runtime-bundles", runtimeBundleVersion, "api", "omnifusion_service.py"),
       "stale checked-out service code is never spawned over the required release bundle",
     );
   } finally {
