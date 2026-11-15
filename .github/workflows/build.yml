@@ -71,7 +71,12 @@ jobs:
           $archive = Join-Path $PWD 'dist/OmniphonyEX-API-win-x64.tar.gz'
           & 'api/runtime/python.exe' tools/package-runtime.py --output $archive
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/verify-runtime-package.py --archive $archive --plugin-module 'dist/Omniphony EX Audio Engine.mjs'
+          $module = Join-Path $PWD 'dist/Omniphony EX Audio Engine.mjs'
+          $moduleText = Get-Content -LiteralPath $module -Raw
+          $pin = [regex]::Match($moduleText, 'const bundleSha256 = "([A-Fa-f0-9]{64})";')
+          if (-not $pin.Success) { throw 'Built plugin module has no valid runtime bundle SHA-256 pin.' }
+          $expectedSha256 = $pin.Groups[1].Value
+          python tools/verify-runtime-package.py --archive $archive --plugin-module $module --expected-sha256 $expectedSha256
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tools/verify-luna-store.py --dist dist
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
