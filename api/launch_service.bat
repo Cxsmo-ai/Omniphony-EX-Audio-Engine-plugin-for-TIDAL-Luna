@@ -7,35 +7,49 @@ if not exist "%PYTHON%" (
     exit /b 3
 )
 
-set "HEALTH="
-for /f "delims=" %%V in ('curl.exe --silent --fail --max-time 2 http://127.0.0.1:8765/health 2^>nul') do set "HEALTH=%%V"
-echo(%HEALTH%| findstr /C:"2.1.34" >nul 2>&1
-if not errorlevel 1 (
-    echo OmniFusion service 2.1.34 is already healthy on port 8765.
-    exit /b 0
-)
-echo(%HEALTH%| findstr /C:"OmniFusion Standalone Audio Engine" >nul 2>&1
-if not errorlevel 1 (
-    echo A different OmniFusion service build owns port 8765: %HEALTH%
-    echo Close it normally, then run this launcher again.
-    exit /b 2
-)
-
 if not defined OMNIFUSION_TIDAL_PID (
     echo This API service must be started by the Omniphony EX plugin inside TIDAL.
     echo Open TIDAL and let the plugin create its verified service instance.
     exit /b 4
 )
+if not defined OMNIFUSION_PLUGIN_DIR (
+    echo The Omniphony EX plugin directory identity is unavailable.
+    echo Open TIDAL and let the plugin create its verified service instance.
+    exit /b 4
+)
+
+"%PYTHON%" "%API_ROOT%\check_service_health.py" --version 2.1.35 >nul 2>&1
+set "HEALTH_CHECK=!ERRORLEVEL!"
+if "!HEALTH_CHECK!"=="0" (
+    echo OmniFusion service 2.1.35 is already healthy on port 8765.
+    exit /b 0
+)
+if "!HEALTH_CHECK!"=="1" (
+    echo A service is responding on port 8765 but does not match this plugin's exact version and owner.
+    echo Close it normally, then run this launcher again.
+    exit /b 2
+)
+if not "!HEALTH_CHECK!"=="2" (
+    echo Service health verification failed unexpectedly; refusing to launch another process.
+    exit /b 5
+)
 
 cd /d "%API_ROOT%"
 start "" /b "%PYTHON%" "%API_ROOT%\omnifusion_service.py"
 for /l %%I in (1,1,20) do (
-    set "HEALTH="
-    for /f "delims=" %%V in ('curl.exe --silent --fail --max-time 2 http://127.0.0.1:8765/health 2^>nul') do set "HEALTH=%%V"
-    echo(!HEALTH!| findstr /C:"2.1.34" >nul 2>&1
-    if not errorlevel 1 (
-        echo OmniFusion service 2.1.34 is healthy on port 8765.
+    "%PYTHON%" "%API_ROOT%\check_service_health.py" --version 2.1.35 >nul 2>&1
+    set "HEALTH_CHECK=!ERRORLEVEL!"
+    if "!HEALTH_CHECK!"=="0" (
+        echo OmniFusion service 2.1.35 is healthy on port 8765.
         exit /b 0
+    )
+    if "!HEALTH_CHECK!"=="1" (
+        echo A service responded on port 8765 but failed exact version and owner verification.
+        exit /b 2
+    )
+    if not "!HEALTH_CHECK!"=="2" (
+        echo Service health verification failed unexpectedly.
+        exit /b 5
     )
     timeout /t 1 /nobreak >nul
 )

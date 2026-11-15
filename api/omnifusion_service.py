@@ -105,7 +105,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.34"
+SERVICE_VERSION = "2.1.35"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 SHUTDOWN_TOKEN = os.environ.get("OMNIFUSION_SHUTDOWN_TOKEN", "")
 if not re.fullmatch(r"[a-f0-9]{64}", SHUTDOWN_TOKEN):
@@ -898,6 +898,100 @@ def studio_config_has_binaural_output_mode(config_text: str) -> bool:
     return matching_values == ["binaural"]
 
 
+def studio_config_binaural_sofa_path(config_text: str, config_dir: Path) -> Path | None:
+    """Resolve the one configured SOFA path for the active binaural profile."""
+    if not isinstance(config_text, str) or not config_text:
+        return None
+    if not studio_config_has_binaural_output_mode(config_text):
+        return None
+
+    in_render = False
+    in_binaural = False
+    values = {"hrir_source": [], "hrtf_sofa_path": []}
+    for line in config_text.splitlines():
+        content = line.strip()
+        if not content or content.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            in_render = content == "render:"
+            in_binaural = False
+            continue
+        if not in_render:
+            continue
+        if indent == 2:
+            in_binaural = content == "binaural:"
+            continue
+        if not in_binaural or indent != 4 or ":" not in content:
+            continue
+        key, raw_value = content.split(":", 1)
+        key = key.strip()
+        if key not in values:
+            continue
+        value = raw_value.strip()
+        if value.startswith("'") and value.endswith("'"):
+            value = value[1:-1].replace("''", "'")
+        elif value.startswith('"') and value.endswith('"'):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                return None
+        else:
+            value = value.split("#", 1)[0].strip()
+        values[key].append(value)
+
+    if any(len(items) != 1 for items in values.values()):
+        return None
+    if values["hrir_source"][0].casefold() != "sofa":
+        return None
+    configured_path = values["hrtf_sofa_path"][0]
+    if not configured_path or "\x00" in configured_path:
+        return None
+
+    path = Path(os.path.expandvars(configured_path)).expanduser()
+    if not path.is_absolute():
+        path = config_dir / path
+    return path
+
+
+def has_sofa_container_signature(path: Path) -> bool:
+    """Check a readable .sofa HDF5/NetCDF container signature, not SOFA semantics."""
+    if not isinstance(path, Path) or path.suffix.casefold() != ".sofa":
+        return False
+    try:
+        if not path.is_file():
+            return False
+        file_size = path.stat().st_size
+        if file_size < 8:
+            return False
+        with path.open("rb") as sofa_file:
+            signature = sofa_file.read(8)
+            if signature[:4] in {b"CDF\x01", b"CDF\x02", b"CDF\x05"}:
+                return True
+            hdf5_signature = b"\x89HDF\r\n\x1a\n"
+            if signature == hdf5_signature:
+                return True
+            offset = 512
+            while offset + len(hdf5_signature) <= file_size:
+                sofa_file.seek(offset)
+                if sofa_file.read(len(hdf5_signature)) == hdf5_signature:
+                    return True
+                offset *= 2
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def studio_binaural_sofa_container_is_configured() -> bool:
+    """Verify the configured headphone SOFA path has a readable container."""
+    try:
+        config_text = STUDIO_CONFIG_FILE.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    path = studio_config_binaural_sofa_path(config_text, STUDIO_CONFIG_FILE.parent)
+    return path is not None and has_sofa_container_signature(path)
+
+
 _STUDIO_CONFIG_MODE_LOCK = threading.Lock()
 _STUDIO_CONFIG_MODE_CACHE: tuple[str, int, int, bool] | None = None
 
@@ -929,6 +1023,7 @@ def omniphony_route_is_ready(
     orender_module_loaded: bool,
     studio_renderer_connected: bool,
     binaural_output_configured: bool,
+    sofa_file_container_verified: bool = False,
     standalone_renderer_absent: bool = True,
 ) -> bool:
     """Require the embedded orender decoder and a live Studio↔MPV route.
@@ -943,6 +1038,7 @@ def omniphony_route_is_ready(
         and orender_module_loaded
         and studio_renderer_connected
         and binaural_output_configured
+        and sofa_file_container_verified
         and standalone_renderer_absent
     )
 
@@ -1192,11 +1288,14 @@ def get_omniphony_route_status(mpv_pid: int | None = None) -> dict:
         "studioRendererConnected": studio_renderer_connected,
         "processIdentity": process_identity_valid,
         "headphoneBinauralConfigured": studio_binaural_output_is_configured(),
+        "sofaFileContainerVerified": studio_binaural_sofa_container_is_configured(),
         "standaloneRendererAbsent": len(renderers) == 0,
     }
     ready = omniphony_route_is_ready(
         len(studios), len(mpvs), orender_module_loaded, studio_renderer_connected,
-        checks["headphoneBinauralConfigured"], checks["standaloneRendererAbsent"],
+        checks["headphoneBinauralConfigured"],
+        sofa_file_container_verified=checks["sofaFileContainerVerified"],
+        standalone_renderer_absent=checks["standaloneRendererAbsent"],
     ) and process_identity_valid
     return {
         "ready": ready,

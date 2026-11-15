@@ -35,7 +35,7 @@ function makeHarness({
   mpvDir,
   studioExe,
   createRuntimeFiles = true,
-  localServiceVersion = "2.1.34",
+  localServiceVersion = "2.1.35",
   verifiedBundle = false,
   processPid = 4321,
   browserPid = 4321,
@@ -93,12 +93,12 @@ function makeHarness({
       "harletty/v0.9.0/harletty_iamf_bridge.dll",
       "harletty/v0.9.0/LICENSE",
     ]) touch(path.join(bundledApiRoot, file));
-    fs.writeFileSync(path.join(bundledApiRoot, "omnifusion_service.py"), 'SERVICE_VERSION = "2.1.34"\n');
+    fs.writeFileSync(path.join(bundledApiRoot, "omnifusion_service.py"), 'SERVICE_VERSION = "2.1.35"\n');
     const bundleSha256 = moduleSource.match(/const bundleSha256 = "([A-F0-9]+)";/)?.[1];
     assert.ok(bundleSha256, "the runtime archive digest is pinned in the plugin");
     fs.writeFileSync(path.join(bundleRoot, "bundle-version.json"), JSON.stringify({
       pluginVersion,
-      serviceVersion: "2.1.34",
+      serviceVersion: "2.1.35",
       sha256: bundleSha256,
     }));
   }
@@ -200,7 +200,7 @@ function makeHarness({
   vm.runInContext(supervisorCode, sandbox, { filename: "service-supervisor.native.js" });
   const health = {
     status: "ok",
-    version: "2.1.34",
+    version: "2.1.35",
     servicePid: 5678,
     serviceInstanceId: "test-instance-1",
     tidalOwnerPid: browserPid ?? processPid,
@@ -225,7 +225,7 @@ function makeHarness({
       vm.runInContext('globalThis[Symbol.for("omniphony-ex.native-service-supervisor")].shutdownToken = null', sandbox);
     },
     cleanup: () => fs.rmSync(userData, { recursive: true, force: true }),
-    ensure: () => module.exports.ensureService("2.1.34", {}),
+    ensure: () => module.exports.ensureService("2.1.35", {}),
   };
 }
 
@@ -319,6 +319,22 @@ function makeHarness({
     assert.equal(result.reason, "service_identity_unavailable");
     assert.equal(harness.requests.length, 0, "a lost token cannot be replaced with a guessed or new credential");
     assert.equal(harness.spawned.length, 1, "the live same-owner service is not duplicated");
+  } finally {
+    harness.cleanup();
+  }
+}
+
+{
+  const harness = makeHarness({ healthResponses: [null] });
+  try {
+    assert.equal((await harness.ensure()).ready, true);
+    const oldService = { ...harness.health, version: "2.1.34" };
+    harness.setHealthResponses([oldService, null, harness.health]);
+    const result = await harness.ensure();
+    assert.equal(result.ready, true, "an older service build is replaced by the required build");
+    assert.equal(result.version, "2.1.35");
+    assert.equal(harness.requests.length, 1, "the old same-owner service receives one authenticated shutdown");
+    assert.equal(harness.spawned.length, 2, "the old service is never reused as the new build");
   } finally {
     harness.cleanup();
   }
