@@ -324,6 +324,95 @@ function extractFunction(name) {
   throw new Error(`unterminated function ${name}`);
 }
 
+const naturalEndMirrorEvents = [];
+const naturalEndMirrorSandbox = {
+  parsePlaybackPosition(value) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+  },
+  pendingExplicitPlayIntent: { trackId: "42", startedAt: 10 },
+  playIntentChangedAt: 10,
+  mirrorEnginePlaybackStateToTidal(status) {
+    naturalEndMirrorEvents.push(["transport", status]);
+  },
+  mirrorEngineClockToTidal(status, trackId, tidalPosition) {
+    naturalEndMirrorEvents.push(["clock", status, trackId, tidalPosition]);
+  },
+};
+vm.createContext(naturalEndMirrorSandbox);
+vm.runInContext(extractFunction("mirrorNaturalEndToTidal"), naturalEndMirrorSandbox);
+assert.equal(naturalEndMirrorSandbox.mirrorNaturalEndToTidal({
+  trackId: 42, playbackState: "playing", paused: false,
+  timePos: 180.4, duration: 180, engineClockAdvancing: true,
+}, 42, 179.9), true,
+"a matching natural-end sample is accepted for terminal clock mirroring");
+assert.equal(naturalEndMirrorEvents.length, 1,
+  "the ambiguous EOF observation updates the clock without prematurely changing transport");
+assert.equal(naturalEndMirrorEvents[0][1].timePos, 180,
+  "the TIDAL footer is clamped to the verified engine duration");
+assert.equal(naturalEndMirrorEvents[0][1].paused, true,
+  "the terminal clock snapshot is stationary");
+assert.equal(naturalEndMirrorSandbox.mirrorNaturalEndToTidal({
+  trackId: 42, playbackState: "paused", paused: true,
+  timePos: 180.4, duration: 180, engineClockAdvancing: false,
+}, 42, 180.4, true), true,
+"a stable natural-end confirmation mirrors the final transport state");
+assert.equal(naturalEndMirrorEvents.length, 3,
+  "confirmed EOF mirrors transport and then its terminal clock");
+assert.equal(naturalEndMirrorEvents[1][0], "transport");
+assert.equal(naturalEndMirrorEvents[1][1].playbackState, "paused");
+assert.equal(naturalEndMirrorSandbox.pendingExplicitPlayIntent, null,
+  "a stale Play handoff is cleared only when natural EOF is confirmed");
+assert.equal(naturalEndMirrorSandbox.playIntentChangedAt, 0,
+  "a stale explicit Play timestamp cannot keep the ended footer on Pause");
+assert.equal(naturalEndMirrorEvents[2][1].timePos, 180);
+assert.match(source,
+  /if \(atNaturalEnd\) \{[\s\S]*?mirrorNaturalEndToTidal\(status, mediaTrackId, tidal\.tidalPosition\);/,
+  "the sync loop mirrors terminal time while stable-EOF detection is pending");
+assert.match(source,
+  /if \(!autoAdvanceEnabled \|\| naturalEndIdentity === lastAutoAdvancedPlaybackIdentity\) \{\s*const handoffPending = naturalEndHandoff\?\.sourceTrackId === String\(mediaTrackId\);[\s\S]*?!handoffPending/,
+  "confirmed EOF reconciles transport only when an active queue handoff does not need its Play intent");
+assert.match(source,
+  /const handoffPending = naturalEndHandoff\?\.sourceTrackId === String\(mediaTrackId\);[\s\S]*?!handoffPending/,
+  "a pending queue transition is not interrupted by terminal transport mirroring");
+assert.match(source, /natural-end-next-rejected[\s\S]*?failureAction/,
+  "a rejected queue advance records its bounded recovery action");
+assert.match(source,
+  /const issuedHandoff = naturalEndHandoff;[\s\S]*?getNaturalEndAdvanceFailureAction\(\s*issuedHandoff,\s*naturalEndHandoff[\s\S]*?if \(failureAction === "stale"\)[\s\S]*?return;[\s\S]*?naturalEndHandoff = null/,
+  "a stale next() rejection cannot clear a newer queue handoff");
+assert.match(source, /MAX_NATURAL_END_ADVANCE_ATTEMPTS = 3/,
+  "natural-end queue retries have a fixed per-playback attempt budget");
+const naturalEndRetrySandbox = { MAX_NATURAL_END_ADVANCE_ATTEMPTS: 3 };
+vm.createContext(naturalEndRetrySandbox);
+vm.runInContext(extractFunction("getNaturalEndAdvanceFailureAction"), naturalEndRetrySandbox);
+const failedNaturalEndHandoff = { sourceTrackId: "42", sourceQueueIndex: 3 };
+assert.equal(naturalEndRetrySandbox.getNaturalEndAdvanceFailureAction(
+  failedNaturalEndHandoff, failedNaturalEndHandoff, "42", 3, 1, 2000, 1500,
+), "retry", "a failed next request can retry when source track/index are unchanged and cooldown elapsed");
+assert.equal(naturalEndRetrySandbox.getNaturalEndAdvanceFailureAction(
+  failedNaturalEndHandoff, failedNaturalEndHandoff, "42", 3, 1, 1200, 1500,
+), "cooldown", "queue retry waits through the configured cooldown");
+assert.equal(naturalEndRetrySandbox.getNaturalEndAdvanceFailureAction(
+  failedNaturalEndHandoff, failedNaturalEndHandoff, "42", 3, 3, 5000, 1500,
+), "exhausted", "repeated next failures stop after the per-identity attempt budget");
+assert.equal(naturalEndRetrySandbox.getNaturalEndAdvanceFailureAction(
+  failedNaturalEndHandoff, failedNaturalEndHandoff, "43", 3, 1, 2000, 1500,
+), "queue-moved", "a failed request cannot clear the handoff after TIDAL selects another track");
+assert.equal(naturalEndRetrySandbox.getNaturalEndAdvanceFailureAction(
+  failedNaturalEndHandoff, failedNaturalEndHandoff, "42", 4, 1, 2000, 1500,
+), "queue-moved", "a rejected request cannot skip twice after the queue index advanced");
+const unknownQueueHandoff = { sourceTrackId: "42", sourceQueueIndex: null };
+assert.equal(naturalEndRetrySandbox.getNaturalEndAdvanceFailureAction(
+  unknownQueueHandoff, unknownQueueHandoff, "42", 3, 1, 2000, 1500,
+), "unknown", "unknown queue position cannot authorize an automatic retry");
+assert.equal(naturalEndRetrySandbox.getNaturalEndAdvanceFailureAction(
+  null, null, "42", 3, 1, 2000, 1500,
+), "stale", "a missing handoff is treated as a stale failure callback");
+assert.equal(naturalEndRetrySandbox.getNaturalEndAdvanceFailureAction(
+  failedNaturalEndHandoff, { sourceTrackId: "newer-handoff", sourceQueueIndex: 4 },
+  "42", 3, 1, 2000, 1500,
+), "stale", "an outdated rejection cannot clear a different newer handoff");
+
 const pausedUiButton = {
   textContent: "",
   attributes: {},

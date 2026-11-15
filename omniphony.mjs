@@ -18,7 +18,7 @@
 const API_BASE = "http://127.0.0.1:8765";
 const REQUIRED_SERVICE_VERSION = "2.1.35";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.53";
+const PLUGIN_BUILD = "2.1.54";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -153,7 +153,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.53");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.54");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
     const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.53/OmniphonyEX-API-win-x64.tar.gz";
@@ -229,7 +229,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.53"
+        return marker.pluginVersion === "2.1.54"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -298,7 +298,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.53", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.54", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -610,6 +610,7 @@ let prepareNextSelectionPaused = false;
 let autoAdvanceEnabled = true;
 let lastAutoAdvancedPlaybackIdentity = null;
 let lastAutoAdvanceUnavailableIdentity = null;
+let naturalEndAdvanceRetryState = { playbackIdentity: null, attempts: 0, retryAfter: 0 };
 let pausedSelectionPending = null;
 let pausedSelectionConfirmedTrackId = null;
 let pausedSelectionUserPlayAuthorization = null;
@@ -2518,6 +2519,30 @@ function mirrorEngineStateToTidal(status, tidalTrackId, tidalPosition, suppressC
       || Number(status.trackId) !== Number(tidalTrackId)) return false;
   mirrorEnginePlaybackStateToTidal(status);
   if (!suppressClock) mirrorEngineClockToTidal(status, tidalTrackId, tidalPosition);
+  return true;
+}
+
+function mirrorNaturalEndToTidal(status, tidalTrackId, tidalPosition, mirrorTransport = false) {
+  const duration = parsePlaybackPosition(status?.duration);
+  if (!status || !Number.isSafeInteger(Number(tidalTrackId))
+      || Number(status.trackId) !== Number(tidalTrackId)
+      || duration === null || duration <= 0) return false;
+
+  const terminalStatus = {
+    ...status,
+    playbackState: "paused",
+    paused: true,
+    timePos: duration,
+    engineClockAdvancing: false,
+  };
+  if (mirrorTransport) {
+    // A Play gesture that arrived at the already-ended stream must not hold
+    // TIDAL's footer on Pause after the engine has confirmed natural EOF.
+    pendingExplicitPlayIntent = null;
+    playIntentChangedAt = 0;
+    mirrorEnginePlaybackStateToTidal(terminalStatus);
+  }
+  mirrorEngineClockToTidal(terminalStatus, tidalTrackId, tidalPosition);
   return true;
 }
 
@@ -4710,6 +4735,27 @@ function getNaturalEndHandoffAction(handoff, trackId, queueIndex, desiredPlaybac
   };
 }
 
+const MAX_NATURAL_END_ADVANCE_ATTEMPTS = 3;
+const NATURAL_END_ADVANCE_RETRY_DELAY_MS = 1500;
+
+function getNaturalEndAdvanceFailureAction(
+  issuedHandoff, currentHandoff, currentTrackId, currentQueueIndex, attempts, now, retryAfter,
+) {
+  if (!issuedHandoff || issuedHandoff !== currentHandoff) return "stale";
+  const handoff = issuedHandoff;
+  const sourceTrackCurrent = String(currentTrackId ?? "") === String(handoff.sourceTrackId ?? "");
+  const sourceQueueIndexKnown = Number.isSafeInteger(handoff.sourceQueueIndex);
+  const currentQueueIndexKnown = Number.isSafeInteger(currentQueueIndex);
+  if (sourceTrackCurrent && sourceQueueIndexKnown && currentQueueIndexKnown
+      && currentQueueIndex === handoff.sourceQueueIndex) {
+    if (attempts >= MAX_NATURAL_END_ADVANCE_ATTEMPTS) return "exhausted";
+    return now >= retryAfter ? "retry" : "cooldown";
+  }
+  if (!sourceTrackCurrent || (sourceQueueIndexKnown && currentQueueIndexKnown
+      && currentQueueIndex !== handoff.sourceQueueIndex)) return "queue-moved";
+  return "unknown";
+}
+
 function hasTidalClockDiscontinuity(
   previousSample, currentTrackId, currentPosition, elapsedSeconds, currentTidalIsPlaying
 ) {
@@ -5145,9 +5191,34 @@ function startSyncLoop() {
           }
         }
         if (naturalEndIdentity !== null) {
+          if (naturalEndAdvanceRetryState.playbackIdentity !== naturalEndIdentity) {
+            naturalEndAdvanceRetryState = {
+              playbackIdentity: naturalEndIdentity,
+              attempts: 0,
+              retryAfter: 0,
+            };
+          }
           // Never reconcile a completed engine back to /resume while TIDAL's
           // queue transition is pending (including when auto-advance is off).
           if (!autoAdvanceEnabled || naturalEndIdentity === lastAutoAdvancedPlaybackIdentity) {
+            const handoffPending = naturalEndHandoff?.sourceTrackId === String(mediaTrackId);
+            mirrorNaturalEndToTidal(
+              status, mediaTrackId, tidal.tidalPosition, !handoffPending,
+            );
+            return;
+          }
+          if (naturalEndAdvanceRetryState.attempts >= MAX_NATURAL_END_ADVANCE_ATTEMPTS) {
+            lastAutoAdvancedPlaybackIdentity = naturalEndIdentity;
+            tracePlaybackEvent("natural-end-next-retry-exhausted", {
+              trackId: mediaTrackId,
+              playbackGeneration: status.playbackGeneration,
+              attempts: naturalEndAdvanceRetryState.attempts,
+            });
+            mirrorNaturalEndToTidal(status, mediaTrackId, tidal.tidalPosition, true);
+            return;
+          }
+          if (Date.now() < naturalEndAdvanceRetryState.retryAfter) {
+            mirrorNaturalEndToTidal(status, mediaTrackId, tidal.tidalPosition);
             return;
           }
           const playState = window.luna?.lib?.PlayState;
@@ -5156,43 +5227,113 @@ function startSyncLoop() {
               console.warn("[Omniphony EX] Natural-end auto-advance waiting for TIDAL PlayState.next.");
               lastAutoAdvanceUnavailableIdentity = naturalEndIdentity;
             }
+            mirrorNaturalEndToTidal(status, mediaTrackId, tidal.tidalPosition, true);
             return;
           }
           lastAutoAdvanceUnavailableIdentity = null;
           lastAutoAdvancedPlaybackIdentity = naturalEndIdentity;
+          naturalEndAdvanceRetryState.attempts += 1;
           naturalEndObservation = null;
-          const sourceQueueIndex = Number(playState.playQueue?.currentIndex);
+          const rawSourceQueueIndex = playState.playQueue?.currentIndex;
+          const sourceQueueIndex = Number.isSafeInteger(rawSourceQueueIndex)
+            ? rawSourceQueueIndex : null;
           naturalEndHandoff = {
             sourceTrackId: String(mediaTrackId),
-            sourceQueueIndex: Number.isSafeInteger(sourceQueueIndex) ? sourceQueueIndex : null,
+            sourceQueueIndex,
             targetTrackId: null,
             targetQueueIndex: null,
             intentGranted: false,
             expiresAt: Date.now() + EXPLICIT_PLAY_HANDOFF_TIMEOUT_MS,
           };
+          const issuedHandoff = naturalEndHandoff;
           const remainingSec = Number(status.duration) - Number(status.timePos);
           console.info(`[Omniphony EX] Track ${mediaTrackId} reached natural end (remaining: ${remainingSec.toFixed(2)}s). Advancing TIDAL queue.`);
           try {
             const advanceResult = playState.next();
             if (advanceResult && typeof advanceResult.then === "function") {
               void Promise.resolve(advanceResult).catch((err) => {
-                naturalEndHandoff = null;
+                const failureAction = lastAutoAdvancedPlaybackIdentity === naturalEndIdentity
+                  ? getNaturalEndAdvanceFailureAction(
+                    issuedHandoff,
+                    naturalEndHandoff,
+                    getCurrentTrackId(),
+                    Number(playState.playQueue?.currentIndex),
+                    naturalEndAdvanceRetryState.attempts,
+                    Date.now(),
+                    naturalEndAdvanceRetryState.retryAfter,
+                  ) : "stale";
+                if (failureAction === "stale") {
+                  tracePlaybackEvent("natural-end-next-stale-rejection", {
+                    trackId: mediaTrackId,
+                    playbackGeneration: status.playbackGeneration,
+                  });
+                  return;
+                }
+                if (failureAction === "retry") {
+                  naturalEndHandoff = null;
+                  naturalEndAdvanceRetryState.retryAfter = Date.now()
+                    + NATURAL_END_ADVANCE_RETRY_DELAY_MS;
+                  lastAutoAdvancedPlaybackIdentity = null;
+                  naturalEndObservation = null;
+                } else if (failureAction === "exhausted") {
+                  naturalEndHandoff = null;
+                }
                 tracePlaybackEvent("natural-end-next-rejected", {
                   trackId: mediaTrackId,
                   playbackGeneration: status.playbackGeneration,
+                  failureAction,
+                  attempts: naturalEndAdvanceRetryState.attempts,
                   message: String(err?.message || err),
                 });
                 console.warn("[Omniphony EX] TIDAL queue advance rejected:", err);
               });
             }
           } catch (err) {
-            naturalEndHandoff = null;
+            const failureAction = lastAutoAdvancedPlaybackIdentity === naturalEndIdentity
+              ? getNaturalEndAdvanceFailureAction(
+                issuedHandoff,
+                naturalEndHandoff,
+                getCurrentTrackId(),
+                Number(playState.playQueue?.currentIndex),
+                naturalEndAdvanceRetryState.attempts,
+                Date.now(),
+                naturalEndAdvanceRetryState.retryAfter,
+              ) : "stale";
+            if (failureAction === "retry") {
+              naturalEndHandoff = null;
+              naturalEndAdvanceRetryState.retryAfter = Date.now()
+                + NATURAL_END_ADVANCE_RETRY_DELAY_MS;
+              lastAutoAdvancedPlaybackIdentity = null;
+              naturalEndObservation = null;
+            } else if (failureAction === "exhausted") {
+              naturalEndHandoff = null;
+            } else if (failureAction === "stale") {
+              tracePlaybackEvent("natural-end-next-stale-throw", {
+                trackId: mediaTrackId,
+                playbackGeneration: status.playbackGeneration,
+              });
+              return;
+            }
+            tracePlaybackEvent("natural-end-next-threw", {
+              trackId: mediaTrackId,
+              playbackGeneration: status.playbackGeneration,
+              failureAction,
+              attempts: naturalEndAdvanceRetryState.attempts,
+              message: String(err?.message || err),
+            });
             console.warn("[Omniphony EX] Error triggering next track on natural end:", err);
           }
           if (!pluginDisposed) scheduleImmediateSync();
           return;
         }
-        if (atNaturalEnd) return;
+        if (atNaturalEnd) {
+          // Keep the native footer and lyrics pinned to the engine's verified
+          // duration while stable-EOF detection decides whether to advance.
+          // Transport is mirrored only after that decision, preserving the
+          // user's queue/autoplay intent during the observation window.
+          mirrorNaturalEndToTidal(status, mediaTrackId, tidal.tidalPosition);
+          return;
+        }
         if (holdSeekClock && !lastTidalSeekIntent.holdLogged) {
           lastTidalSeekIntent.holdLogged = true;
           tracePlaybackEvent("seek-clock-reconciliation-hold", {
