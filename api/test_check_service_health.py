@@ -8,13 +8,13 @@ import check_service_health as checker
 class ServiceHealthIdentityTests(unittest.TestCase):
     def setUp(self):
         self.expected = {
-            "expected_version": "2.1.35",
+            "expected_version": "2.1.36",
             "expected_owner_pid": 1234,
             "expected_plugin_root": r"C:\Users\picky\AppData\Roaming\TIDAL\plugins\omniphony-tidal-luna-plugin",
         }
         self.health = {
             "status": "ok",
-            "version": "2.1.35",
+            "version": "2.1.36",
             "tidalOwnerPid": 1234,
             "tidalOwnerAlive": True,
             "pluginRoot": r"c:\users\picky\appdata\roaming\tidal\plugins\omniphony-tidal-luna-plugin",
@@ -24,7 +24,7 @@ class ServiceHealthIdentityTests(unittest.TestCase):
         self.assertTrue(checker.check_health(self.health, **self.expected))
 
     def test_rejects_substring_or_similarly_numbered_version(self):
-        for version in ("2.1.350", "2.1.35-old", "unrelated 2.1.35"):
+        for version in ("2.1.360", "2.1.36-old", "unrelated 2.1.36"):
             with self.subTest(version=version):
                 health = {**self.health, "version": version}
                 self.assertFalse(checker.check_health(health, **self.expected))

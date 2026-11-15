@@ -105,7 +105,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.35"
+SERVICE_VERSION = "2.1.36"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 SHUTDOWN_TOKEN = os.environ.get("OMNIFUSION_SHUTDOWN_TOKEN", "")
 if not re.fullmatch(r"[a-f0-9]{64}", SHUTDOWN_TOKEN):
@@ -1476,6 +1476,7 @@ class HeadlessAudioEngine:
         self.playback_lock = threading.Lock()
         self.playback_generation_lock = threading.RLock()
         self.seek_sequence = 0
+        self.pause_intent_revision = 0
         self.last_seek_diagnostic = None
         self.pending_generation = 0
         self.active_generation = 0
@@ -1562,6 +1563,7 @@ class HeadlessAudioEngine:
                 result = self.cmd(["set_property", "pause", True])
                 if not mpv_command_succeeded(result):
                     raise RuntimeError("could not pause the matching active request")
+                self.pause_intent_revision += 1
                 return "active-paused"
 
             self.cancelled_play_request_ids[request_id] = now
@@ -1647,7 +1649,8 @@ class HeadlessAudioEngine:
     def wait_for_seek_position(
         self, target, sequence, track_id, generation, request_id=None,
         timeout=SEEK_SETTLE_TIMEOUT_SECONDS, expected_paused=None,
-        diagnostic_samples=None,
+        diagnostic_samples=None, expected_pause_intent_revision=None,
+        recover_raw_ac4_pause=False,
     ):
         """Confirm a seek with consecutive MPV clock samples without holding playback locks."""
         started_at = time.monotonic()
@@ -1658,8 +1661,28 @@ class HeadlessAudioEngine:
         active_clock_anchor = target if expected_paused is False else None
         active_clock_anchor_at = started_at if expected_paused is False else None
         awaiting_post_seek_anchor = False
+        saw_seeking_during_request = False
+        restored_internal_pause = False
         in_tolerance = False
         expected_position = None
+
+        def pause_intent_changed():
+            if expected_pause_intent_revision is None:
+                return True
+            with self.playback_generation_lock:
+                return self.pause_intent_revision != expected_pause_intent_revision
+
+        def internal_seek_pause(pause_value, seeking_value=None):
+            return (
+                expected_paused is False
+                and pause_value is True
+                and (
+                    saw_seeking_during_request
+                    or seeking_value is True
+                )
+                and recover_raw_ac4_pause
+                and not pause_intent_changed()
+            )
 
         def record_sample(pause_value=None, seeking_value=None, failure=None):
             if diagnostic_samples is None:
@@ -1698,9 +1721,6 @@ class HeadlessAudioEngine:
                 if not isinstance(pause_value, bool):
                     record_sample(failure="pause-invalid")
                     return False, observed, "ipc-error"
-                if pause_value is not expected_paused:
-                    record_sample(pause_value=pause_value, failure="pause-changed")
-                    return False, observed, "pause-changed"
             result = self.cmd(["get_property", "time-pos"])
             if not mpv_command_succeeded(result):
                 record_sample(pause_value=pause_value, failure="time-pos-read-error")
@@ -1721,6 +1741,8 @@ class HeadlessAudioEngine:
             if not isinstance(seeking_value, bool):
                 record_sample(pause_value=pause_value, failure="seeking-invalid")
                 return False, observed, "ipc-error"
+            if seeking_value is True:
+                saw_seeking_during_request = True
             if not self.seek_is_current(sequence, track_id, generation, request_id):
                 record_sample(pause_value=pause_value, seeking_value=seeking_value, failure="superseded")
                 return False, observed, "superseded"
@@ -1733,9 +1755,45 @@ class HeadlessAudioEngine:
                 if not isinstance(pause_value, bool):
                     record_sample(seeking_value=seeking_value, failure="pause-invalid")
                     return False, observed, "ipc-error"
-                if pause_value is not expected_paused:
+                if pause_value is not expected_paused and not internal_seek_pause(
+                    pause_value, seeking_value
+                ):
                     record_sample(pause_value=pause_value, seeking_value=seeking_value, failure="pause-changed")
                     return False, observed, "pause-changed"
+            if (
+                expected_paused is False
+                and pause_value is True
+                and internal_seek_pause(pause_value, seeking_value)
+                and seeking_value is False
+            ):
+                # The raw-PCM demuxer can transiently pause MPV after its
+                # range-backed seek completes. Restore the pre-seek play
+                # state only when no authoritative TIDAL pause/resume command
+                # arrived while the seek was settling.
+                if restored_internal_pause:
+                    record_sample(pause_value=pause_value, seeking_value=seeking_value, failure="internal-pause-not-restored")
+                    return False, observed, "pause-changed"
+                if observed is not None and abs(observed - target) <= SEEK_POSITION_TOLERANCE_SECONDS:
+                    with self.playback_generation_lock:
+                        if not self.seek_is_current(sequence, track_id, generation, request_id):
+                            record_sample(pause_value=pause_value, seeking_value=seeking_value, failure="superseded")
+                            return False, observed, "superseded"
+                        if self.pause_intent_revision != expected_pause_intent_revision:
+                            record_sample(pause_value=pause_value, seeking_value=seeking_value, failure="pause-changed")
+                            return False, observed, "pause-changed"
+                        resume_result = self.cmd(["set_property", "pause", False])
+                        if not mpv_command_succeeded(resume_result):
+                            record_sample(pause_value=pause_value, seeking_value=seeking_value, failure="seek-resume-error")
+                            return False, observed, "ipc-error"
+                    restored_internal_pause = True
+                    active_clock_anchor = observed
+                    active_clock_anchor_at = time.monotonic()
+                    awaiting_post_seek_anchor = False
+                    consecutive = 0
+                    stable_since = None
+                    record_sample(pause_value=pause_value, seeking_value=seeking_value, failure="internal-pause-restored")
+                    time.sleep(0.05)
+                    continue
             settled = False
             now = time.monotonic()
             expected_position = target
@@ -7288,6 +7346,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     result = engine.cmd(["set_property", "pause", True])
                     if not mpv_command_succeeded(result):
                         return self.send_json({"error": f"mpv pause failed: {result.get('error') if result else 'no response'}"}, status=502)
+                    engine.pause_intent_revision += 1
             self.send_json({"status": "paused"})
 
         elif parsed.path == "/resume":
@@ -7372,6 +7431,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     )
                     if not mpv_command_succeeded(result):
                         return self.send_json({"error": f"mpv resume failed: {result.get('error') if result else 'no response'}"}, status=502)
+                    engine.pause_intent_revision += 1
                     if prepared:
                         engine.active_generation = generation
                         engine.prepared_generation = 0
@@ -7395,6 +7455,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             seek_samples = []
             proxy_requests_before = None
             proxy_indices_before = None
+            pause_intent_revision = None
+            recover_raw_ac4_pause = False
             with engine.playback_lock:
                 with engine.playback_generation_lock:
                     track_id = body.get("trackId")
@@ -7417,6 +7479,12 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                                 dispatch_error = "stale track command"
                                 dispatch_status = 409
                             else:
+                                pause_intent_revision = engine.pause_intent_revision
+                                recover_raw_ac4_pause = (
+                                    engine.current_meta.get("format") == "AC4_IMS"
+                                    and engine.current_meta.get("streamTransport")
+                                    == STREAM_TRANSPORT_OXIDEAV_RAW_S16LE
+                                )
                                 pre_seek_position_result = engine.cmd(["get_property", "time-pos"])
                                 pre_seek_state_result = engine.cmd(["get_property", "seeking"])
                                 proxy = getattr(engine, "stream_proxy", None)
@@ -7446,6 +7514,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 timeout=seek_timeout,
                 expected_paused=expected_paused,
                 diagnostic_samples=seek_samples,
+                expected_pause_intent_revision=pause_intent_revision,
+                recover_raw_ac4_pause=recover_raw_ac4_pause,
             )
             if settle_error == "superseded":
                 return self.send_json({
