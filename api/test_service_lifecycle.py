@@ -222,10 +222,23 @@ class ServiceLifecycleTests(unittest.TestCase):
                         "X-Omniphony-Service-Instance": "loopback-instance",
                     },
                 )
-                with patch.object(service, "schedule_server_shutdown") as schedule:
+                shutdown_scheduled = threading.Event()
+
+                def record_shutdown_scheduled(_server):
+                    shutdown_scheduled.set()
+
+                with patch.object(
+                    service,
+                    "schedule_server_shutdown",
+                    side_effect=record_shutdown_scheduled,
+                ) as schedule:
                     with urllib.request.urlopen(authorized, timeout=2) as accepted:
                         self.assertEqual(accepted.status, 200)
                         self.assertEqual(json.load(accepted), {"status": "shutting_down"})
+                    self.assertTrue(
+                        shutdown_scheduled.wait(timeout=2),
+                        "the authenticated handler did not schedule shutdown",
+                    )
                     schedule.assert_called_once_with(server)
             finally:
                 server.shutdown()
