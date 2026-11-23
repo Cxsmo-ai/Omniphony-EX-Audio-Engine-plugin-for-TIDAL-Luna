@@ -18,7 +18,7 @@
 const API_BASE = "http://127.0.0.1:8765";
 const REQUIRED_SERVICE_VERSION = "2.1.38";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.59";
+const PLUGIN_BUILD = "2.1.60";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -153,10 +153,10 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.59");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.60");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.59/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.60/OmniphonyEX-API-win-x64.tar.gz";
     const bundleSha256 = "5E5D71A3CBD4B9AA9B02118AC5E4A89EA7048F6FFC057DC7DF0BFBD93D69C131";
     const readPersistedRuntimePaths = () => {
       try {
@@ -229,7 +229,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.59"
+        return marker.pluginVersion === "2.1.60"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -298,7 +298,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.59", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.60", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -3154,14 +3154,13 @@ function applyNativeTimelinePosition(
     ? parsePlaybackPosition(slider.getAttribute?.("aria-valuenow")) : null;
   let nativeFillProjectionResult = null;
   if (isTidalDivSlider && engineDuration !== null && engineDuration > 0) {
-    const fillBasisPosition = customSliderAriaValueAfter ?? bounded;
     nativeFillProjectionResult = applyNativeProgressFillProjection(
-      slider, fillBasisPosition, engineDuration,
+      slider, bounded, engineDuration,
     );
     if (nativeFillProjectionResult.applied) {
       recordNativeTimelineDiagnostic("native-fill", {
         source: projectionSource,
-        basis: customSliderAriaValueAfter !== null ? "committed-aria" : "projected-engine",
+        basis: "projected-engine",
         ...nativeFillProjectionResult,
       }, frameTime);
     }
@@ -3262,16 +3261,16 @@ function observeNativeTimelineRange(footer) {
               || projectedEnginePosition === null
             ? null : (committedAriaValue - projectedEnginePosition) * 1000,
         }, now);
-        if (committedAriaValue !== null
+        if (projectedEnginePosition !== null
             && Number.isFinite(sample.duration)
             && sample.duration > 0) {
           const fillResult = applyNativeProgressFillProjection(
-            slider, committedAriaValue, sample.duration,
+            slider, projectedEnginePosition, sample.duration,
           );
           if (fillResult.applied) {
             recordNativeTimelineDiagnostic("native-fill", {
               source: "dom-commit",
-              basis: "committed-aria",
+              basis: "projected-engine",
               ...fillResult,
             }, now);
           }
@@ -3644,7 +3643,7 @@ function forwardTidalVolume(payload) {
   });
 }
 
-function getNativeTimelinePosition(eventTarget) {
+function getNativeTimelinePosition(eventTarget, pointerEvent = null) {
   const slider = eventTarget?.closest?.('input[type="range"], [role="slider"]')
     || (eventTarget?.matches?.('input[type="range"], [role="slider"]') ? eventTarget : null);
   const footer = getPlaybackFooter();
@@ -3656,6 +3655,24 @@ function getNativeTimelinePosition(eventTarget) {
     slider.id
   ].filter(Boolean).join(" ");
   if (!/progress|seek|timeline/i.test(label)) return null;
+  if (pointerEvent && Number.isFinite(Number(pointerEvent.clientX))) {
+    const bounds = slider.getBoundingClientRect?.();
+    const left = Number(bounds?.left);
+    const width = Number(bounds?.width);
+    const duration = parsePlaybackPosition(currentStatusData?.duration)
+      ?? parsePlaybackPosition(nativeTimelineProjection?.duration)
+      ?? parsePlaybackPosition(slider.getAttribute?.("aria-valuemax"));
+    if (Number.isFinite(left) && Number.isFinite(width) && width > 0
+        && duration !== null && duration > 0) {
+      let ratio = Math.min(1, Math.max(0, (Number(pointerEvent.clientX) - left) / width));
+      try {
+        if (String(window.getComputedStyle?.(slider)?.direction ?? "ltr").toLowerCase() === "rtl") {
+          ratio = 1 - ratio;
+        }
+      } catch (_) {}
+      return ratio * duration;
+    }
+  }
   const value = slider.value ?? slider.getAttribute?.("aria-valuenow");
   return parsePlaybackPosition(value);
 }
@@ -3727,27 +3744,33 @@ function installPlaybackObservers(onPlaybackChange, onSeek) {
   }
   if (typeof document?.addEventListener === "function" && typeof onSeek === "function") {
     let nativeTimelinePointerTarget = null;
-    const forwardNativeTimelineSeek = (target, source = "native-ui") => {
-      const position = getNativeTimelinePosition(target);
+    const forwardNativeTimelineSeek = (target, source = "native-ui", pointerEvent = null) => {
+      const position = getNativeTimelinePosition(target, pointerEvent);
       if (position === null) return;
       tracePlaybackEvent("native-timeline-seek", { requestedPosition: position, source });
       onSeek(position, source);
     };
-    const onNativeTimelineInput = (event) => forwardNativeTimelineSeek(event.target);
+    const onNativeTimelineInput = (event) => {
+      // Pointer drags are finalized from pointerup coordinates below. Do not
+      // forward intermediate React ARIA values, which may belong to a stale
+      // render and could produce a second, incorrect engine seek.
+      if (nativeTimelinePointerTarget) return;
+      forwardNativeTimelineSeek(event.target);
+    };
     const onNativeTimelinePointerDown = (event) => {
       if (getNativeTimelinePosition(event.target) !== null) {
         nativeTimelinePointerTarget = event.target;
       }
     };
     const onNativeTimelinePointerUp = (event) => {
-      const target = getNativeTimelinePosition(event.target) !== null
-        ? event.target : nativeTimelinePointerTarget;
+      const target = nativeTimelinePointerTarget
+        || (getNativeTimelinePosition(event.target, event) !== null ? event.target : null);
       nativeTimelinePointerTarget = null;
       if (!target) return;
-      // TIDAL's current custom range commits aria-valuenow on pointer release
-      // without reliably emitting input/change or Redux SEEK. Read it after
-      // React's pointer handlers commit, then forward the final target once.
-      queueMicrotask(() => forwardNativeTimelineSeek(target, "native-ui"));
+      // aria-valuenow can remain stale after TIDAL advances the Redux clock.
+      // Derive the final seek from the user's pointer coordinate and the
+      // confirmed playback duration instead of trusting that stale value.
+      queueMicrotask(() => forwardNativeTimelineSeek(target, "native-ui", event));
     };
     const onNativeTimelinePointerCancel = () => { nativeTimelinePointerTarget = null; };
     const onNativeTimelineKeyUp = (event) => {

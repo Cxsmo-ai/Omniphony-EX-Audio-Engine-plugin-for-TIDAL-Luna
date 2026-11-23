@@ -794,6 +794,7 @@ const observerTimelineSlider = {
   closest() { return this; },
   matches() { return true; },
   getAttribute() { return null; },
+  getBoundingClientRect() { return { left: 100, width: 400 }; },
 };
 const observerTimelineFooter = {
   contains(element) { return element === observerTimelineSlider; },
@@ -864,6 +865,7 @@ const observerSandbox = {
   unloads: observerCleanups,
 };
 vm.createContext(observerSandbox);
+observerSandbox.observerTimelineSlider = observerTimelineSlider;
 vm.runInContext(`
   const PLAY_INTENT_RECONCILIATION_WINDOW_MS = 1000;
   const EXPLICIT_PLAY_HANDOFF_TIMEOUT_MS = 15000;
@@ -923,10 +925,29 @@ vm.runInContext(`
   globalThis.getSentVolumeCommands = () => sentVolumeCommands;
   globalThis.installPlaybackObservers = installPlaybackObservers;
 `, observerSandbox);
+observerSandbox.setCurrentStatusData({ duration: 200 });
+observerSandbox.window.getComputedStyle = () => ({ direction: "ltr" });
+assert.equal(vm.runInContext(
+  "getNativeTimelinePosition(observerTimelineSlider, { clientX: 300 })",
+  observerSandbox,
+), 100, "native timeline pointer seeks use the pointer coordinate against the confirmed duration");
+assert.equal(vm.runInContext(
+  "getNativeTimelinePosition(observerTimelineSlider, { clientX: 500 })",
+  observerSandbox,
+), 200, "native timeline pointer seeks clamp at the confirmed duration despite stale ARIA state");
 observerSandbox.installPlaybackObservers(
   (...args) => observedTidalEvents.push(["playback-change", ...args]),
   (position, source) => observedTidalEvents.push(["seek", position, source]),
 );
+observerDocumentListeners.get("pointerdown")({ target: observerTimelineSlider, clientX: 150 });
+observerDocumentListeners.get("input")({ target: observerTimelineSlider });
+assert.equal(observedTidalEvents.some((event) => event[0] === "seek"), false,
+  "intermediate pointer-drag input does not forward stale slider ARIA values as engine seeks");
+observerDocumentListeners.get("pointerup")({ target: observerTimelineSlider, clientX: 300 });
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.deepEqual(observedTidalEvents.filter((event) => event[0] === "seek").at(-1),
+  ["seek", 100, "native-ui"],
+  "the pointer release forwards the coordinate-derived seek target exactly once");
 assert.equal(observerSandbox.desiredPlaybackIntent, false,
   "initial transport intent follows desiredState when actual state is stale");
 observerCallbacks.state("PAUSED");
@@ -1107,12 +1128,14 @@ observerDocumentListeners.get("input")({ target: observerTimelineSlider });
 assert.ok(observedTidalEvents.some((event) => Array.isArray(event)
   && event[0] === "seek" && event[1] === 33.5 && event[2] === "native-ui"),
 "TIDAL's progressBar id preserves seek provenance when Redux SEEK is bypassed");
+const nativeSeekCountBeforeVolume = observedTidalEvents.filter((event) => Array.isArray(event)
+  && event[0] === "seek" && event[2] === "native-ui").length;
 observerDocumentListeners.get("change")({ target: {
   ...observerTimelineSlider,
   getAttribute(name) { return name === "aria-label" ? "Volume" : null; },
 } });
 assert.equal(observedTidalEvents.filter((event) => Array.isArray(event)
-  && event[0] === "seek" && event[2] === "native-ui").length, 1,
+  && event[0] === "seek" && event[2] === "native-ui").length, nativeSeekCountBeforeVolume,
 "the volume slider is not mistaken for a native timeline seek");
 assert.equal(await observerSandbox.forwardTidalVolume({ volume: 35 }), true,
   "TIDAL's native volume control is forwarded to the matching engine track");
@@ -1299,7 +1322,8 @@ assert.equal(Object.getOwnPropertyDescriptor(MockPlayerController.prototype, "on
 playerController.onPlayerMessage({}, JSON.stringify({ command: "media.play" }));
 assert.equal(nativeGuardMainCalls.length, 2,
   "after final unload, native player dispatch is restored");
-assert.deepEqual(observedTidalEvents.slice(0, 2), [
+assert.deepEqual(observedTidalEvents.filter((event) => Array.isArray(event)
+  && event[0] === "playback-change").slice(0, 2), [
   ["playback-change", "PAUSED"],
   ["playback-change", { id: 42 }],
 ], "TidaLuna state, track-transition, and SEEK actions reach the immediate sync observers");
@@ -4959,6 +4983,22 @@ assert.ok(
   Math.abs(timelineProjectionSandbox.nativeTimelineDiagnosticWindow.lastNativeFillProjection.postCorrectionErrorMs) < 0.001,
   "post-correction duration-scale error converges under 1 microsecond",
 );
+
+// React may leave aria-valuenow stale while the engine/Redux clock is current.
+// The fill must continue to follow the confirmed engine projection on commits.
+fillSlider.setAttribute("aria-valuenow", "89.7193728");
+timelineProjectionSandbox.nativeTimelineProjection.sampledAt = 8000;
+timelineRangeObservers[0].trigger([{
+  type: "attributes",
+  attributeName: "aria-valuenow",
+  target: fillSlider,
+}]);
+const staleAriaExpectedTranslateX = Number((-1000 * (1 - 48.662 / 215.168)).toFixed(6));
+assert.equal(fillIndicator.style.transform,
+  `matrix(1, 0, 0, 1, ${staleAriaExpectedTranslateX}, 0)`,
+  "an aria-valuenow commit cannot pull the progress fill away from the current engine clock");
+assert.equal(timelineProjectionSandbox.nativeTimelineDiagnosticWindow.lastNativeFillProjection.basis,
+  "projected-engine", "DOM-commit fill diagnostics identify the authoritative engine basis");
 
 // Verify active scrubbing skips transform overwrite.
 fillSlider.activeState = true;
