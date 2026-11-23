@@ -3742,6 +3742,65 @@ assert.deepEqual(JSON.parse(JSON.stringify(failedSeekDiagnostic.seekDiagnostic))
 }, "the trace keeps only numeric and boolean seek diagnostics");
 assert.equal(JSON.stringify(failedSeekDiagnostic).includes("must-not-be-logged"), false,
   "seek diagnostics cannot leak unrelated response fields");
+
+const staleJocResumeTraceEvents = [];
+const staleJocReprepareCalls = [];
+const staleJocResumeSandbox = {
+  API_BASE: "http://127.0.0.1:8765",
+  pluginDisposed: false,
+  currentStatusData: {
+    trackId: 97874148,
+    format: "EAC3_JOC",
+    playbackGeneration: 12,
+    requestId: "stale-joc-request",
+    playbackState: "paused",
+    paused: true,
+    timePos: 53.521545,
+    title: "Bad Liar",
+    artist: "Imagine Dragons",
+  },
+  desiredPlaybackIntent: true,
+  enginePlayPending: null,
+  enginePlayPendingTrackId: null,
+  enginePlayAllowPaused: false,
+  pausedSelectionPending: null,
+  pausedSelectionConfirmedTrackId: null,
+  staleJocResumeRecovery: null,
+  tracePlaybackEvent: (event, detail) => staleJocResumeTraceEvents.push({ event, ...detail }),
+  requestWithTimeout: async () => ({
+    ok: false,
+    status: 409,
+    json: async () => ({ error: "stale track command" }),
+  }),
+  getCurrentTrackId: () => 97874148,
+  getTidalPlaybackSnapshot: () => ({
+    trackId: "97874148", title: "Bad Liar", artist: "Imagine Dragons", playing: true,
+  }),
+  getCurrentTrackMeta: () => ({ title: "Bad Liar", artist: "Imagine Dragons" }),
+  setTidalPlaybackIntent: (playing) => { staleJocResumeSandbox.desiredPlaybackIntent = playing; },
+  parsePlaybackPosition: (value) => Number.isFinite(Number(value)) ? Number(value) : null,
+  triggerEnginePlay: (trackId, position, meta) => {
+    staleJocReprepareCalls.push({ trackId, position, meta });
+    return Promise.resolve(true);
+  },
+  console: { warn() {} },
+};
+vm.createContext(staleJocResumeSandbox);
+vm.runInContext(extractFunction("recoverStaleJocResume"), staleJocResumeSandbox);
+vm.runInContext(extractFunction("sendEngineCommandDirect"), staleJocResumeSandbox);
+assert.equal(await staleJocResumeSandbox.sendEngineCommandDirect("resume", {
+  trackId: 97874148,
+  playbackGeneration: 12,
+  requestId: "stale-joc-request",
+}), false, "a stale JOC /resume remains rejected by the service");
+await Promise.resolve();
+assert.equal(staleJocReprepareCalls.length, 1,
+  "stale JOC resume triggers exactly one fresh prioritized play request");
+assert.equal(staleJocReprepareCalls[0].position, 53.521545,
+  "fresh JOC preparation preserves the paused engine position");
+assert.ok(staleJocResumeTraceEvents.some((event) => event.event === "stale-joc-resume-reprepared"),
+  "the fresh-stream recovery is traceable");
+
 playbackRequests.length = 0;
 sandbox.currentTrackId = 1;
 const obsoletePlay = sandbox.triggerEnginePlay(1, 0, {});

@@ -18,7 +18,7 @@
 const API_BASE = "http://127.0.0.1:8765";
 const REQUIRED_SERVICE_VERSION = "2.1.38";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.58";
+const PLUGIN_BUILD = "2.1.59";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -153,10 +153,10 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.58");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.59");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.58/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.59/OmniphonyEX-API-win-x64.tar.gz";
     const bundleSha256 = "5E5D71A3CBD4B9AA9B02118AC5E4A89EA7048F6FFC057DC7DF0BFBD93D69C131";
     const readPersistedRuntimePaths = () => {
       try {
@@ -229,7 +229,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.58"
+        return marker.pluginVersion === "2.1.59"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -298,7 +298,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.58", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.59", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -592,6 +592,7 @@ let enginePlayRequestId = null;
 let enginePlayRequestTrackId = null;
 let enginePlayAllowPaused = false;
 let lastPlayAttempt = { trackId: null, at: 0 };
+let staleJocResumeRecovery = null;
 let lastMirroredPlaybackState = null;
 let clockOrderingInstanceId = null;
 let clockOrderingMpvInstanceId = null;
@@ -4515,10 +4516,11 @@ async function sendEngineCommandDirect(endpoint, body = {}) {
     }, 3500);
     if (!res.ok) {
       let seekDiagnostic = null;
+      let responsePayload = null;
       if (endpoint === "seek") {
         try {
-          const payload = await res.json();
-          const raw = payload?.seekDiagnostic;
+          responsePayload = await res.json();
+          const raw = responsePayload?.seekDiagnostic;
           if (raw && typeof raw === "object") {
             const finiteOrNull = (value) => (
               typeof value === "number" && Number.isFinite(value) ? value : null
@@ -4555,13 +4557,23 @@ async function sendEngineCommandDirect(endpoint, body = {}) {
             };
           }
         } catch (error) {}
+      } else if (endpoint === "resume") {
+        try {
+          responsePayload = await res.json();
+        } catch (error) {}
       }
       if (traceable) tracePlaybackEvent("engine-command-rejected", {
         endpoint,
         httpStatus: res.status,
+        ...(endpoint === "resume" && typeof responsePayload?.error === "string"
+          ? { error: responsePayload.error.slice(0, 120) } : {}),
         ...(seekDiagnostic ? { seekDiagnostic } : {})
       });
       console.warn(`[Omniphony EX] Engine ${endpoint} returned HTTP ${res.status}`);
+      if (endpoint === "resume" && res.status === 409
+          && responsePayload?.error === "stale track command") {
+        recoverStaleJocResume(body);
+      }
       return false;
     }
     if (traceable) tracePlaybackEvent("engine-command-accepted", { endpoint, httpStatus: res.status });
@@ -4571,6 +4583,72 @@ async function sendEngineCommandDirect(endpoint, body = {}) {
     console.warn(`[Omniphony EX] Engine ${endpoint} request failed:`, e);
     return false;
   }
+}
+
+function recoverStaleJocResume(body = {}) {
+  const status = currentStatusData || {};
+  const trackId = String(body.trackId ?? "");
+  const generation = Number(body.playbackGeneration);
+  if (!trackId
+      || !Number.isSafeInteger(Number(trackId))
+      || Number(trackId) <= 0
+      || !Number.isSafeInteger(generation)
+      || generation <= 0
+      || typeof body.requestId !== "string"
+      || !body.requestId
+      || String(status.trackId ?? "") !== trackId
+      || Number(status.playbackGeneration) !== generation
+      || status.requestId !== body.requestId
+      || status.format !== "EAC3_JOC"
+      || status.paused !== true
+      || desiredPlaybackIntent !== true
+      || String(getCurrentTrackId() ?? "") !== trackId
+      || pausedSelectionPending
+      || pausedSelectionConfirmedTrackId != null
+      || enginePlayAllowPaused === true) {
+    tracePlaybackEvent("stale-joc-resume-recovery-skipped", {
+      trackId: trackId || null,
+      reason: "track-state-or-user-intent-no-longer-matches",
+    });
+    return false;
+  }
+
+  const recoveryKey = `${trackId}:${generation}:${body.requestId}`;
+  if (enginePlayPending && enginePlayPendingTrackId === trackId) return true;
+  if (staleJocResumeRecovery?.key === recoveryKey
+      && Date.now() - staleJocResumeRecovery.at < 5000) return true;
+
+  const snapshot = getTidalPlaybackSnapshot();
+  const position = parsePlaybackPosition(status.timePos) ?? 0;
+  const meta = getCurrentTrackMeta();
+  staleJocResumeRecovery = { key: recoveryKey, at: Date.now() };
+  // Route loss invalidates the old MPV/orender stream. Re-resolve this same
+  // selected track and position through the normal priority path; /play keeps
+  // it paused until TIDAL still confirms Play and JOC route checks pass.
+  setTidalPlaybackIntent(true);
+  tracePlaybackEvent("stale-joc-resume-reprepared", {
+    trackId,
+    generation,
+    requestedPosition: position,
+    title: snapshot?.title || meta?.title || "",
+  });
+  void triggerEnginePlay(trackId, position, {
+    ...meta,
+    title: snapshot?.title || meta?.title || status.title || "",
+    artist: snapshot?.artist || meta?.artist || status.artist || "",
+  }).then((started) => {
+    tracePlaybackEvent("stale-joc-resume-reprepare-result", {
+      trackId,
+      started: started === true,
+    });
+  }).catch((error) => {
+    tracePlaybackEvent("stale-joc-resume-reprepare-failed", {
+      trackId,
+      errorName: error?.name || "Error",
+    });
+    console.warn("[Omniphony EX] JOC resume recovery failed:", error);
+  });
+  return true;
 }
 
 function refreshSettingsTelemetry(status) {
