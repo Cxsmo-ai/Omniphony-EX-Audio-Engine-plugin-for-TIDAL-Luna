@@ -18,7 +18,7 @@
 const API_BASE = "http://127.0.0.1:8765";
 const REQUIRED_SERVICE_VERSION = "2.1.38";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.60";
+const PLUGIN_BUILD = "2.1.61";
 function parseEclipseManifestUrl(value) {
   const parsed = new URL(String(value ?? "").trim());
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -153,10 +153,10 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.60");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.61");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.60/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.61/OmniphonyEX-API-win-x64.tar.gz";
     const bundleSha256 = "5E5D71A3CBD4B9AA9B02118AC5E4A89EA7048F6FFC057DC7DF0BFBD93D69C131";
     const readPersistedRuntimePaths = () => {
       try {
@@ -229,7 +229,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.60"
+        return marker.pluginVersion === "2.1.61"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -298,7 +298,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.60", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.61", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -639,6 +639,8 @@ let configLoadGeneration = 0;
 const supportedFormats = ["AC4_IMS", "EAC3_JOC", "HI_RES_LOSSLESS", "LOSSLESS"];
 const SEEK_RECONCILIATION_WINDOW_MS = 2000;
 const SEEK_RECONCILIATION_TOLERANCE_SECONDS = 0.25;
+const ENGINE_SEEK_REQUEST_TIMEOUT_MS = 32_000;
+const SEEK_PENDING_PLAYBACK_HOLD_MS = 33_000;
 const REQUIRED_AUDIO_DEVICE = "wasapi/{30714dd9-2d0e-4cfb-9b98-558a8c5992da}";
 const formatLabels = {
   EAC3_JOC: "Atmos JOC",
@@ -3612,6 +3614,64 @@ function hasRecentTidalSeekIntent(trackId, position, now = Date.now()) {
     && now - lastTidalSeekIntent.at <= 2000;
 }
 
+function isPairedNativeTimelineSeek(intent, trackId, position, source, now = Date.now()) {
+  if (!intent
+      || intent.failed === true
+      || !["native-ui", "redux"].includes(source)
+      || !["native-ui", "redux"].includes(intent.source)
+      || source === intent.source
+      || String(intent.trackId) !== String(trackId)
+      || parsePlaybackPosition(position) === null
+      || now < intent.at
+      || now - intent.at > 100) return false;
+  // TIDAL 2.48 emits a pointer-derived native seek and a Redux SEEK for the
+  // same scrub. Their independently sampled clocks can differ by a few
+  // tenths of a second; forwarding both races the MPV seeks and supersedes
+  // the first one before it can settle.
+  return Math.abs(Number(intent.position) - Number(position)) <= 0.5;
+}
+
+function shouldPreservePlaybackForTidalSeek(intent, trackId, status, now = Date.now()) {
+  if (!intent
+      || !intent.preservePlaying
+      || String(intent.trackId) !== String(trackId)
+      || intent.transportIntentRevision !== transportIntentRevision
+      || desiredPlaybackIntent === false
+      || pluginDisposed
+      || String(status?.trackId ?? "") !== String(trackId)
+      || String(status?.playbackGeneration ?? "") !== String(intent.playbackGeneration ?? "")
+      || String(status?.requestId ?? "") !== String(intent.requestId ?? "")) return false;
+  if (["failed", "stopped", "ended"].includes(String(status?.playbackState ?? "").toLowerCase())) {
+    return false;
+  }
+  const seekMayStillBeSettling = intent.pending === true || intent.failed === true;
+  const anchor = seekMayStillBeSettling
+    ? intent.at
+    : Number(intent.settledAt ?? intent.at);
+  const maxAgeMs = seekMayStillBeSettling
+    ? SEEK_PENDING_PLAYBACK_HOLD_MS
+    : SEEK_RECONCILIATION_WINDOW_MS;
+  const elapsedMs = now - anchor;
+  return Number.isFinite(anchor) && elapsedMs >= 0 && elapsedMs <= maxAgeMs;
+}
+
+function shouldDeferResumeDuringTidalSeek(intent, trackId, status, now = Date.now()) {
+  return status?.paused === true
+    && intent?.pending === true
+    && shouldPreservePlaybackForTidalSeek(intent, trackId, status, now);
+}
+
+function getPlaybackReconciliationCommand(options) {
+  const {
+    transportPlaying,
+    enginePlaying,
+    resumeNeeded,
+    deferResume = false,
+  } = options;
+  if (transportPlaying) return !deferResume && resumeNeeded ? "resume" : null;
+  return enginePlaying ? "pause" : null;
+}
+
 function shouldHoldEngineClockAfterTidalSeek(intent, trackId, status, now = Date.now()) {
   if (!intent || String(intent.trackId) !== String(trackId)) return false;
   if (intent.pending === true) return true;
@@ -4005,6 +4065,15 @@ async function handleImmediateTidalSeek(timePos, source = "redux") {
       || Number(status.trackId) !== trackId) return false;
 
   const now = Date.now();
+  if (isPairedNativeTimelineSeek(lastTidalSeekIntent, trackId, targetTime, source, now)) {
+    tracePlaybackEvent("paired-native-seek-suppressed", {
+      requestedPosition: targetTime,
+      firstPosition: lastTidalSeekIntent.position,
+      firstSource: lastTidalSeekIntent.source,
+      source
+    });
+    return true;
+  }
   if (hasRecentTidalSeekIntent(trackId, targetTime, now)
       && now - lastTidalSeekIntent.at <= 100) return true;
   const nativeUiIntent = source === "native-ui";
@@ -4023,7 +4092,19 @@ async function handleImmediateTidalSeek(timePos, source = "redux") {
     return true;
   }
 
-  const seekIntent = { trackId, position: targetTime, at: now, source, pending: true };
+  const seekIntent = {
+    trackId,
+    position: targetTime,
+    at: now,
+    source,
+    pending: true,
+    preservePlaying: status.playbackState === "playing"
+      && status.paused === false
+      && desiredPlaybackIntent !== false,
+    transportIntentRevision,
+    playbackGeneration: status.playbackGeneration,
+    requestId: status.requestId,
+  };
   lastTidalSeekIntent = seekIntent;
   const sent = await sendEngineCommand("seek", {
     timePos: targetTime,
@@ -4048,7 +4129,12 @@ async function handleImmediateTidalSeek(timePos, source = "redux") {
     return false;
   }
   if (!sent) {
-    lastTidalSeekIntent = null;
+    seekIntent.pending = false;
+    seekIntent.settledAt = Date.now();
+    seekIntent.failed = true;
+    if (!shouldPreservePlaybackForTidalSeek(seekIntent, trackId, latestStatus)) {
+      lastTidalSeekIntent = null;
+    }
     return false;
   }
   seekIntent.pending = false;
@@ -4536,7 +4622,7 @@ async function sendEngineCommandDirect(endpoint, body = {}) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
-    }, 3500);
+    }, endpoint === "seek" ? ENGINE_SEEK_REQUEST_TIMEOUT_MS : 3500);
     if (!res.ok) {
       let seekDiagnostic = null;
       let responsePayload = null;
@@ -5445,8 +5531,19 @@ function startSyncLoop() {
         // Honor the fresh, track-matched Play intent through that handoff so
         // this same reconciliation pass cannot undo it with /pause.
         const pendingExplicitPlay = hasPendingExplicitPlayIntent(mediaTrackId, status);
+        const seekPreservesPlayback = shouldPreservePlaybackForTidalSeek(
+          lastTidalSeekIntent, mediaTrackId, status, Date.now(),
+        );
+        if (seekPreservesPlayback && !lastTidalSeekIntent.playbackHoldLogged) {
+          lastTidalSeekIntent.playbackHoldLogged = true;
+          tracePlaybackEvent("seek-preserves-playing-transport", {
+            requestedPosition: lastTidalSeekIntent.position,
+            enginePaused: status.paused === true,
+          });
+        }
         const transportPlaying = tidalIsPlaying
           || pendingExplicitPlay
+          || seekPreservesPlayback
           || hasRecentExplicitPlayIntent(mediaTrackId)
           // The UI mirror above may update PlayState after tidalIsPlaying was
           // sampled. If this same track is already running and the operator's
@@ -5457,6 +5554,9 @@ function startSyncLoop() {
             status, mediaTrackId, engineTrackId, desiredPlaybackIntent
           );
         const desiredState = transportPlaying ? "playing" : "paused";
+        const deferSeekResume = shouldDeferResumeDuringTidalSeek(
+          lastTidalSeekIntent, mediaTrackId, status, Date.now(),
+        );
         const needsResume = shouldResumeEngine(
           transportPlaying,
           status,
@@ -5464,13 +5564,19 @@ function startSyncLoop() {
           engineTrackId,
           enginePlayPending && enginePlayPendingTrackId === String(mediaTrackId)
         );
-        const needsPause = !transportPlaying && status.paused === false;
-        const stateMismatch = needsResume || needsPause;
+        const reconciliationCommand = getPlaybackReconciliationCommand({
+          transportPlaying,
+          enginePlaying: status.paused === false,
+          resumeNeeded: needsResume,
+          deferResume: deferSeekResume,
+        });
+        const needsReconciliation = reconciliationCommand !== null;
+        const stateMismatch = needsReconciliation;
         const shouldReconcile = stateMismatch
           && (desiredState !== lastMirroredPlaybackState
             || Date.now() - lastEngineStateCommandAt >= 1000);
         if (shouldReconcile) {
-          const endpoint = needsResume ? "resume" : "pause";
+          const endpoint = reconciliationCommand;
           const sequenceBeforeCommand = clockOrderingSequence;
           lastEngineStateCommandAt = Date.now();
           const commandSucceeded = await sendEngineCommand(endpoint, {
