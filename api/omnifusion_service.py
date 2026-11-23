@@ -105,7 +105,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.37"
+SERVICE_VERSION = "2.1.38"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 SHUTDOWN_TOKEN = os.environ.get("OMNIFUSION_SHUTDOWN_TOKEN", "")
 if not re.fullmatch(r"[a-f0-9]{64}", SHUTDOWN_TOKEN):
@@ -329,6 +329,10 @@ def public_track_status(metadata: dict, playback_state: str) -> dict:
     last_failure = metadata.get("lastFailure")
     label = str(metadata.get("label") or "")
     route = metadata.get("omniphonyRoute")
+    stale_joc_failures = {
+        "Omniphony renderer disconnected",
+        "Omniphony decoder not active",
+    }
     verified_ready_joc = (
         track_id is not None
         and metadata.get("format") == "EAC3_JOC"
@@ -337,12 +341,11 @@ def public_track_status(metadata: dict, playback_state: str) -> dict:
         and route.get("ready") is True
     )
     if verified_ready_joc:
-        stale_renderer_failure = "Omniphony renderer disconnected"
-        if last_failure == stale_renderer_failure:
+        if last_failure in stale_joc_failures:
             last_failure = None
-        # Clear only the exact stale renderer label after the current JOC route
-        # is independently confirmed ready. Preserve every unrelated failure.
-        if label == stale_renderer_failure and not last_failure:
+        # Clear only exact stale JOC failure labels after the current route is
+        # independently confirmed ready. Preserve every unrelated failure.
+        if label in stale_joc_failures and not last_failure:
             label = "Dolby Atmos (E-AC-3 JOC)"
     if not last_failure and state == "failed":
         last_failure = label or "Playback failed"
@@ -6557,7 +6560,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                             )
                             current_meta["omniphonyRoute"] = route_status
                             if route_status["ready"]:
-                                if current_meta.get("lastFailure") == "Omniphony renderer disconnected":
+                                if current_meta.get("lastFailure") in {
+                                    "Omniphony renderer disconnected",
+                                    "Omniphony decoder not active",
+                                }:
                                     current_meta.pop("lastFailure", None)
                             else:
                                 pause_result = engine.cmd(["set_property", "pause", True])

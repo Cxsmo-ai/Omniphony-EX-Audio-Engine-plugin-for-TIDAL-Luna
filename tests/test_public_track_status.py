@@ -19,6 +19,7 @@ import omnifusion_service as service
 
 
 STALE_LABEL = "Omniphony renderer disconnected"
+STALE_DECODER_LABEL = "Omniphony decoder not active"
 HEALTHY_JOC_LABEL = "Dolby Atmos (E-AC-3 JOC)"
 
 
@@ -48,13 +49,25 @@ class PublicTrackStatusTests(unittest.TestCase):
         self.assertIsNone(result["lastFailure"])
         self.assertEqual(value, original)
 
-    def test_verified_joc_does_not_reinfer_failure_from_stale_label(self):
-        result = service.public_track_status(
-            metadata(lastFailure=None), "paused"
-        )
+    def test_verified_paused_joc_normalizes_stale_decoder_message(self):
+        value = metadata(label=STALE_DECODER_LABEL, lastFailure=STALE_DECODER_LABEL)
+        original = value.copy()
+
+        result = service.public_track_status(value, "paused")
 
         self.assertEqual(result["label"], HEALTHY_JOC_LABEL)
         self.assertIsNone(result["lastFailure"])
+        self.assertEqual(value, original)
+
+    def test_verified_joc_does_not_reinfer_failure_from_stale_label(self):
+        for stale_label in (STALE_LABEL, STALE_DECODER_LABEL):
+            with self.subTest(label=stale_label):
+                result = service.public_track_status(
+                    metadata(label=stale_label, lastFailure=None), "paused"
+                )
+
+                self.assertEqual(result["label"], HEALTHY_JOC_LABEL)
+                self.assertIsNone(result["lastFailure"])
 
     def test_unrelated_active_failure_is_preserved_and_not_hidden_by_label(self):
         result = service.public_track_status(
@@ -65,12 +78,19 @@ class PublicTrackStatusTests(unittest.TestCase):
         self.assertEqual(result["lastFailure"], "MPV audio output failed")
 
     def test_unready_route_keeps_renderer_failure(self):
-        result = service.public_track_status(
-            metadata(omniphonyRoute={"ready": False}), "paused"
-        )
+        for stale_label in (STALE_LABEL, STALE_DECODER_LABEL):
+            with self.subTest(label=stale_label):
+                result = service.public_track_status(
+                    metadata(
+                        label=stale_label,
+                        lastFailure=stale_label,
+                        omniphonyRoute={"ready": False},
+                    ),
+                    "paused",
+                )
 
-        self.assertEqual(result["label"], STALE_LABEL)
-        self.assertEqual(result["lastFailure"], STALE_LABEL)
+                self.assertEqual(result["label"], stale_label)
+                self.assertEqual(result["lastFailure"], stale_label)
 
     def test_missing_route_keeps_renderer_failure(self):
         value = metadata()
@@ -82,10 +102,14 @@ class PublicTrackStatusTests(unittest.TestCase):
         self.assertEqual(result["lastFailure"], STALE_LABEL)
 
     def test_failed_state_is_never_normalized(self):
-        result = service.public_track_status(metadata(), "failed")
+        for stale_label in (STALE_LABEL, STALE_DECODER_LABEL):
+            with self.subTest(label=stale_label):
+                result = service.public_track_status(
+                    metadata(label=stale_label, lastFailure=stale_label), "failed"
+                )
 
-        self.assertEqual(result["label"], STALE_LABEL)
-        self.assertEqual(result["lastFailure"], STALE_LABEL)
+                self.assertEqual(result["label"], stale_label)
+                self.assertEqual(result["lastFailure"], stale_label)
 
     def test_loading_state_is_not_treated_as_verified_active_playback(self):
         result = service.public_track_status(metadata(), "loading")
@@ -188,6 +212,32 @@ class StatusEndpointIntegrationTests(unittest.TestCase):
         server = ThreadingHTTPServer(("127.0.0.1", 0), service.RequestHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         engine = self.FakeEngine("Omniphony renderer disconnected")
+        route = {"ready": True, "checks": {}}
+
+        try:
+            thread.start()
+            with patch.object(service, "engine", engine), \
+                    patch.object(service, "mpv_path_matches", return_value=True), \
+                    patch.object(service, "get_omniphony_route_status", return_value=route), \
+                    patch.object(service, "is_active_orender_decoder", return_value=True), \
+                    patch.object(service, "joc_route_is_verified", return_value=True), \
+                    patch.object(service, "refresh_invalidated_joc_route_telemetry"):
+                status = self.fetch_status(server)
+
+            self.assertTrue(status["omniphonyRoute"]["ready"])
+            self.assertEqual(status["label"], HEALTHY_JOC_LABEL)
+            self.assertIsNone(status["lastFailure"])
+            self.assertEqual(status["playbackState"], "paused")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_ready_route_clears_stale_decoder_failure(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), service.RequestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        engine = self.FakeEngine("Omniphony decoder not active")
+        engine.current_meta["label"] = "Omniphony decoder not active"
         route = {"ready": True, "checks": {}}
 
         try:

@@ -18,10 +18,10 @@ if not defined OMNIFUSION_PLUGIN_DIR (
     exit /b 4
 )
 
-"%PYTHON%" "%API_ROOT%\check_service_health.py" --version 2.1.37 >nul 2>&1
+"%PYTHON%" "%API_ROOT%\check_service_health.py" --version 2.1.38 >nul 2>&1
 set "HEALTH_CHECK=!ERRORLEVEL!"
 if "!HEALTH_CHECK!"=="0" (
-    echo OmniFusion service 2.1.37 is already healthy on port 8765.
+    echo OmniFusion service 2.1.38 is already healthy on port 8765.
     exit /b 0
 )
 if "!HEALTH_CHECK!"=="1" (
@@ -37,10 +37,10 @@ if not "!HEALTH_CHECK!"=="2" (
 cd /d "%API_ROOT%"
 start "" /b "%PYTHON%" "%API_ROOT%\omnifusion_service.py"
 for /l %%I in (1,1,20) do (
-    "%PYTHON%" "%API_ROOT%\check_service_health.py" --version 2.1.37 >nul 2>&1
+    "%PYTHON%" "%API_ROOT%\check_service_health.py" --version 2.1.38 >nul 2>&1
     set "HEALTH_CHECK=!ERRORLEVEL!"
     if "!HEALTH_CHECK!"=="0" (
-        echo OmniFusion service 2.1.37 is healthy on port 8765.
+        echo OmniFusion service 2.1.38 is healthy on port 8765.
         exit /b 0
     )
     if "!HEALTH_CHECK!"=="1" (
