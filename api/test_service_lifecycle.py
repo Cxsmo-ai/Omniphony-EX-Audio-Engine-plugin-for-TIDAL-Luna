@@ -617,6 +617,7 @@ class ServiceLifecycleTests(unittest.TestCase):
         engine.studio_proc = process
         engine.studio_job = job
         child_identities = []
+        surviving_children = []
         watcher = threading.Thread(
             target=engine._watch_owned_omniphony_studio,
             args=(process, job),
@@ -641,22 +642,41 @@ class ServiceLifecycleTests(unittest.TestCase):
             self.assertFalse(watcher.is_alive(), "the Studio exit watcher did not finish")
             self.assertIsNone(engine.studio_proc)
             self.assertIsNone(engine.studio_job)
+
+            # Windows reports job termination asynchronously; wait on the
+            # captured process identities, never on a reused PID or process name.
+            deadline = service.time.monotonic() + 3
+            while service.time.monotonic() < deadline:
+                surviving_children = []
+                for pid, create_time in child_identities:
+                    try:
+                        child = service.psutil.Process(pid)
+                        if abs(child.create_time() - create_time) < 0.01:
+                            surviving_children.append((pid, create_time))
+                    except service.psutil.NoSuchProcess:
+                        continue
+                if not surviving_children:
+                    break
+                service.time.sleep(0.05)
         finally:
             if watcher.is_alive():
                 job.close()
                 watcher.join(timeout=3)
             elif engine.studio_job is not None:
                 engine.stop_owned_omniphony_studio()
-
-        remaining = []
-        for pid, create_time in child_identities:
-            try:
-                child = service.psutil.Process(pid)
-                if abs(child.create_time() - create_time) < 0.01:
-                    remaining.append(pid)
-            except service.psutil.NoSuchProcess:
-                continue
-        self.assertEqual(remaining, [], "a child outlived the exited Studio process")
+            for pid, create_time in surviving_children:
+                try:
+                    child = service.psutil.Process(pid)
+                    if abs(child.create_time() - create_time) < 0.01:
+                        child.kill()
+                        child.wait(timeout=3)
+                except service.psutil.NoSuchProcess:
+                    continue
+        self.assertEqual(
+            [pid for pid, _ in surviving_children],
+            [],
+            "a child outlived the exited Studio process and job teardown window",
+        )
 
     def test_existing_user_started_studio_is_never_claimed_or_closed(self):
         engine = service.HeadlessAudioEngine()
