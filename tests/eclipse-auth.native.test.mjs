@@ -79,7 +79,7 @@ const sandbox = {
 const serviceIdentity = { shutdownToken: "a".repeat(64), serviceInstanceId: "service-instance-test" };
 import crypto from "node:crypto";
 const awaitlessCrypto = crypto;
-vm.runInNewContext(moduleCode, sandbox);
+vm.runInNewContext(moduleCode, sandbox, { codeGeneration: { strings: false, wasm: false } });
 const handler = sandbox.module.exports;
 
 const invalidOrigin = await handler.startLogin("http://example.com:8765");

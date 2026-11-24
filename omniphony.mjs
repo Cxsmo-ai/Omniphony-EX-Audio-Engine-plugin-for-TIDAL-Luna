@@ -44,7 +44,7 @@ function normalizeRealmaxSourceMode(value) {
 const REQUIRED_SERVICE_VERSION = "2.1.43";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
 const ECLIPSE_ACCOUNT_LINKING_SUPPORTED = true;
-const PLUGIN_BUILD = "2.1.72";
+const PLUGIN_BUILD = "2.1.73";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -363,7 +363,6 @@ const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
     return { closed: true };
   },
 };`;
-const NATIVE_ECLIPSE_AUTH_MODULE_CODE_JSON = JSON.stringify(NATIVE_ECLIPSE_AUTH_MODULE_CODE);
 const NATIVE_SERVICE_SUPERVISOR_MODULE_ID = "OmniphonyEX/service-supervisor.native.js";
 const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`const stateKey = "__omniphony-ex.native-service-supervisor";
 const shared = luna[stateKey] || (luna[stateKey] = {
@@ -387,8 +386,9 @@ module.exports = {
     }
     if (!shared.eclipseAuthModule) {
       const authModule = { exports: {} };
-      const loadAuthModule = new Function("module", "exports", "require", ${NATIVE_ECLIPSE_AUTH_MODULE_CODE_JSON});
-      loadAuthModule(authModule, authModule.exports, require);
+      ((module, exports, require) => {
+${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
+      })(authModule, authModule.exports, require);
       shared.eclipseAuthModule = authModule.exports;
     }
     return await shared.eclipseAuthModule.startLogin(serviceBase, {

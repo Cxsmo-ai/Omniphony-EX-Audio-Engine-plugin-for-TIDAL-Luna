@@ -21,10 +21,12 @@ const supervisorCodeTemplate = moduleSource.match(
   /const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String\.raw`([\s\S]*?)`;/,
 )?.[1];
 const supervisorCode = supervisorCodeTemplate?.replace(
-  "${NATIVE_ECLIPSE_AUTH_MODULE_CODE_JSON}",
-  JSON.stringify(nativeAuthModuleCode),
+  "${NATIVE_ECLIPSE_AUTH_MODULE_CODE}",
+  nativeAuthModuleCode,
 );
 assert.ok(supervisorCode, "the native service supervisor is embedded in the plugin entrypoint");
+assert.doesNotMatch(supervisorCode, /new Function\s*\(/,
+  "the supervisor contains no runtime code generation forbidden by TidaLuna's secure loader");
 assert.match(supervisorCode, /async startEclipseLogin\(serviceBase, requiredVersion, runtimeConfig = \{\}\)[\s\S]*?module\.exports\.ensureService\(requiredVersion, runtimeConfig\)/,
   "Eclipse authentication ensures and uses the service identity in one native-module context");
 assert.ok(pluginVersion, "the plugin build version is declared in the canonical entrypoint");
@@ -222,7 +224,7 @@ function makeHarness({
       throw new Error(`unexpected module ${name}`);
     },
   };
-  vm.createContext(sandbox);
+  vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
   vm.runInContext(supervisorCode, sandbox, { filename: "service-supervisor.native.js" });
   const health = {
     status: "ok",
