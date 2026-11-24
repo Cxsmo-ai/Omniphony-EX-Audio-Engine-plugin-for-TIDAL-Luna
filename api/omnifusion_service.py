@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import binascii
 import ctypes
+import ctypes.wintypes
 import datetime
 import hashlib
 import hmac
@@ -105,7 +106,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.38"
+SERVICE_VERSION = "2.1.40"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 SHUTDOWN_TOKEN = os.environ.get("OMNIFUSION_SHUTDOWN_TOKEN", "")
 if not re.fullmatch(r"[a-f0-9]{64}", SHUTDOWN_TOKEN):
@@ -246,10 +247,19 @@ DEFAULT_SETTINGS = {
     "priority": ["AC4_IMS", "EAC3_JOC", "HI_RES_LOSSLESS", "LOSSLESS"],
     "audio_device": "auto",
     "volume": 100,
-    "eclipse_addons": [],
-    "realmax_source": "auto",
+    "realmax_source": "both",
+    "realmax_provider_order": None,
 }
 SUPPORTED_FORMAT_PRIORITY = ("AC4_IMS", "EAC3_JOC", "HI_RES_LOSSLESS", "LOSSLESS")
+REALMAX_SOURCE_ALIASES = {
+    "auto": "both",
+    "both": "both",
+    "tidal_only": "tidal_api",
+    "tidal_api": "tidal_api",
+    "eclipse_only": "eclipse_addons",
+    "amazon_only": "eclipse_addons",
+    "eclipse_addons": "eclipse_addons",
+}
 CANCELLED_PLAY_REQUEST_TTL = 600.0
 MAX_CANCELLED_PLAY_REQUESTS = 512
 SEEK_SETTLE_TIMEOUT_SECONDS = 2.0
@@ -259,30 +269,29 @@ SEEK_SETTLE_STABILITY_SECONDS = 0.30
 USER_SEEK_MODE = "absolute"
 
 
-def validate_eclipse_addon_urls(value) -> list[str]:
-    """Validate configured Eclipse manifests before persisting or fetching them."""
-    if not isinstance(value, list) or len(value) > 16:
-        raise ValueError("eclipse_addons must be a list containing at most 16 URLs")
-    validated = []
+def validate_realmax_provider_order(value) -> list[str] | None:
+    """Validate selected providers and their order without persisting addon URLs."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) > 81:
+        raise ValueError("realmax_provider_order must be null or a list of at most 81 provider keys")
+    result = []
+    seen = set()
     for item in value:
-        if not isinstance(item, str):
-            raise ValueError("each Eclipse manifest URL must be a string")
-        candidate = item.strip()
-        if not candidate or len(candidate) > 2048 or any(ord(char) < 0x20 for char in candidate):
-            raise ValueError("Eclipse manifest URLs must be non-empty and at most 2048 characters")
-        try:
-            parsed = urllib.parse.urlsplit(candidate)
-            hostname = (parsed.hostname or "").strip("[]").lower()
-            _ = parsed.port
-        except ValueError as exc:
-            raise ValueError("Eclipse manifest URL is malformed") from exc
-        local_http = parsed.scheme.lower() == "http" and hostname in {"localhost", "127.0.0.1", "::1"}
-        if (parsed.scheme.lower() != "https" and not local_http) or not hostname:
-            raise ValueError("Eclipse manifests must use HTTPS (HTTP is allowed only for localhost development)")
-        if parsed.username is not None or parsed.password is not None:
-            raise ValueError("Eclipse manifest URLs must not contain embedded credentials")
-        validated.append(candidate)
-    return validated
+        if not isinstance(item, str) or not (
+            item == "tidal_api" or re.fullmatch(r"eclipse:[0-9a-f]{20}", item)
+        ):
+            raise ValueError("provider keys must be tidal_api or eclipse:<20 lowercase hex characters>")
+        if item in seen:
+            raise ValueError("provider order cannot contain duplicate keys")
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def normalize_realmax_source(value) -> str:
+    """Normalize earlier source-mode labels to the three current provider families."""
+    return REALMAX_SOURCE_ALIASES.get(value, "both") if isinstance(value, str) else "both"
 
 
 def validate_play_request_id(value) -> str:
@@ -314,6 +323,7 @@ TRACK_STATUS_FIELDS = (
     "sourceQuality",
     "sourceAudioMode",
     "sourceProvider",
+    "sourceName",
     "presentation",
     "decodedSampleRate",
     "decodedChannels",
@@ -2536,21 +2546,34 @@ def load_settings() -> dict:
         if SETTINGS_FILE.is_file():
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    settings = {**DEFAULT_SETTINGS, **json.load(f)}
-                    try:
-                        settings["eclipse_addons"] = validate_eclipse_addon_urls(
-                            settings.get("eclipse_addons", [])
-                        )
-                    except ValueError as exc:
-                        print(f"[-] Ignoring invalid configured Eclipse manifests: {exc}")
-                        settings["eclipse_addons"] = []
-                    priority = settings.get("priority")
-                    if (not isinstance(priority, list)
-                            or len(priority) != len(SUPPORTED_FORMAT_PRIORITY)
-                            or any(not isinstance(item, str) for item in priority)
-                            or set(priority) != set(SUPPORTED_FORMAT_PRIORITY)):
-                        settings["priority"] = list(DEFAULT_SETTINGS["priority"])
-                    return settings
+                    loaded_settings = json.load(f)
+                settings = {**DEFAULT_SETTINGS, **loaded_settings}
+                # Remove paths and access tokens embedded in legacy manually
+                # pasted manifest URLs. Eclipse providers now come only from
+                # the authenticated account's Connections list.
+                needs_save = "eclipse_addons" in settings
+                if needs_save:
+                    settings.pop("eclipse_addons", None)
+                normalized_source = normalize_realmax_source(settings.get("realmax_source"))
+                if settings.get("realmax_source") != normalized_source:
+                    settings["realmax_source"] = normalized_source
+                    needs_save = True
+                if needs_save:
+                    save_settings(settings)
+                try:
+                    settings["realmax_provider_order"] = validate_realmax_provider_order(
+                        settings.get("realmax_provider_order")
+                    )
+                except ValueError as exc:
+                    print(f"[-] Ignoring invalid RealMAX provider order: {exc}")
+                    settings["realmax_provider_order"] = None
+                priority = settings.get("priority")
+                if (not isinstance(priority, list)
+                        or len(priority) != len(SUPPORTED_FORMAT_PRIORITY)
+                        or any(not isinstance(item, str) for item in priority)
+                        or set(priority) != set(SUPPORTED_FORMAT_PRIORITY)):
+                    settings["priority"] = list(DEFAULT_SETTINGS["priority"])
+                return settings
             except Exception as exc:
                 print(f"[-] Settings read failed; using defaults: {exc}")
                 backup_file = SETTINGS_FILE.with_name(
@@ -4325,77 +4348,510 @@ _ECLIPSE_AUTH_LOCK = threading.RLock()
 _ECLIPSE_AUTH_CACHE: dict[str, object] = {
     "jwt": None,
     "addon_tokens": {},
+    "account_addons": {},
+    "manifest_cache": {},
     "search_cache": {},
     "stream_cache": {},
     "tido_manifest_url": None,
 }
+_ECLIPSE_AUTH_GENERATION = 0
 ECLIPSE_SESSION_FILE = CONFIG_DIR / "eclipse-session.json"
-DEFAULT_TIDO_ECLIPSE_MANIFEST = "https://tido.tido.tido.rickyaddons.dpdns.org/bd6335b8e3c74a388134bf5f5bc3b3df/manifest.json"
-DEFAULT_TIDO_ECLIPSE_ROOT = "https://tido.tido.tido.rickyaddons.dpdns.org"
+ECLIPSE_AUTH_VERIFY_URL = "https://api.eclipsemusic.app/api/auth/mobile/verify"
+_ECLIPSE_ACCOUNT_STATUS: dict[str, object] = {"user": None, "checked_at": 0.0, "session_mtime": None}
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevent Eclipse bearer and add-on access headers crossing origins."""
+
+    @staticmethod
+    def _origin(url: str) -> tuple[str, str, int | None] | None:
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme.lower() != "https" or not parsed.hostname:
+                return None
+            return "https", parsed.hostname.rstrip(".").lower(), parsed.port or 443
+        except ValueError:
+            return None
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if self._origin(req.full_url) != self._origin(newurl):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _eclipse_authenticated_urlopen(request, timeout: float):
+    """Open an authenticated HTTPS request without following cross-origin redirects."""
+    return urllib.request.build_opener(_SameOriginRedirectHandler()).open(request, timeout=timeout)
+
+
+def _validate_account_manifest_url(value: str) -> str:
+    """Validate a manifest URL received from the authenticated Eclipse account API."""
+    if not isinstance(value, str):
+        raise ValueError("manifest URL must be a string")
+    candidate = value.strip()
+    if not candidate or len(candidate) > 2048 or any(ord(char) < 0x20 for char in candidate):
+        raise ValueError("manifest URL is invalid")
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("manifest URL is malformed") from exc
+    if parsed.scheme.lower() != "https" or not hostname:
+        raise ValueError("account add-on manifests must use HTTPS")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("manifest URL must not contain embedded credentials")
+    if parsed.fragment:
+        raise ValueError("manifest URL must not contain a fragment")
+    return candidate
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.wintypes.BYTE))]
+
+
+def _eclipse_token_protect(token: str) -> str:
+    """Protect an Eclipse bearer token with current-user Windows DPAPI."""
+    if os.name != "nt":
+        raise OSError("Eclipse account token protection requires Windows DPAPI")
+    raw = token.encode("utf-8")
+    source_buffer = ctypes.create_string_buffer(raw, len(raw))
+    source = _DataBlob(len(raw), ctypes.cast(source_buffer, ctypes.POINTER(ctypes.wintypes.BYTE)))
+    protected = _DataBlob()
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    crypt32.CryptProtectData.argtypes = [
+        ctypes.POINTER(_DataBlob), ctypes.c_wchar_p, ctypes.POINTER(_DataBlob),
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.wintypes.DWORD, ctypes.POINTER(_DataBlob),
+    ]
+    crypt32.CryptProtectData.restype = ctypes.wintypes.BOOL
+    if not crypt32.CryptProtectData(ctypes.byref(source), "Omniphony EX Eclipse account", None, None, None, 1, ctypes.byref(protected)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return base64.b64encode(ctypes.string_at(protected.pbData, protected.cbData)).decode("ascii")
+    finally:
+        local_free = ctypes.WinDLL("kernel32", use_last_error=True).LocalFree
+        local_free.argtypes = [ctypes.c_void_p]
+        local_free.restype = ctypes.c_void_p
+        local_free(protected.pbData)
+
+
+def _eclipse_token_unprotect(value: str) -> str:
+    """Unprotect a current-user Windows DPAPI token without exposing it in logs."""
+    if os.name != "nt":
+        raise OSError("Eclipse account token protection requires Windows DPAPI")
+    raw = base64.b64decode(value.encode("ascii"), validate=True)
+    source_buffer = ctypes.create_string_buffer(raw, len(raw))
+    source = _DataBlob(len(raw), ctypes.cast(source_buffer, ctypes.POINTER(ctypes.wintypes.BYTE)))
+    clear = _DataBlob()
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    crypt32.CryptUnprotectData.argtypes = [
+        ctypes.POINTER(_DataBlob), ctypes.POINTER(ctypes.c_wchar_p), ctypes.POINTER(_DataBlob),
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.wintypes.DWORD, ctypes.POINTER(_DataBlob),
+    ]
+    crypt32.CryptUnprotectData.restype = ctypes.wintypes.BOOL
+    if not crypt32.CryptUnprotectData(ctypes.byref(source), None, None, None, None, 1, ctypes.byref(clear)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return ctypes.string_at(clear.pbData, clear.cbData).decode("utf-8")
+    finally:
+        local_free = ctypes.WinDLL("kernel32", use_last_error=True).LocalFree
+        local_free.argtypes = [ctypes.c_void_p]
+        local_free.restype = ctypes.c_void_p
+        local_free(clear.pbData)
+
+
+def _read_eclipse_session() -> dict | None:
+    try:
+        saved = json.loads(ECLIPSE_SESSION_FILE.read_text(encoding="utf-8"))
+        if not isinstance(saved, dict):
+            return None
+        token = saved.get("jwt")
+        protected = saved.get("jwt_dpapi")
+        if isinstance(protected, str) and protected:
+            token = _eclipse_token_unprotect(protected)
+        elif isinstance(token, str) and token.strip():
+            # Migrate a session created by the earlier local prototype to DPAPI.
+            token = token.strip()
+            _write_eclipse_session(token, saved.get("user") if isinstance(saved.get("user"), dict) else None)
+        return {"jwt": token, "user": saved.get("user") if isinstance(saved.get("user"), dict) else None}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _write_eclipse_session(token: str, user: dict | None = None) -> None:
+    protected = _eclipse_token_protect(token)
+    public_user = {}
+    if isinstance(user, dict):
+        for key in ("id", "userId", "name", "email", "image"):
+            value = user.get(key)
+            if isinstance(value, str) and len(value) <= 512:
+                public_user[key] = value
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = ECLIPSE_SESSION_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"version": 1, "jwt_dpapi": protected, "user": public_user}), encoding="utf-8")
+    os.replace(temporary, ECLIPSE_SESSION_FILE)
+
+
+def _verify_eclipse_account_token(token: str) -> tuple[bool, dict | None, str | None]:
+    request = urllib.request.Request(
+        ECLIPSE_AUTH_VERIFY_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "OmniphonyEX TIDAL Luna plugin",
+        },
+    )
+    try:
+        with _eclipse_authenticated_urlopen(request, timeout=8.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return False, None, "unauthorized" if exc.code == 401 else "verification_failed"
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False, None, "verification_unavailable"
+    if not isinstance(payload, dict) or payload.get("success") is not True or not isinstance(payload.get("user"), dict):
+        return False, None, "account_not_verified"
+    replacement = payload.get("token") if isinstance(payload.get("token"), str) else None
+    user = {}
+    for key in ("id", "userId", "name", "email", "image"):
+        value = payload["user"].get(key)
+        if isinstance(value, str) and len(value) <= 512:
+            user[key] = value
+    return True, user, replacement
+
+
+def _complete_eclipse_login(token: str) -> tuple[bool, dict | None, str | None]:
+    if not token or len(token) > 8192 or any(ord(char) < 0x20 for char in token):
+        return False, None, "invalid_token"
+    with _ECLIPSE_AUTH_LOCK:
+        auth_generation = _ECLIPSE_AUTH_GENERATION
+    valid, user, replacement = _verify_eclipse_account_token(token)
+    if not valid:
+        return False, None, replacement
+    saved_token = replacement.strip() if isinstance(replacement, str) and replacement.strip() else token
+    with _ECLIPSE_AUTH_LOCK:
+        if _ECLIPSE_AUTH_GENERATION != auth_generation:
+            return False, None, "account_changed"
+        try:
+            _write_eclipse_session(saved_token, user)
+        except (OSError, ValueError, TypeError):
+            return False, None, "secure_storage_unavailable"
+        _invalidate_eclipse_account_cache(clear_jwt=True)
+        _ECLIPSE_AUTH_CACHE["jwt"] = saved_token
+        _ECLIPSE_ACCOUNT_STATUS.update({"user": user, "checked_at": time.time(), "session_mtime": ECLIPSE_SESSION_FILE.stat().st_mtime})
+    return True, user, None
+
+
+def _invalidate_eclipse_account_cache(clear_jwt: bool = False) -> None:
+    """Clear auth-derived caches when the saved Eclipse account changes or disappears."""
+    global _ECLIPSE_AUTH_GENERATION
+    _ECLIPSE_AUTH_GENERATION += 1
+    account_cache = _ECLIPSE_AUTH_CACHE.get("account_addons")
+    account_urls = set()
+    if isinstance(account_cache, dict):
+        cached = account_cache.get("current")
+        result = cached.get("result") if isinstance(cached, dict) else None
+        addons = result.get("addons") if isinstance(result, dict) else None
+        if isinstance(addons, list):
+            account_urls = {
+                item.get("manifestUrl") for item in addons
+                if isinstance(item, dict) and isinstance(item.get("manifestUrl"), str)
+            }
+    manifest_cache = _ECLIPSE_AUTH_CACHE.get("manifest_cache")
+    if isinstance(manifest_cache, dict):
+        for url in account_urls:
+            manifest_cache.pop(url, None)
+    if clear_jwt:
+        _ECLIPSE_AUTH_CACHE["jwt"] = None
+        _ECLIPSE_ACCOUNT_STATUS.update({"user": None, "checked_at": 0.0, "session_mtime": None})
+    for key in ("addon_tokens", "account_addons", "search_cache", "stream_cache"):
+        cached = _ECLIPSE_AUTH_CACHE.get(key)
+        if isinstance(cached, dict):
+            cached.clear()
 
 
 def _get_eclipse_jwt(force_refresh: bool = False) -> str | None:
-    """Acquire or load cached Eclipse session JWT for addon access."""
+    """Load the saved Eclipse account token; force_refresh reloads local storage only."""
     with _ECLIPSE_AUTH_LOCK:
         if not force_refresh and isinstance(_ECLIPSE_AUTH_CACHE.get("jwt"), str) and _ECLIPSE_AUTH_CACHE["jwt"]:
             return str(_ECLIPSE_AUTH_CACHE["jwt"])
-        if not force_refresh and ECLIPSE_SESSION_FILE.is_file():
-            try:
-                saved = json.loads(ECLIPSE_SESSION_FILE.read_text(encoding="utf-8"))
-                token = saved.get("jwt")
-                if isinstance(token, str) and token.strip():
-                    _ECLIPSE_AUTH_CACHE["jwt"] = token.strip()
-                    return token.strip()
-            except Exception:
-                pass
+        saved = _read_eclipse_session() if ECLIPSE_SESSION_FILE.is_file() else None
+        token = saved.get("jwt") if isinstance(saved, dict) else None
+        if isinstance(token, str) and token.strip():
+            token = token.strip()
+            if token != _ECLIPSE_AUTH_CACHE.get("jwt"):
+                _invalidate_eclipse_account_cache()
+            _ECLIPSE_AUTH_CACHE["jwt"] = token
+            return token
 
-        creds = {
-            "name": "OmniUser",
-            "email": "omni_test_user_7721@test.com",
-            "password": "Password123!",
+        if force_refresh:
+            _invalidate_eclipse_account_cache(clear_jwt=True)
+        return None
+
+
+def eclipse_account_status(force_refresh: bool = False) -> dict:
+    """Verify the local Eclipse session and return only non-secret account details."""
+    token = _get_eclipse_jwt(force_refresh=force_refresh)
+    if not token:
+        return {"connected": False, "user": None}
+    try:
+        session_mtime = ECLIPSE_SESSION_FILE.stat().st_mtime
+    except OSError:
+        session_mtime = None
+    with _ECLIPSE_AUTH_LOCK:
+        cached_user = _ECLIPSE_ACCOUNT_STATUS.get("user")
+        checked_at = float(_ECLIPSE_ACCOUNT_STATUS.get("checked_at") or 0)
+        if (not force_refresh and isinstance(cached_user, dict)
+                and _ECLIPSE_ACCOUNT_STATUS.get("session_mtime") == session_mtime
+                and time.time() - checked_at < 60):
+            return {"connected": True, "user": cached_user}
+        auth_generation = _ECLIPSE_AUTH_GENERATION
+    valid, user, replacement = _verify_eclipse_account_token(token)
+    with _ECLIPSE_AUTH_LOCK:
+        if (_ECLIPSE_AUTH_GENERATION != auth_generation
+                or _ECLIPSE_AUTH_CACHE.get("jwt") != token):
+            return {"connected": False, "user": None, "reason": "account_changed"}
+        if not valid:
+            if replacement == "unauthorized":
+                try:
+                    ECLIPSE_SESSION_FILE.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                _invalidate_eclipse_account_cache(clear_jwt=True)
+            return {"connected": False, "user": None, "reason": replacement}
+        saved_token = replacement.strip() if isinstance(replacement, str) and replacement.strip() else token
+        if saved_token != token or not isinstance(_ECLIPSE_ACCOUNT_STATUS.get("user"), dict):
+            try:
+                _write_eclipse_session(saved_token, user)
+            except (OSError, ValueError, TypeError):
+                return {"connected": False, "user": None, "reason": "secure_storage_unavailable"}
+        if saved_token != token:
+            _invalidate_eclipse_account_cache(clear_jwt=True)
+            _ECLIPSE_AUTH_CACHE["jwt"] = saved_token
+        _ECLIPSE_ACCOUNT_STATUS.update({
+            "user": user,
+            "checked_at": time.time(),
+            "session_mtime": ECLIPSE_SESSION_FILE.stat().st_mtime,
+        })
+    return {"connected": True, "user": user}
+
+
+ECLIPSE_ACCOUNT_ADDONS_URL = "https://eclipsemusic.app/music/addons"
+ECLIPSE_ACCOUNT_ADDONS_TTL_SECONDS = 45.0
+
+
+def eclipse_account_addons(force_refresh: bool = False) -> dict:
+    """Read the signed-in account's Eclipse Connections list without returning its token."""
+    token = _get_eclipse_jwt(force_refresh=force_refresh)
+    if not token:
+        return {"connected": False, "addons": [], "order": []}
+    token_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with _ECLIPSE_AUTH_LOCK:
+        if _ECLIPSE_AUTH_CACHE.get("jwt") != token:
+            return {"connected": False, "addons": [], "order": [], "reason": "account_changed"}
+        auth_generation = _ECLIPSE_AUTH_GENERATION
+    now = time.time()
+    with _ECLIPSE_AUTH_LOCK:
+        if (_ECLIPSE_AUTH_GENERATION != auth_generation
+                or _ECLIPSE_AUTH_CACHE.get("jwt") != token):
+            return {"connected": False, "available": False, "addons": [], "order": [], "reason": "account_changed"}
+        cache = _ECLIPSE_AUTH_CACHE.setdefault("account_addons", {})
+        cached = cache.get("current") if isinstance(cache, dict) else None
+        if (not force_refresh and isinstance(cached, dict)
+                and cached.get("token_key") == token_key
+                and now < float(cached.get("expires_at") or 0)):
+            result = cached.get("result")
+            if isinstance(result, dict):
+                return dict(result)
+
+    request = urllib.request.Request(
+        ECLIPSE_ACCOUNT_ADDONS_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "Omniphony EX TIDAL Luna plugin",
+        },
+    )
+    try:
+        with _eclipse_authenticated_urlopen(request, timeout=8.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        reason = "unauthorized" if exc.code == 401 else "account_addons_unavailable"
+        return {"connected": True, "available": False, "addons": [], "order": [], "reason": reason}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"connected": True, "available": False, "addons": [], "order": [], "reason": "account_addons_unavailable"}
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("addons"), list):
+        return {"connected": True, "available": False, "addons": [], "order": [], "reason": "invalid_account_addons_response"}
+
+    normalized = []
+    seen_ids = set()
+    for item in payload["addons"][:64]:
+        if not isinstance(item, dict):
+            continue
+        addon_id = item.get("addonId")
+        manifest_url = item.get("manifestUrl")
+        if not isinstance(addon_id, str) or not addon_id.strip() or len(addon_id) > 256:
+            continue
+        addon_id = addon_id.strip()
+        if addon_id in seen_ids:
+            continue
+        if not isinstance(manifest_url, str) or not manifest_url.strip():
+            continue
+        try:
+            manifest_url = _validate_account_manifest_url(manifest_url)
+        except (TypeError, ValueError):
+            continue
+        enabled_value = item.get("isEnabled")
+        if not isinstance(enabled_value, bool):
+            continue
+        seen_ids.add(addon_id)
+        display_name = item.get("displayName")
+        kind = item.get("kind")
+        normalized.append({
+            "addonId": addon_id,
+            "displayName": display_name.strip()[:256] if isinstance(display_name, str) else addon_id,
+            "kind": kind.strip()[:64] if isinstance(kind, str) else "community",
+            "manifestUrl": manifest_url,
+            "isEnabled": enabled_value,
+        })
+
+    raw_order = payload.get("order")
+    order = [item.strip() for item in raw_order if isinstance(item, str) and item.strip()][:64] if isinstance(raw_order, list) else []
+    if order:
+        rank = {addon_id: index for index, addon_id in enumerate(order)}
+        normalized.sort(key=lambda addon: rank.get(addon["addonId"], len(rank)))
+    result = {"connected": True, "available": True, "addons": normalized, "order": order}
+    with _ECLIPSE_AUTH_LOCK:
+        if (_ECLIPSE_AUTH_GENERATION != auth_generation
+                or _ECLIPSE_AUTH_CACHE.get("jwt") != token):
+            return {"connected": False, "available": False, "addons": [], "order": [], "reason": "account_changed"}
+        cache = _ECLIPSE_AUTH_CACHE.setdefault("account_addons", {})
+        if isinstance(cache, dict):
+            cache.clear()
+            cache["current"] = {
+                "token_key": token_key,
+                "expires_at": time.time() + ECLIPSE_ACCOUNT_ADDONS_TTL_SECONDS,
+                "result": result,
+            }
+    return dict(result)
+
+
+def public_eclipse_account_addons(account: dict) -> dict:
+    """Expose only account addon metadata and opaque local keys to the Luna renderer."""
+    if not isinstance(account, dict):
+        return {"connected": False, "addons": [], "order": []}
+    public_addons = []
+    for addon in account.get("addons", []):
+        if not isinstance(addon, dict):
+            continue
+        manifest_url = addon.get("manifestUrl")
+        public_addons.append({
+            "key": _eclipse_provider_key(manifest_url, str(addon.get("addonId") or "")) if isinstance(manifest_url, str) else None,
+            "addonId": addon.get("addonId"),
+            "displayName": addon.get("displayName"),
+            "kind": addon.get("kind"),
+            "isEnabled": addon.get("isEnabled") is True,
+        })
+    return {
+        **{key: account[key] for key in ("connected", "available", "reason", "order") if key in account},
+        "addons": public_addons,
+    }
+
+
+def _eclipse_provider_key(manifest_url: str = "", addon_id: str = "") -> str:
+    """Return a stable provider key for one Eclipse account connection."""
+    identity = f"account:{addon_id.strip()}" if isinstance(addon_id, str) and addon_id.strip() else f"manifest:{manifest_url}"
+    return "eclipse:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+
+
+def realmax_provider_configuration(settings: dict | None = None, force_account_refresh: bool = False) -> dict:
+    """Build available RealMAX providers, preserving account and manifest ordering."""
+    settings = settings if isinstance(settings, dict) else load_settings()
+    account = eclipse_account_addons(force_refresh=force_account_refresh)
+    records = []
+    for addon in account.get("addons", []) if account.get("available") is True else []:
+        if not isinstance(addon, dict) or not isinstance(addon.get("manifestUrl"), str):
+            continue
+        url = addon["manifestUrl"]
+        record = {
+            "key": _eclipse_provider_key(url, str(addon.get("addonId") or "")),
+            "name": str(addon.get("displayName") or addon.get("addonId") or "Eclipse add-on")[:256],
+            "addonId": str(addon.get("addonId") or "")[:256],
+            "kind": str(addon.get("kind") or "community")[:64],
+            "manifestUrl": url,
+            "available": addon.get("isEnabled") is True,
+            "accountConnected": True,
+            "source": "eclipse_account",
         }
-        if ECLIPSE_SESSION_FILE.is_file():
-            try:
-                saved = json.loads(ECLIPSE_SESSION_FILE.read_text(encoding="utf-8"))
-                if isinstance(saved.get("email"), str) and saved.get("email"):
-                    creds["email"] = saved["email"]
-                if isinstance(saved.get("password"), str) and saved.get("password"):
-                    creds["password"] = saved["password"]
-            except Exception:
-                pass
+        records.append(record)
 
-        payload = json.dumps(creds).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    authorized = is_main_tidal_api_authorized()
+    default_order = (["tidal_api"] if authorized else []) + [
+        row["key"] for row in records if row["available"]
+    ]
+    saved_order = settings.get("realmax_provider_order")
+    if isinstance(saved_order, list):
+        allowed_keys = {"tidal_api"} | {row["key"] for row in records if row["available"]}
+        legacy_key_map = {
+            _eclipse_provider_key(row["manifestUrl"]): row["key"]
+            for row in records
+            if row.get("accountConnected") and isinstance(row.get("manifestUrl"), str)
         }
-        jwt_token = None
-        for auth_ep in (
-            "https://api.eclipsemusic.app/api/auth/mobile/login",
-            "https://api.eclipsemusic.app/api/auth/mobile/signup",
-        ):
-            try:
-                req = urllib.request.Request(auth_ep, data=payload, headers=headers)
-                with urllib.request.urlopen(req, timeout=6) as resp:
-                    res = json.loads(resp.read().decode("utf-8"))
-                    candidate = res.get("token")
-                    if isinstance(candidate, str) and candidate.strip():
-                        jwt_token = candidate.strip()
-                        break
-            except Exception:
-                continue
+        configured_order = list(dict.fromkeys(legacy_key_map.get(key, key) for key in saved_order))
+        order = [key for key in configured_order if key in allowed_keys]
+    else:
+        configured_order = default_order
+        order = default_order
 
-        if jwt_token:
-            _ECLIPSE_AUTH_CACHE["jwt"] = jwt_token
-            try:
-                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-                ECLIPSE_SESSION_FILE.write_text(
-                    json.dumps({**creds, "jwt": jwt_token}, indent=2),
-                    encoding="utf-8",
-                )
-            except Exception:
-                pass
-        return jwt_token
+    known_keys = {row["key"] for row in records} | {"tidal_api"}
+    for key in configured_order:
+        if key not in known_keys and key.startswith("eclipse:"):
+            records.append({
+                "key": key,
+                "name": "Unavailable Eclipse add-on",
+                "addonId": "",
+                "kind": "community",
+                "available": False,
+                "accountConnected": False,
+                "source": "unavailable",
+            })
+
+    providers = [{
+        "key": "tidal_api",
+        "name": "TIDAL API (EbbLabs / python-tidal)",
+        "type": "tidal_api",
+        "available": authorized,
+        "accountConnected": False,
+    }, *({key: value for key, value in row.items() if key != "manifestUrl"} for row in records)]
+    selected = set(configured_order)
+    for provider in providers:
+        provider["selected"] = provider["key"] in selected
+        provider["priority"] = configured_order.index(provider["key"]) + 1 if provider["key"] in selected else None
+    return {
+        "providers": providers,
+        "order": order,
+        "configuredOrder": configured_order,
+        "customized": isinstance(saved_order, list),
+        "accountConnected": account.get("connected") is True,
+        "accountAvailable": account.get("available") is True,
+        "_internal_records": {row["key"]: row for row in records},
+    }
+
+
+def _ordered_resolution_providers(settings: dict | None = None) -> tuple[list[str], dict[str, dict]]:
+    settings = settings if isinstance(settings, dict) else load_settings()
+    source_mode = normalize_realmax_source(settings.get("realmax_source", "both"))
+    if source_mode == "tidal_api":
+        saved_order = settings.get("realmax_provider_order")
+        tidal_selected = not isinstance(saved_order, list) or "tidal_api" in saved_order
+        return (["tidal_api"] if tidal_selected and is_main_tidal_api_authorized() else []), {}
+    config = realmax_provider_configuration(settings)
+    by_key = {item["key"]: item for item in config["providers"]}
+    order = list(config["order"])
+    if source_mode == "eclipse_addons":
+        order = [key for key in order if key != "tidal_api"]
+    records = config.get("_internal_records", {})
+    return order, records
 
 
 def _get_eclipse_addon_access_token(addon_id: str = "com.yourname.amazonmusic", force_refresh: bool = False) -> str | None:
@@ -4425,7 +4881,7 @@ def _get_eclipse_addon_access_token(addon_id: str = "com.yourname.amazonmusic", 
                 },
             )
             try:
-                with urllib.request.urlopen(req, timeout=6) as resp:
+                with _eclipse_authenticated_urlopen(req, timeout=6) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     addon_token = data.get("token")
                     expires_in = float(data.get("expiresIn") or 300)
@@ -4452,37 +4908,57 @@ def _is_tido_eclipse_addon(addon_manifest_url: str) -> bool:
     return "tido.rickyaddons" in u or "com.yourname.tidal.hifi" in u
 
 
-def _resolve_tido_manifest_url(url_or_root: str) -> str:
-    """Normalize a Tido root URL or manifest URL into a full tokenized manifest URL."""
-    u = (url_or_root or "").strip()
-    if not u:
-        return DEFAULT_TIDO_ECLIPSE_MANIFEST
-    if u.endswith("/manifest.json"):
-        return u
-    u_stripped = u.rstrip("/")
-    if u_stripped.lower() == DEFAULT_TIDO_ECLIPSE_ROOT.lower():
-        cached = _ECLIPSE_AUTH_CACHE.get("tido_manifest_url")
-        if isinstance(cached, str) and cached.endswith("/manifest.json"):
-            return cached
-        return DEFAULT_TIDO_ECLIPSE_MANIFEST
-    return f"{u_stripped}/manifest.json"
-
-
 def _eclipse_worker_base_url(addon_manifest_url: str) -> str:
     """Resolve the base worker URL for an Eclipse addon.
 
-    AMZM routes work at the domain root (or token prefix), whereas Tido requires
-    the token prefix path segment before /search and /stream/{id}.
+    Eclipse tokenized addon URLs keep their path prefix on every resource
+    request. Removing it turns a valid per-user URL into an unscoped request.
     """
     u = (addon_manifest_url or "").strip()
-    if _is_tido_eclipse_addon(u):
-        manifest_full = _resolve_tido_manifest_url(u)
-        return manifest_full.rsplit("/manifest.json", 1)[0].rstrip("/")
     parsed = urllib.parse.urlsplit(u)
     if parsed.scheme and parsed.netloc:
-        return f"{parsed.scheme}://{parsed.netloc}"
-    base = u.rsplit("/manifest.json", 1)[0]
-    return base.rstrip("/")
+        path = parsed.path
+        if path.endswith("/manifest.json"):
+            path = path[:-len("/manifest.json")]
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
+    return u.rsplit("/manifest.json", 1)[0].rstrip("/")
+
+
+def _eclipse_worker_url(addon_manifest_url: str, resource_path: str, params: dict | None = None) -> str:
+    """Build an addon resource URL while retaining manifest-level query configuration."""
+    base = _eclipse_worker_base_url(addon_manifest_url)
+    manifest_query = urllib.parse.parse_qsl(urllib.parse.urlsplit(addon_manifest_url).query, keep_blank_values=True)
+    resource_params = list((params or {}).items())
+    merged = manifest_query + resource_params
+    query = urllib.parse.urlencode(merged, doseq=True)
+    return f"{base}/{resource_path.lstrip('/')}" + (f"?{query}" if query else "")
+
+
+def _get_eclipse_manifest(addon_manifest_url: str, force_refresh: bool = False) -> dict | None:
+    """Fetch and briefly cache a public Eclipse addon manifest."""
+    manifest_url = addon_manifest_url.strip()
+    now = time.time()
+    with _ECLIPSE_AUTH_LOCK:
+        cache = _ECLIPSE_AUTH_CACHE.setdefault("manifest_cache", {})
+        if not force_refresh and isinstance(cache, dict):
+            item = cache.get(manifest_url)
+            if isinstance(item, dict) and now < float(item.get("expires_at") or 0):
+                manifest = item.get("manifest")
+                return manifest if isinstance(manifest, dict) else None
+    try:
+        req = urllib.request.Request(manifest_url, headers={"User-Agent": "OmniphonyEX/1.0 Eclipse addon client"})
+        with urllib.request.urlopen(req, timeout=6.0) as response:
+            manifest = json.loads(response.read().decode("utf-8"))
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("id"), str) or not manifest["id"].strip():
+            return None
+    except Exception as exc:
+        print(f"[-] Eclipse manifest fetch failed ({type(exc).__name__})")
+        return None
+    with _ECLIPSE_AUTH_LOCK:
+        cache = _ECLIPSE_AUTH_CACHE.setdefault("manifest_cache", {})
+        if isinstance(cache, dict):
+            cache[manifest_url] = {"manifest": manifest, "expires_at": time.time() + 300}
+    return manifest
 
 
 def is_main_tidal_api_authorized() -> bool:
@@ -4598,9 +5074,11 @@ def _select_eclipse_search_track(tracks: list[dict], title: str, artist: str, re
     norm_isrc = (isrc or "").strip().upper()
     target_dur = float(duration or 0)
 
-    def score(item: dict) -> tuple[int, int, int, int, int]:
+    def identity_and_score(item: dict) -> tuple[bool, tuple[int, int, int, int, int]]:
         item_isrc = str(item.get("isrc") or "").strip().upper()
         isrc_match = 1 if (norm_isrc and item_isrc == norm_isrc) else 0
+        if norm_isrc and item_isrc and not isrc_match:
+            return False, (0, 0, 0, 0, 0)
         t_title = re.sub(r"[^a-z0-9]+", " ", str(item.get("title") or "").lower()).strip()
         t_artist = re.sub(r"[^a-z0-9]+", " ", str(item.get("artist") or "").lower()).strip()
         exact_title = 2 if (norm_title and t_title == norm_title) else (1 if (norm_title and (norm_title in t_title or t_title in norm_title)) else 0)
@@ -4608,10 +5086,42 @@ def _select_eclipse_search_track(tracks: list[dict], title: str, artist: str, re
         dur_match = 1 if (target_dur > 0 and item_dur > 0 and abs(item_dur - target_dur) <= 6) else 0
         artist_match = 1 if (norm_artist and (norm_artist in t_artist or t_artist in norm_artist)) else 0
         atmos_pref = 1 if (requested_fmt == "EAC3_JOC" and (item.get("atmosAvailable") or item.get("isAtmos"))) else 0
-        return (isrc_match, exact_title, dur_match, artist_match, atmos_pref)
+        duration_conflict = target_dur > 0 and item_dur > 0 and abs(item_dur - target_dur) > 8
+        identity_match = bool(isrc_match or (exact_title and artist_match and not duration_conflict))
+        return identity_match, (isrc_match, exact_title, dur_match, artist_match, atmos_pref)
 
-    best = max(valid, key=score)
-    return best
+    matching = [(item, score) for item in valid for matches, score in [identity_and_score(item)] if matches]
+    return max(matching, key=lambda row: row[1])[0] if matching else None
+
+
+def _tidal_alternate_track_matches(original, candidate) -> bool:
+    """Accept only the same recording when expanding TIDAL album editions."""
+    if getattr(candidate, "id", None) == getattr(original, "id", None):
+        return False
+    normalize = lambda value: re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    original_title = normalize(getattr(original, "name", ""))
+    candidate_title = normalize(getattr(candidate, "name", ""))
+    if not original_title or candidate_title != original_title:
+        return False
+    try:
+        if abs(float(getattr(candidate, "duration", 0)) - float(getattr(original, "duration", 0))) > 6:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    original_isrc = str(getattr(original, "isrc", "") or "").strip().upper()
+    candidate_isrc = str(getattr(candidate, "isrc", "") or "").strip().upper()
+    if original_isrc and candidate_isrc:
+        return original_isrc == candidate_isrc
+
+    def artist_identity(track):
+        artist = getattr(track, "artist", None)
+        primary = getattr(artist, "name", "") if artist is not None else ""
+        return normalize(primary)
+
+    original_artist = artist_identity(original)
+    candidate_artist = artist_identity(candidate)
+    return bool(original_artist and candidate_artist and original_artist == candidate_artist)
 
 
 def resolve_tido_eclipse_addon(
@@ -4643,7 +5153,7 @@ def resolve_tido_eclipse_addon(
             for attempt in range(2):
                 req = urllib.request.Request(url, headers=headers)
                 try:
-                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    with _eclipse_authenticated_urlopen(req, timeout=timeout) as resp:
                         return json.loads(resp.read().decode("utf-8"))
                 except urllib.error.HTTPError as exc:
                     if exc.code in (401, 403) and attempt == 0:
@@ -4677,7 +5187,7 @@ def resolve_tido_eclipse_addon(
                     cached_tracks = entry.get("tracks")
             if not isinstance(cached_tracks, list):
                 query = f"{title} {artist}".strip()
-                s_res = _fetch_json(f"{base}/search?q={urllib.parse.quote(query)}", timeout=5.0)
+                s_res = _fetch_json(_eclipse_worker_url(addon_manifest_url, "search", {"q": query}), timeout=5.0)
                 cached_tracks = s_res.get("tracks", []) if isinstance(s_res, dict) else (s_res if isinstance(s_res, list) else [])
                 if isinstance(search_cache, dict) and isinstance(cached_tracks, list):
                     search_cache[lookup_key] = {"tracks": cached_tracks, "expires_at": now + 600.0}
@@ -4697,7 +5207,7 @@ def resolve_tido_eclipse_addon(
                             candidate_ids.append(cid)
 
         for cid in candidate_ids[:4]:
-            stream_url = f"{base}/stream/{urllib.parse.quote(cid)}?quality={urllib.parse.quote(quality_param)}&videosEnabled=false"
+            stream_url = _eclipse_worker_url(addon_manifest_url, f"stream/{urllib.parse.quote(cid)}", {"quality": quality_param, "videosEnabled": "false"})
             s_data = _fetch_json(stream_url, timeout=8.0)
             if not isinstance(s_data, dict) or not s_data.get("url"):
                 continue
@@ -4758,7 +5268,8 @@ def resolve_tido_eclipse_addon(
                         "sourceChannels": dash.get("sourceChannels") or 6,
                         "sourceBitDepth": dash.get("sourceBitDepth"),
                         "sourceAudioMode": "DOLBY_ATMOS",
-                        "sourceProvider": "TIDAL",
+                        "sourceProvider": "TIDAL_ECLIPSE",
+                        "sourceName": "Tido Eclipse add-on",
                         "manifestXml": validated_xml,
                         "segmentUrls": segment_urls,
                         "requestSession": requests.Session(),
@@ -4781,7 +5292,8 @@ def resolve_tido_eclipse_addon(
                         "sourceBitDepth": dash.get("sourceBitDepth") or bit_depth or (24 if stream_fmt == "HI_RES_LOSSLESS" else 16),
                         "sourceQuality": stream_fmt,
                         "sourceAudioMode": "STEREO",
-                        "sourceProvider": "TIDAL",
+                        "sourceProvider": "TIDAL_ECLIPSE",
+                        "sourceName": "Tido Eclipse add-on",
                         "manifestXml": validated_xml,
                         "segmentUrls": segment_urls,
                         "requestSession": requests.Session(),
@@ -4803,13 +5315,14 @@ def resolve_tido_eclipse_addon(
                     "sourceBitDepth": None if is_atmos else (bit_depth or (24 if is_hires else 16)),
                     "sourceQuality": quality_label or stream_fmt,
                     "sourceAudioMode": "DOLBY_ATMOS" if is_atmos else "STEREO",
-                    "sourceProvider": "TIDAL",
+                    "sourceProvider": "TIDAL_ECLIPSE",
+                    "sourceName": "Tido Eclipse add-on",
                 }
     except Exception as exc:
-        print(f"[-] Tido Eclipse addon resolution error ({requested_fmt}): {exc}")
+        print(f"[-] Tido Eclipse addon resolution error ({requested_fmt}): {type(exc).__name__}")
     return None
 
-def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str, title: str = "", artist: str = "", duration: int | float = 0, explicit_track_id: str = "") -> dict | None:
+def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str, title: str = "", artist: str = "", duration: int | float = 0, explicit_track_id: str = "", addon_id: str = "", addon_name: str = "") -> dict | None:
     """Resolve streams from Eclipse Music addons adhering strictly to the official Eclipse specification."""
     if requested_fmt == "AC4_IMS":
         return None
@@ -4817,7 +5330,20 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
         return resolve_tido_eclipse_addon(addon_manifest_url, isrc, requested_fmt, title=title, artist=artist, isrc=isrc, duration=duration)
     try:
         base = _eclipse_worker_base_url(addon_manifest_url)
-        addon_token = _get_eclipse_addon_access_token("com.yourname.amazonmusic")
+        normalized_addon_id = addon_id.strip()[:256] if isinstance(addon_id, str) else ""
+        normalized_addon_name = addon_name.strip()[:256] if isinstance(addon_name, str) else ""
+        if not normalized_addon_id:
+            manifest = _get_eclipse_manifest(addon_manifest_url)
+            normalized_addon_id = str(manifest.get("id") or "").strip()[:256] if isinstance(manifest, dict) else ""
+            if not normalized_addon_name and isinstance(manifest, dict):
+                normalized_addon_name = str(manifest.get("name") or "").strip()[:256]
+        is_amazon = (
+            normalized_addon_id.lower() == "com.yourname.amazonmusic"
+            or "amazon" in normalized_addon_name.lower()
+            or normalized_addon_name.upper() == "AMZM"
+        )
+        provider_label = "AMAZON" if is_amazon else re.sub(r"[\[\]\r\n]+", " ", normalized_addon_name or normalized_addon_id or "ECLIPSE").strip()[:64]
+        addon_token = _get_eclipse_addon_access_token(normalized_addon_id) if normalized_addon_id else None
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
@@ -4832,11 +5358,11 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
             for attempt in range(2):
                 req = urllib.request.Request(url, headers=headers)
                 try:
-                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    with _eclipse_authenticated_urlopen(req, timeout=timeout) as resp:
                         return json.loads(resp.read().decode("utf-8"))
                 except urllib.error.HTTPError as exc:
                     if exc.code in (401, 403) and attempt == 0:
-                        refreshed = _get_eclipse_addon_access_token("com.yourname.amazonmusic", force_refresh=True)
+                        refreshed = _get_eclipse_addon_access_token(normalized_addon_id, force_refresh=True) if normalized_addon_id else None
                         if refreshed:
                             headers["X-Eclipse-Access"] = refreshed
                             continue
@@ -4868,7 +5394,7 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
         # 1. Primary lookup: GET /search?q={query} when title is known (fastest & most reliable on AMZM worker)
         if not track_id and (title or isrc):
             query = f"{title} {artist}".strip() if title else isrc
-            search_url = f"{base}/search?q={urllib.parse.quote(query)}"
+            search_url = _eclipse_worker_url(addon_manifest_url, "search", {"q": query})
             data = _fetch_json(search_url, timeout=5.0)
             if isinstance(data, dict):
                 tracks = data.get("tracks") or data.get("results") or []
@@ -4885,8 +5411,8 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
         # 2. Fallback Spec 7: ISRC resolution -> GET /resolve-isrc/{isrc}
         if not track_id and isrc:
             for isrc_url in (
-                f"{base}/resolve-isrc/{urllib.parse.quote(isrc)}",
-                f"{base}/resolve-isrc?isrc={urllib.parse.quote(isrc)}",
+                _eclipse_worker_url(addon_manifest_url, f"resolve-isrc/{urllib.parse.quote(isrc)}"),
+                _eclipse_worker_url(addon_manifest_url, "resolve-isrc", {"isrc": isrc}),
             ):
                 data = _fetch_json(isrc_url, timeout=4.0)
                 if isinstance(data, dict):
@@ -4897,7 +5423,7 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
         # 3. Fallback Spec 11: Universal Resolve -> GET /resolve
         if not track_id and (isrc or title):
             params = {"isrc": isrc or "", "title": title or "", "artist": artist or ""}
-            resolve_url = f"{base}/resolve?{urllib.parse.urlencode(params)}"
+            resolve_url = _eclipse_worker_url(addon_manifest_url, "resolve", params)
             data = _fetch_json(resolve_url, timeout=4.0)
             if isinstance(data, dict):
                 item = data.get("item")
@@ -4931,7 +5457,7 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
                 s_data = cached_s.get("data")
 
         if not isinstance(s_data, dict):
-            stream_url = f"{base}/stream/{urllib.parse.quote(str(target_id))}?quality={urllib.parse.quote(quality_param)}"
+            stream_url = _eclipse_worker_url(addon_manifest_url, f"stream/{urllib.parse.quote(str(target_id))}", {"quality": quality_param})
             s_data = _fetch_json(stream_url, timeout=6.0)
             if isinstance(s_data, dict) and isinstance(stream_cache, dict):
                 stream_cache[stream_cache_key] = {
@@ -4954,7 +5480,7 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
             sr_check = int(s_data.get("sampleRate") or 44100)
             bd_check = int(s_data.get("bitDepth") or 16)
             if sr_check > 48000 or bd_check > 16:
-                lossless_url = f"{base}/stream/{urllib.parse.quote(str(target_id))}?quality=Lossless"
+                lossless_url = _eclipse_worker_url(addon_manifest_url, f"stream/{urllib.parse.quote(str(target_id))}", {"quality": "Lossless"})
                 lossless_data = _fetch_json(lossless_url, timeout=6.0)
                 if isinstance(lossless_data, dict):
                     s_data = lossless_data
@@ -5007,19 +5533,19 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
                 source_bitrate_basis = "Estimated FLAC"
 
             if is_atmos:
-                human_label = "[AMAZON] Dolby Atmos (E-AC-3 JOC)"
+                human_label = "[AMAZON] Dolby Atmos (E-AC-3 JOC)" if is_amazon else f"[{provider_label}] Dolby Atmos (E-AC-3 JOC)"
                 norm_codec = "eac3_joc"
                 source_codec = "EAC3_JOC"
                 source_audio_mode = "DOLBY_ATMOS"
                 channels = int(s.get("channels") or 6)
             elif is_hires:
-                human_label = f"[AMAZON] Hi-Res FLAC ({bit_depth}-bit/{sample_rate / 1000:g}kHz)"
+                human_label = f"[{provider_label}] Hi-Res FLAC ({bit_depth}-bit/{sample_rate / 1000:g}kHz)"
                 norm_codec = "flac"
                 source_codec = "FLAC"
                 source_audio_mode = "STEREO"
                 channels = int(s.get("channels") or 2)
             else:
-                human_label = "[AMAZON] Lossless FLAC"
+                human_label = f"[{provider_label}] Lossless FLAC"
                 norm_codec = "flac"
                 source_codec = "FLAC"
                 source_audio_mode = "STEREO"
@@ -5039,16 +5565,17 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
                 "sourceBitDepth": bit_depth,
                 "sourceQuality": quality_label or stream_fmt,
                 "sourceAudioMode": source_audio_mode,
-                "sourceProvider": "AMAZON",
+                "sourceProvider": "AMAZON" if is_amazon else "ECLIPSE",
+                "sourceName": normalized_addon_name or normalized_addon_id or "Eclipse add-on",
                 "sourceAuthProfile": "eclipse_addon",
                 "sourceMetadata": dict(matched_track_meta),
             }
     except Exception as exc:
-        print(f"[-] Eclipse addon resolution error ({requested_fmt}): {exc}")
+        print(f"[-] Eclipse addon resolution error ({requested_fmt}): {type(exc).__name__}")
     return None
 
 
-def resolve_with_priority(track_id: int | str, priority_list: list[str], title_hint: str = "", artist_hint: str = "") -> dict:
+def resolve_with_priority(track_id: int | str, priority_list: list[str], title_hint: str = "", artist_hint: str = "", provider_key: str | None = None) -> dict:
     resolvers = {
         "EAC3_JOC": lambda tid: resolve_eac3_joc(tid),
         "AC4_IMS": lambda tid: resolve_ac4_ims(tid),
@@ -5060,21 +5587,52 @@ def resolve_with_priority(track_id: int | str, priority_list: list[str], title_h
     is_numeric = clean_id_str.isdigit()
 
     settings = load_settings()
-    raw_eclipse_addons = settings.get("eclipse_addons", [])
-    amazon_addons = [u for u in raw_eclipse_addons if isinstance(u, str) and u.strip() and not _is_tido_eclipse_addon(u)]
-    configured_tido_addons = [u for u in raw_eclipse_addons if isinstance(u, str) and u.strip() and _is_tido_eclipse_addon(u)]
-    tido_manifest = configured_tido_addons[0] if configured_tido_addons else DEFAULT_TIDO_ECLIPSE_MANIFEST
-
-    source_mode = settings.get("realmax_source", "auto")
+    provider_order, addon_providers = _ordered_resolution_providers(settings)
     main_api_authorized = is_main_tidal_api_authorized()
+    if provider_key:
+        if provider_key == "tidal_api":
+            if provider_key not in provider_order or not main_api_authorized:
+                raise RuntimeError("The selected TIDAL API provider is unavailable or not authorized")
+        else:
+            provider = addon_providers.get(provider_key)
+            if provider_key not in provider_order or not isinstance(provider, dict):
+                raise RuntimeError("The selected Eclipse provider is unavailable or no longer enabled")
+            addon_url = provider.get("manifestUrl")
+            if not isinstance(addon_url, str) or not addon_url:
+                raise RuntimeError("The selected Eclipse provider has no valid manifest")
+            clean_id = str(track_id).strip()
+            for fmt in priority_list:
+                if fmt == "AC4_IMS":
+                    continue
+                if _is_tido_eclipse_addon(addon_url):
+                    resolved = resolve_tido_eclipse_addon(
+                        addon_url, clean_id, fmt, title=title_hint, artist=artist_hint,
+                    )
+                else:
+                    resolved = resolve_eclipse_addon(
+                        addon_url, "", fmt, title_hint, artist_hint,
+                        explicit_track_id=clean_id,
+                        addon_id=str(provider.get("addonId") or ""),
+                        addon_name=str(provider.get("name") or provider.get("displayName") or ""),
+                    )
+                if resolved:
+                    return resolved
+            raise RuntimeError(f"Could not resolve track {clean_id} from the selected Eclipse provider")
+    tidal_selected = "tidal_api" in provider_order
+    selected_addons = [
+        (key, addon_providers[key]) for key in provider_order
+        if key != "tidal_api" and key in addon_providers
+    ]
 
     if not is_numeric:
-        if not amazon_addons:
-            raise RuntimeError(f"Cannot resolve non-numeric Amazon/Eclipse track '{clean_id_str}' without an Amazon Eclipse addon configured")
+        non_tidal_addons = [row for _, row in selected_addons if not _is_tido_eclipse_addon(row.get("manifestUrl", ""))]
+        if not non_tidal_addons:
+            raise RuntimeError(f"Cannot resolve non-numeric track '{clean_id_str}' without a selected compatible Eclipse add-on")
         for fmt in priority_list:
             if fmt == "AC4_IMS":
                 continue
-            for addon_url in amazon_addons:
+            for provider in non_tidal_addons:
+                addon_url = provider["manifestUrl"]
                 addon_res = resolve_eclipse_addon(
                     addon_url,
                     "",
@@ -5083,9 +5641,11 @@ def resolve_with_priority(track_id: int | str, priority_list: list[str], title_h
                     artist_hint or "",
                     duration=0,
                     explicit_track_id=clean_id_str,
+                    addon_id=str(provider.get("addonId") or ""),
+                    addon_name=str(provider.get("name") or provider.get("displayName") or ""),
                 )
                 if addon_res:
-                    print(f"[RealMAX] Selected Amazon Eclipse addon stream for ASIN {clean_id_str} ({fmt})")
+                    print(f"[RealMAX] Selected Eclipse add-on {provider.get('name') or provider.get('addonId') or provider_key} for track {clean_id_str} ({fmt})")
                     return addon_res
         raise RuntimeError(f"Could not resolve any audio stream for track {clean_id_str}")
 
@@ -5097,7 +5657,7 @@ def resolve_with_priority(track_id: int | str, priority_list: list[str], title_h
     track_artist = artist_hint or ""
     orig = None
 
-    if main_api_authorized:
+    if tidal_selected and main_api_authorized:
         try:
             import tidalapi
             for sess_getter in (get_python_tidal_session, get_python_tidal_mobile_session):
@@ -5126,7 +5686,7 @@ def resolve_with_priority(track_id: int | str, priority_list: list[str], title_h
             pass
 
     # RealMAX cross-edition discovery: find alternate album releases (Atmos editions, Deluxe Hi-Res, etc.)
-    if source_mode != "amazon_only" and main_api_authorized:
+    if tidal_selected and main_api_authorized:
         try:
             import tidalapi
             session = None
@@ -5141,25 +5701,21 @@ def resolve_with_priority(track_id: int | str, priority_list: list[str], title_h
                 query = f"{track_title} {track_artist}".strip()
                 search_res = session.search(query, models=[tidalapi.media.Track], limit=20)
                 for cand in search_res.get("tracks", []):
-                    if cand.id != track_id and cand.name.lower() == orig.name.lower() and abs(cand.duration - orig.duration) <= 6:
+                    if _tidal_alternate_track_matches(orig, cand):
                         candidate_ids.append(cand.id)
         except Exception as exc:
             print(f"[-] RealMAX candidate search error: {exc}")
 
-    # Evaluate each format in user's strict priority order
+    # Format order is the outer preference; within each format, use the
+    # user's selected provider order. This lets AC-4 win when preferred while
+    # still allowing account add-ons to outrank one another for E-AC-3/FLAC.
     for fmt in priority_list:
         if fmt not in resolvers:
             continue
-        if (track_isrc or track_title) and amazon_addons and source_mode != "tidal_only":
-            # Amazon Music does not carry Dolby AC-4 IMS; skip AC4_IMS for Amazon queries
-            if fmt != "AC4_IMS":
-                for addon_url in amazon_addons:
-                    addon_res = resolve_eclipse_addon(addon_url, track_isrc or "", fmt, track_title, track_artist, duration=getattr(orig, "duration", 0) if orig else 0)
-                    if addon_res:
-                        print(f"[RealMAX] Selected Eclipse addon {addon_res.get('sourceProvider')} stream for {track_id} ({fmt})")
-                        return addon_res
-        if source_mode != "amazon_only":
-            if main_api_authorized:
+        for provider_key in provider_order:
+            if provider_key == "tidal_api":
+                if not main_api_authorized:
+                    continue
                 for tid in candidate_ids:
                     try:
                         res = resolvers[fmt](tid)
@@ -5173,19 +5729,28 @@ def resolve_with_priority(track_id: int | str, priority_list: list[str], title_h
                         raise
                     except Exception:
                         pass
-            elif fmt != "AC4_IMS":
-                # Main TIDAL API is not authorized: use Tido Eclipse addon for EAC3_JOC, HI_RES_LOSSLESS, and LOSSLESS
-                tido_res = resolve_tido_eclipse_addon(
-                    tido_manifest,
-                    track_id,
-                    fmt,
-                    title=track_title,
-                    artist=track_artist,
-                    isrc=track_isrc or "",
+                continue
+            provider = addon_providers.get(provider_key)
+            if not provider or fmt == "AC4_IMS":
+                continue
+            addon_url = provider.get("manifestUrl")
+            if not isinstance(addon_url, str) or not addon_url:
+                continue
+            if _is_tido_eclipse_addon(addon_url):
+                addon_res = resolve_tido_eclipse_addon(
+                    addon_url, track_id, fmt, title=track_title,
+                    artist=track_artist, isrc=track_isrc or "",
                 )
-                if tido_res:
-                    print(f"[RealMAX] Selected Tido Eclipse fallback stream for {track_id} ({fmt})")
-                    return tido_res
+            else:
+                addon_res = resolve_eclipse_addon(
+                    addon_url, track_isrc or "", fmt, track_title,
+                    track_artist, duration=getattr(orig, "duration", 0) if orig else 0,
+                    addon_id=str(provider.get("addonId") or ""),
+                    addon_name=str(provider.get("name") or provider.get("displayName") or ""),
+                )
+            if addon_res:
+                print(f"[RealMAX] Selected Eclipse provider {provider.get('displayName') or provider.get('addonId') or provider_key} for {track_id} ({fmt})")
+                return addon_res
 
     raise RuntimeError(f"Could not resolve any audio stream for track {track_id}")
 
@@ -5193,75 +5758,104 @@ def resolve_with_priority(track_id: int | str, priority_list: list[str], title_h
 
 
 def execute_multi_source_search(query: str, limit: int = 10) -> dict:
-    """Concurrently search TIDAL, Amazon Music, and Tido Eclipse addons, merging and deduplicating results."""
+    """Search the primary TIDAL API and every configured Eclipse addon."""
     clean_q = (query or "").strip()
     if not clean_q:
         return {"query": "", "tracks": []}
 
     results = {"query": clean_q, "tracks": []}
     tidal_tracks = []
-    amazon_tracks = []
+    eclipse_tracks = []
+    settings = load_settings()
+    provider_order, addon_providers = _ordered_resolution_providers(settings)
 
     # 1. Search TIDAL
-    try:
-        sess = get_python_tidal_session()
-        if sess:
-            import tidalapi
-            t_res = sess.search(clean_q, models=[tidalapi.media.Track], limit=limit)
-            for t in t_res.get("tracks", []):
-                modes = getattr(t, "audio_modes", []) or []
-                is_atmos = any("DOLBY_ATMOS" in str(m).upper() for m in modes)
-                tidal_tracks.append({
-                    "id": t.id,
-                    "title": t.name,
-                    "artist": t.artist.name if getattr(t, "artist", None) else "",
-                    "album": t.album.name if getattr(t, "album", None) else "",
-                    "duration": int(getattr(t, "duration", 0) or 0),
-                    "isAtmos": is_atmos,
-                    "quality": getattr(t, "audio_quality", "LOSSLESS"),
-                    "cover": t.album.image(640) if hasattr(t.album, "image") else "",
-                    "isrc": getattr(t, "isrc", "") or "",
-                    "source": "TIDAL",
-                })
-    except Exception as exc:
-        print(f"[-] TIDAL multi-search error: {exc}")
-
-    # 2. Search Amazon Music Eclipse Addon
-    try:
-        settings = load_settings()
-        addons = settings.get("eclipse_addons", [])
-        amazon_addons = [u for u in addons if isinstance(u, str) and u.strip() and not _is_tido_eclipse_addon(u)]
-        if amazon_addons:
-            addon_url = amazon_addons[0]
-            base = _eclipse_worker_base_url(addon_url)
-            token = _get_eclipse_addon_access_token("com.yourname.amazonmusic")
-            headers = {
-                "User-Agent": "Mozilla/5.0",
-                "X-Client-Platform": "web",
-                "Origin": "https://eclipsemusic.app",
-                "Referer": "https://eclipsemusic.app/",
-            }
-            if token:
-                headers["X-Eclipse-Access"] = token
-            s_url = f"{base}/search?q={urllib.parse.quote(clean_q)}"
-            req = urllib.request.Request(s_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=6.0) as r:
-                a_data = json.loads(r.read().decode("utf-8"))
-                for t in a_data.get("tracks", [])[:limit]:
-                    amazon_tracks.append({
-                        "id": t.get("id"),
-                        "title": t.get("title") or "Unknown Title",
-                        "artist": t.get("artist") or "Unknown Artist",
-                        "album": t.get("album") or "Unknown Album",
-                        "duration": int(t.get("duration") or 0),
-                        "isAtmos": bool(t.get("atmosAvailable")),
-                        "quality": t.get("audioQuality") or "FLAC",
-                        "cover": t.get("artworkURL") or "",
-                        "isrc": t.get("isrc") or "",
-                        "source": "AMAZON",
+    if "tidal_api" in provider_order:
+        try:
+            sess = get_python_tidal_session()
+            if sess:
+                import tidalapi
+                t_res = sess.search(clean_q, models=[tidalapi.media.Track], limit=limit)
+                for t in t_res.get("tracks", []):
+                    modes = getattr(t, "audio_modes", []) or []
+                    is_atmos = any("DOLBY_ATMOS" in str(m).upper() for m in modes)
+                    tidal_tracks.append({
+                        "id": t.id,
+                        "providerKey": "tidal_api",
+                        "title": t.name,
+                        "artist": t.artist.name if getattr(t, "artist", None) else "",
+                        "album": t.album.name if getattr(t, "album", None) else "",
+                        "duration": int(getattr(t, "duration", 0) or 0),
+                        "isAtmos": is_atmos,
+                        "quality": getattr(t, "audio_quality", "LOSSLESS"),
+                        "cover": t.album.image(640) if hasattr(t.album, "image") else "",
+                        "isrc": getattr(t, "isrc", "") or "",
+                        "source": "TIDAL",
                     })
-    except Exception as exc:
-        print(f"[-] Amazon multi-search error: {exc}")
+        except Exception as exc:
+            print(f"[-] TIDAL multi-search error: {exc}")
+
+    # Search only selected Eclipse providers, preserving the configured
+    # provider order. Account-linked providers are loaded from Eclipse itself.
+    for provider_key in provider_order:
+        if provider_key == "tidal_api":
+            continue
+        provider_info = addon_providers.get(provider_key) or {}
+        addon_url = provider_info.get("manifestUrl")
+        if not isinstance(addon_url, str) or not addon_url.strip():
+            continue
+        addon_id = provider_info.get("addonId")
+        addon_name = str(provider_info.get("name") or provider_info.get("displayName") or addon_id or "Eclipse add-on").strip()
+        if not isinstance(addon_id, str) or not addon_id.strip():
+            manifest = _get_eclipse_manifest(addon_url)
+            if not manifest:
+                continue
+            addon_id = manifest["id"].strip()
+            addon_name = str(manifest.get("name") or addon_id).strip()
+        if addon_id.lower() == "com.yourname.amazonmusic" or "amazon" in addon_name.lower() or addon_name.upper() == "AMZM":
+            provider = "AMAZON"
+        elif _is_tido_eclipse_addon(addon_url) or addon_id.lower() == "com.yourname.tidal.hifi":
+            provider = "TIDAL_ECLIPSE"
+        else:
+            provider = "ECLIPSE"
+        headers = {
+            "User-Agent": "OmniphonyEX/1.0 Eclipse addon client",
+            "Accept": "application/json, text/plain, */*",
+            "X-Client-Platform": "web",
+            "Origin": "https://eclipsemusic.app",
+            "Referer": "https://eclipsemusic.app/",
+        }
+        token = _get_eclipse_addon_access_token(addon_id)
+        if token:
+            headers["X-Eclipse-Access"] = token
+        search_url = _eclipse_worker_url(addon_url, "search", {"q": clean_q})
+        try:
+            req = urllib.request.Request(search_url, headers=headers)
+            with _eclipse_authenticated_urlopen(req, timeout=6.0) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            tracks = payload.get("tracks") or payload.get("results") or [] if isinstance(payload, dict) else payload
+            for track in tracks[:max(1, min(int(limit), 50))] if isinstance(tracks, list) else []:
+                if not isinstance(track, dict) or track.get("id") is None:
+                    continue
+                atmosphere = track.get("atmosAvailable") or track.get("isAtmos") or track.get("atmos")
+                eclipse_tracks.append({
+                    "id": track.get("id"),
+                    "providerKey": provider_key,
+                    "title": track.get("title") or track.get("name") or "Unknown Title",
+                    "artist": track.get("artist") or track.get("artistName") or "Unknown Artist",
+                    "album": track.get("album") or track.get("albumTitle") or "Unknown Album",
+                    "duration": int(track.get("duration") or track.get("durationSeconds") or 0),
+                    "isAtmos": bool(atmosphere),
+                    "quality": track.get("audioQuality") or track.get("quality") or "",
+                    "cover": track.get("artworkURL") or track.get("cover") or track.get("artwork") or "",
+                    "isrc": track.get("isrc") or "",
+                    "source": provider,
+                    "sourceName": addon_name,
+                })
+        except urllib.error.HTTPError as exc:
+            print(f"[-] Eclipse search failed for {addon_id}: HTTP {exc.code}")
+        except Exception as exc:
+            print(f"[-] Eclipse search failed for {addon_id}: {type(exc).__name__}")
 
     # 3. Merge, Deduplicate & Badge
     seen_isrc = set()
@@ -5277,7 +5871,7 @@ def execute_multi_source_search(query: str, limit: int = 10) -> dict:
 
         # Cross-reference Amazon for Atmos upgrade
         amz_match = next((
-            a for a in amazon_tracks
+            a for a in eclipse_tracks if a["source"] == "AMAZON"
             if (a["isrc"] and a["isrc"].upper() == item["isrc"].upper())
             or (re.sub(r"[^a-z0-9]+", " ", a["title"].lower()).strip() == norm_t and re.sub(r"[^a-z0-9]+", " ", a["artist"].lower()).strip() == norm_a)
         ), None)
@@ -5290,18 +5884,23 @@ def execute_multi_source_search(query: str, limit: int = 10) -> dict:
             }
         results["tracks"].append(item)
 
-    for a in amazon_tracks:
+    for a in eclipse_tracks:
         norm_t = re.sub(r"[^a-z0-9]+", " ", a["title"].lower()).strip()
         norm_a = re.sub(r"[^a-z0-9]+", " ", a["artist"].lower()).strip()
         key = f"{norm_t}|{norm_a}"
-        if (a["isrc"] and a["isrc"].upper() in seen_isrc) or (key in seen_keys):
+        # Keep cross-provider matches visible with the correct provider badge;
+        # suppress repeated copies only within the same addon.
+        dedup_key = (str(a.get("providerKey") or a.get("source") or "ECLIPSE"), str(a.get("id")))
+        if dedup_key in seen_keys:
             continue
-        seen_keys.add(key)
-        if a["isrc"]:
-            seen_isrc.add(a["isrc"].upper())
+        seen_keys.add(dedup_key)
+        matched_tid = next((t for t in tidal_tracks if
+            (a["isrc"] and t["isrc"] and a["isrc"].upper() == t["isrc"].upper()) or
+            (re.sub(r"[^a-z0-9]+", " ", t["title"].lower()).strip() == norm_t and
+             re.sub(r"[^a-z0-9]+", " ", t["artist"].lower()).strip() == norm_a)), None)
         results["tracks"].append({
             **a,
-            "exclusive": True,
+            "exclusive": a["source"] == "AMAZON" and matched_tid is None,
         })
 
     return results
@@ -5748,7 +6347,10 @@ def execute_track_download(job_id: str, payload: dict) -> None:
             ACTIVE_DOWNLOADS[job_id]["progress"] = 15
 
         track_id_param = int(track_id) if str(track_id).strip().isdigit() else str(track_id).strip()
-        stream_info = resolve_with_priority(track_id_param, priority, title_hint=title, artist_hint=artist)
+        stream_info = resolve_with_priority(
+            track_id_param, priority, title_hint=title, artist_hint=artist,
+            provider_key=payload.get("providerKey"),
+        )
         if not stream_info or not stream_info.get("uri"):
             raise RuntimeError("Could not resolve audio stream for track")
 
@@ -5773,7 +6375,7 @@ def execute_track_download(job_id: str, payload: dict) -> None:
         lyrics_synced = str(payload.get("syncedLyrics") or "")
         resolved_cover_url = art_url
 
-        # Amazon metadata is taken only from the exact resolved stream result.
+        # Eclipse metadata is taken only from the exact resolved stream result.
         metadata_state = {
             "title": title, "artist": artist, "album": album, "album_artist": album_artist,
             "year": year, "track_num": track_num, "disc_num": disc_num, "isrc": isrc,
@@ -5781,7 +6383,7 @@ def execute_track_download(job_id: str, payload: dict) -> None:
             "art_url": resolved_cover_url, "lyrics_text": lyrics_text, "lyrics_synced": lyrics_synced,
         }
         source_metadata = stream_info.get("sourceMetadata")
-        if provider == "AMAZON" and isinstance(source_metadata, dict):
+        if provider in {"AMAZON", "ECLIPSE", "TIDAL_ECLIPSE"} and isinstance(source_metadata, dict):
             apply_provider_metadata(source_metadata, metadata_state)
         title = metadata_state["title"]
         artist = metadata_state["artist"]
@@ -5798,10 +6400,12 @@ def execute_track_download(job_id: str, payload: dict) -> None:
         lyrics_text = metadata_state["lyrics_text"]
         lyrics_synced = metadata_state["lyrics_synced"]
 
-        # Enrich TIDAL tracks from python-tidal only. Amazon IDs are unrelated
-        # identifiers and must never be looked up as TIDAL track IDs.
+        # Only a main TIDAL API result can be looked up with python-tidal.
+        # Eclipse addon IDs can be numeric too, but belong to their own catalog.
         try:
-            sess = get_python_tidal_session() if provider != "AMAZON" else None
+            source_key = str(payload.get("providerKey") or "")
+            tidal_origin = source_key == "tidal_api" or (not source_key and provider == "TIDAL")
+            sess = get_python_tidal_session() if provider == "TIDAL" and tidal_origin else None
             if sess and str(track_id).strip().isdigit():
                 t_obj = sess.track(int(track_id))
                 if t_obj:
@@ -5876,7 +6480,7 @@ def execute_track_download(job_id: str, payload: dict) -> None:
                     else:
                         print("[-] Cover art response was not a recognized image; skipping artwork")
             except Exception as e:
-                print(f"[-] Cover art download error: {e}")
+                print(f"[-] Cover art download error: {safe_process_error(str(e), limit=500)}")
 
         comments = {
             "TITLE": title,
@@ -6054,10 +6658,11 @@ def execute_track_download(job_id: str, payload: dict) -> None:
             }
 
     except Exception as exc:
-        print(f"[-] Download error for {title}: {exc}")
+        safe_error = safe_process_error(str(exc), limit=500)
+        print(f"[-] Download error for {title}: {safe_error}")
         with DOWNLOAD_QUEUE_LOCK:
             ACTIVE_DOWNLOADS[job_id]["status"] = "failed"
-            ACTIVE_DOWNLOADS[job_id]["error"] = str(exc)
+            ACTIVE_DOWNLOADS[job_id]["error"] = safe_error
             ACTIVE_DOWNLOADS[job_id]["errorType"] = type(exc).__name__
     finally:
         for leftover in (temp_dest, temp_lyrics):
@@ -6273,13 +6878,31 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
         elif parsed.path == "/config":
             try:
-                self.send_json(load_settings())
+                public_settings = dict(load_settings())
+                self.send_json(public_settings)
             except OSError as exc:
                 print(f"[-] Config read error: {exc}")
                 self.send_json({"error": "configuration unavailable; original file preserved"}, status=500)
 
+        elif parsed.path == "/realmax/providers":
+            force_refresh = urllib.parse.parse_qs(parsed.query).get("refresh", [""])[0] == "1"
+            try:
+                provider_config = realmax_provider_configuration(load_settings(), force_account_refresh=force_refresh)
+                provider_config.pop("_internal_records", None)
+                self.send_json(provider_config)
+            except Exception as exc:
+                self.send_json({"error": f"provider list unavailable ({type(exc).__name__})"}, status=502)
+
         elif parsed.path == "/login/status":
             self.send_json(public_login_flow())
+
+        elif parsed.path == "/eclipse-auth/status":
+            self.send_json(eclipse_account_status())
+
+        elif parsed.path == "/eclipse-auth/addons":
+            force_refresh = urllib.parse.parse_qs(parsed.query).get("refresh", [""])[0] == "1"
+            account = eclipse_account_addons(force_refresh=force_refresh)
+            self.send_json(public_eclipse_account_addons(account))
 
         elif parsed.path == "/clock":
             # Keep the renderer's high-rate clock path read-only and cheap.
@@ -6704,7 +7327,26 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 pass
             return self.send_json({"error": f"invalid JSON request: {exc}"}, status=400)
 
-        if parsed.path == "/diag":
+        if parsed.path == "/eclipse-auth/complete":
+            token = body.get("token")
+            if not isinstance(token, str):
+                return self.send_json({"connected": False, "error": "missing account token"}, status=400)
+            connected, user, error = _complete_eclipse_login(token.strip())
+            if not connected:
+                status = 401 if error in {"unauthorized", "account_not_verified", "invalid_token"} else 502
+                return self.send_json({"connected": False, "error": error}, status=status)
+            return self.send_json({"connected": True, "user": user})
+
+        elif parsed.path == "/eclipse-auth/disconnect":
+            with _ECLIPSE_AUTH_LOCK:
+                try:
+                    ECLIPSE_SESSION_FILE.unlink(missing_ok=True)
+                except OSError:
+                    return self.send_json({"error": "could not remove the saved account session"}, status=500)
+                _invalidate_eclipse_account_cache(clear_jwt=True)
+            return self.send_json({"connected": False})
+
+        elif parsed.path == "/diag":
             debug_dump = DATA_DIR / "logs" / "tidal_redux_dump.json"
             debug_dump.parent.mkdir(parents=True, exist_ok=True)
             with open(debug_dump, "w", encoding="utf-8") as f:
@@ -6712,8 +7354,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             return self.send_json({"ok": True})
 
         if parsed.path == "/config":
-            if not isinstance(body, dict) or not set(body).issubset({"priority", "eclipse_addons", "realmax_source"}):
-                return self.send_json({"error": "expected an object containing only priority"}, status=400)
+            if not isinstance(body, dict) or not set(body).issubset({
+                "priority", "realmax_source", "realmax_provider_order"
+            }):
+                return self.send_json({"error": "unsupported configuration field"}, status=400)
             updates = {}
             if "priority" in body:
                 priority = body["priority"]
@@ -6726,13 +7370,20 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                         "supported": list(SUPPORTED_FORMAT_PRIORITY),
                     }, status=400)
                 updates["priority"] = priority
-            if "eclipse_addons" in body:
+            if "realmax_source" in body and body["realmax_source"] in REALMAX_SOURCE_ALIASES:
+                updates["realmax_source"] = normalize_realmax_source(body["realmax_source"])
+            elif "realmax_source" in body:
+                return self.send_json({
+                    "error": "realmax_source must be both, tidal_api, or eclipse_addons",
+                    "supported": ["both", "tidal_api", "eclipse_addons"],
+                }, status=400)
+            if "realmax_provider_order" in body:
                 try:
-                    updates["eclipse_addons"] = validate_eclipse_addon_urls(body["eclipse_addons"])
+                    updates["realmax_provider_order"] = validate_realmax_provider_order(
+                        body["realmax_provider_order"]
+                    )
                 except ValueError as exc:
                     return self.send_json({"error": str(exc)}, status=400)
-            if "realmax_source" in body and body["realmax_source"] in ("auto", "tidal_only", "amazon_only"):
-                updates["realmax_source"] = body["realmax_source"]
             try:
                 settings = update_settings(updates)
             except OSError as exc:
@@ -6806,6 +7457,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
         elif parsed.path == "/play":
             track_id = body.get("trackId")
+            provider_key = body.get("providerKey")
             time_pos = body.get("timePos", 0.0)
             title = body.get("title", "")
             artist = body.get("artist", "")
@@ -6814,6 +7466,11 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
             if not track_id:
                 return self.send_json({"error": "missing trackId"}, status=400)
+            if provider_key is not None:
+                try:
+                    validate_realmax_provider_order([provider_key])
+                except ValueError as exc:
+                    return self.send_json({"error": str(exc)}, status=400)
             if not isinstance(start_paused, bool):
                 return self.send_json({"error": "startPaused must be a boolean"}, status=400)
             if request_id is not None or start_paused:
@@ -6846,12 +7503,15 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
             try:
                 track_id_param = int(track_id) if str(track_id).strip().isdigit() else str(track_id).strip()
-                stream_info = resolve_with_priority(track_id_param, priority, title_hint=title, artist_hint=artist)
+                stream_info = resolve_with_priority(
+                    track_id_param, priority, title_hint=title, artist_hint=artist,
+                    provider_key=provider_key,
+                )
             except RuntimeError as exc:
                 return self.send_json({
                     "error": str(exc),
                     "trackId": track_id,
-                    "sourceMode": settings.get("realmax_source", "auto"),
+                    "sourceMode": normalize_realmax_source(settings.get("realmax_source", "both")),
                 }, status=404)
             except Ac4TransportUnavailable as exc:
                 return self.send_json({
@@ -7306,6 +7966,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                         "sourceQuality": stream_info.get("sourceQuality"),
                         "sourceAudioMode": stream_info.get("sourceAudioMode"),
                         "sourceProvider": stream_info.get("sourceProvider", "TIDAL"),
+                        "sourceName": stream_info.get("sourceName") or ("TIDAL API" if stream_info.get("sourceProvider", "TIDAL") == "TIDAL" else ""),
                         "presentation": stream_info.get("presentation"),
                         "presentationVerified": stream_info.get("presentationVerified", False),
                         "decodedSampleRate": stream_info.get("decodedSampleRate"),
@@ -7660,6 +8321,11 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             track_id = body.get("trackId")
             if not track_id:
                 return self.send_json({"error": "missing trackId"}, status=400)
+            if body.get("providerKey") is not None:
+                try:
+                    validate_realmax_provider_order([body.get("providerKey")])
+                except ValueError as exc:
+                    return self.send_json({"error": str(exc)}, status=400)
             job_id = uuid.uuid4().hex
             threading.Thread(target=execute_track_download, args=(job_id, body), daemon=True).start()
             self.send_json({"status": "queued", "jobId": job_id})

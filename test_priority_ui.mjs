@@ -1471,6 +1471,7 @@ const resumeGuardSeekCommands = [];
 const resumeGuardSeekEvents = [];
 const resumeGuardSeekSandbox = {
   desiredPlaybackIntent: true,
+  transportIntentRevision: 0,
   playIntentChangedAt: 1000,
   currentStatusData: {
     trackId: 42, playbackGeneration: 4, requestId: "r42",
@@ -1493,7 +1494,7 @@ const resumeGuardSeekSandbox = {
   sendEngineCommand: async (...args) => { resumeGuardSeekCommands.push(args); return true; },
 };
 vm.createContext(resumeGuardSeekSandbox);
-vm.runInContext(`const PLAY_INTENT_RECONCILIATION_WINDOW_MS = 1000;\nfunction tracePlaybackEvent() {}\n${extractFunction("parsePlaybackPosition")}\n${extractFunction("getPlaybackInstanceIdentity")}\n${extractFunction("hasRecentTidalSeekIntent")}\n${extractFunction("handleImmediateTidalSeek")}`, resumeGuardSeekSandbox);
+vm.runInContext(`const PLAY_INTENT_RECONCILIATION_WINDOW_MS = 1000;\nfunction tracePlaybackEvent() {}\n${extractFunction("parsePlaybackPosition")}\n${extractFunction("getPlaybackInstanceIdentity")}\n${extractFunction("hasRecentTidalSeekIntent")}\n${extractFunction("isPairedNativeTimelineSeek")}\n${extractFunction("handleImmediateTidalSeek")}`, resumeGuardSeekSandbox);
 assert.equal(await resumeGuardSeekSandbox.handleImmediateTidalSeek(0), true,
   "the transient zero seek emitted during Play startup is consumed");
 assert.equal(resumeGuardSeekCommands.length, 0,
@@ -1895,6 +1896,7 @@ vm.runInContext(`
   const PLAY_INTENT_RECONCILIATION_WINDOW_MS = 1000;
   const EXPLICIT_PLAY_HANDOFF_TIMEOUT_MS = 15000;
   ${extractFunction("getPlaybackInstanceIdentity")}
+  ${extractFunction("isPairedNativeTimelineSeek")}
   let seekToEndPlaybackIdentity = null;
   let seekToEndTargetPosition = null;
   let seekToEndProgressObserved = false;
@@ -1908,7 +1910,16 @@ vm.runInContext(`
   let nativeSliderInteractionObservedFooter = null;
   let nativeSliderInteractionCleanup = null;
   const NATIVE_SLIDER_INTERACTION_HOLD_MS = 250;
-  const unloads = { add(callback) { globalThis.pluginCleanup = callback; }, delete() {} };
+  const cleanupCallbacks = new Set();
+  const unloads = {
+    add(callback) {
+      cleanupCallbacks.add(callback);
+      globalThis.pluginCleanup = () => {
+        for (const cleanup of [...cleanupCallbacks].reverse()) cleanup();
+      };
+    },
+    delete(callback) { cleanupCallbacks.delete(callback); },
+  };
   ${extractFunction("readInlineTransform")}
   ${extractFunction("disconnectNativeSliderInteractionGuards")}
   ${extractFunction("restoreNativeProgressFillProjection")}
@@ -2212,6 +2223,7 @@ vm.runInContext(`
   ${extractFunction("hasPendingExplicitPlayIntent")}
   const SEEK_RECONCILIATION_WINDOW_MS = 2000;
   const SEEK_RECONCILIATION_TOLERANCE_SECONDS = 0.25;
+  const SEEK_PENDING_PLAYBACK_HOLD_MS = 33_000;
   const MAX_NATIVE_TIMELINE_SAMPLE_AGE_MS = 250;
   function tracePlaybackEvent(event) { syncEventLog.push(event); }
   function invalidateEngineStatus() {}
@@ -2236,6 +2248,9 @@ vm.runInContext(`
   ${extractFunction("hasTidalClockDiscontinuity")}
   ${extractFunction("shouldSuppressStaleZeroSeek")}
   ${extractFunction("shouldHoldEngineClockAfterTidalSeek")}
+  ${extractFunction("shouldPreservePlaybackForTidalSeek")}
+  ${extractFunction("shouldDeferResumeDuringTidalSeek")}
+  ${extractFunction("getPlaybackReconciliationCommand")}
   ${extractFunction("shouldPreserveExplicitPlayIntent")}
   ${extractFunction("captureRadiantSyntheticLyricsSnapshot")}
   ${extractFunction("overlayCapturedRadiantLyricsState")}
@@ -2669,11 +2684,15 @@ assert.deepEqual(Object.getOwnPropertyDescriptor(lyricsProbeStore, "getState"), 
 syncClockSandbox.startSyncLoop();
 async function pollSyncClock(now) {
   syncClockSandbox.syncNow = now;
-  syncClockSandbox.syncStatus.timePosSampleSequence += 1;
-  syncClockSandbox.syncPoll();
+  const sequence = Number(syncClockSandbox.syncStatus.timePosSampleSequence);
+  syncClockSandbox.syncStatus.timePosSampleSequence = Number.isSafeInteger(sequence)
+    ? sequence + 1
+    : Number(syncClockSandbox.clockOrderingSequence) + 1;
+  await syncClockSandbox.syncPoll();
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 await pollSyncClock(1000);
+await pollSyncClock(1050);
 assert.ok(syncClockSandbox.syncEventLog.indexOf("clock") < syncClockSandbox.syncEventLog.indexOf("project"),
   "native slider projection follows TIDAL's Redux clock update so the final render cannot clamp it back");
 let clockProjectionCount = syncClockSandbox.syncEventLog.filter((entry) => entry === "clock").length;
@@ -3074,7 +3093,7 @@ sandbox.availableDevices = [{
 }];
 sandbox.currentConfig.audio_device = "wasapi/{30714dd9-2d0e-4cfb-9b98-558a8c5992da}";
 sandbox.updateBadgeUI("Dolby AC-4 IMS");
-assert.equal(activeBadge.innerText, "[TIDAL] AC-4 IMS \u00b7 256 kbps avg\n48 kHz \u00b7 2 ch",
+assert.equal(activeBadge.innerText, "[TIDAL API] AC-4 IMS \u00b7 256 kbps avg\n48 kHz \u00b7 2 ch",
   "native footer badge shows source codec, measured bitrate, sample rate, and channel count");
 assert.match(activeBadge.title, /Natural .*AC-4 IMS .*Engine clock advancing via OmniFusion/);
 assert.match(activeBadge.title, /Source AC-4 \u00b7 48 kHz \u00b7 2 source ch \u00b7 256 kbps avg source \u00b7 MP4 packet average/);
@@ -3083,7 +3102,7 @@ assert.match(activeBadge.title, /Output 96 kHz \u00b7 8 ch \u00b7 PCM S16 \u00b7
 const ac4StatusForBadge = sandbox.currentStatusData;
 sandbox.currentStatusData = { trackId: 227401768, format: "EAC3_JOC", audioCodec: "eac3", audioBitrate: 768000 };
 sandbox.updateBadgeUI("Atmos JOC");
-assert.equal(activeBadge.innerText, "[TIDAL] E-AC-3 JOC \u00b7 bitrate pending\nrate n/a \u00b7 ch n/a",
+assert.equal(activeBadge.innerText, "[TIDAL API] E-AC-3 JOC \u00b7 bitrate pending\nrate n/a \u00b7 ch n/a",
   "footer marks estimated bitrate and refuses to invent missing source format metrics");
 assert.equal(activeBadge.dataset.omniphonyState, "route-unverified",
   "JOC is never represented as active before Studio, renderer, and orender decoder are confirmed");
@@ -3103,9 +3122,21 @@ assert.equal(sandbox.isVerifiedOmniphonyJocRoute(jocStatus), true);
 sandbox.currentStatusData = jocStatus;
 sandbox.updateBadgeUI("Atmos JOC");
 assert.equal(activeBadge.dataset.omniphonyState, "paused");
-assert.equal(activeBadge.innerText, "[TIDAL] E-AC-3 JOC \u00b7 bitrate pending\n48 kHz \u00b7 6 ch",
+assert.equal(activeBadge.innerText, "[TIDAL API] E-AC-3 JOC \u00b7 bitrate pending\n48 kHz \u00b7 6 ch",
   "JOC badge reports encoded source channels while the tooltip reports rendered output channels");
 assert.match(activeBadge.title, /Omniphony Studio ↔ orender connected · decoder confirmed/);
+const amazonBadgeStatus = { ...jocStatus, sourceProvider: "AMAZON", sourceName: "AMZM" };
+sandbox.currentStatusData = amazonBadgeStatus;
+sandbox.updateBadgeUI("Atmos JOC");
+assert.match(activeBadge.innerText, /^\[Amazon Music · AMZM\]/,
+  "the footer identifies Amazon Music and its connected add-on");
+const tidalEclipseBadgeStatus = { ...jocStatus, sourceProvider: "TIDAL_ECLIPSE", sourceName: "Tido Eclipse add-on" };
+sandbox.currentStatusData = tidalEclipseBadgeStatus;
+sandbox.updateBadgeUI("Atmos JOC");
+assert.match(activeBadge.innerText, /^\[Tido Eclipse add-on\]/,
+  "the footer distinguishes a TIDAL Eclipse connection from the main TIDAL API");
+sandbox.currentStatusData = jocStatus;
+sandbox.updateBadgeUI("Atmos JOC");
 for (const check of Object.keys(jocRouteChecks)) {
   const missing = { ...jocStatus, omniphonyRoute: { ready: true, checks: { ...jocRouteChecks, [check]: false } } };
   assert.equal(sandbox.isVerifiedOmniphonyJocRoute(missing), false, `JOC route requires ${check}`);
@@ -3129,12 +3160,12 @@ sandbox.currentStatusData = {
   audioOutputParams: { samplerate: 96000, "channel-count": 2, format: "s32" },
 };
 sandbox.updateBadgeUI("Hi-Res FLAC");
-assert.equal(activeBadge.innerText, "[TIDAL] Hi-Res FLAC \u00b7 bitrate pending\n96 kHz \u00b7 2 ch");
+assert.equal(activeBadge.innerText, "[TIDAL API] Hi-Res FLAC \u00b7 bitrate pending\n96 kHz \u00b7 2 ch");
 assert.match(activeBadge.title, /Output 96 kHz · Stereo · PCM S32 · 6144 kbps PCM payload/,
   "valid 96 kHz stereo Hi-Res output is reported without a 48 kHz cap");
 sandbox.currentStatusData = { trackId: 227401768, format: "LOSSLESS", audioCodec: "flac", audioBitrate: 0 };
 sandbox.updateBadgeUI("Lossless FLAC");
-assert.equal(activeBadge.innerText, "[TIDAL] Lossless FLAC \u00b7 bitrate pending\nrate n/a \u00b7 ch n/a");
+assert.equal(activeBadge.innerText, "[TIDAL API] Lossless FLAC \u00b7 bitrate pending\nrate n/a \u00b7 ch n/a");
 sandbox.currentTrackId = 10582679;
 sandbox.currentStatusData = {
   trackId: 10582679, format: "LOSSLESS", audioCodec: "flac", sourceCodec: "FLAC",
@@ -3144,7 +3175,7 @@ sandbox.currentStatusData = {
   audioOutputParams: { samplerate: 96000, "channel-count": 8, format: "float" },
 };
 sandbox.updateBadgeUI("Lossless FLAC");
-assert.equal(activeBadge.innerText, "[TIDAL] Lossless FLAC \u00b7 1050.773 kbps MPD\n44.1 kHz · 2 ch · 16-bit");
+assert.equal(activeBadge.innerText, "[TIDAL API] Lossless FLAC \u00b7 1050.773 kbps MPD\n44.1 kHz · 2 ch · 16-bit");
 assert.match(activeBadge.title, /1050\.773 kbps MPD source · TIDAL DASH Representation bandwidth \(declared\)/);
 sandbox.currentTrackId = 227401768;
 sandbox.currentStatusData = ac4StatusForBadge;
@@ -3233,7 +3264,7 @@ sandbox.currentStatusData = {
   audioParams: { samplerate: 48000, "channel-count": 2, format: "s16" }
 };
 sandbox.updateBadgeUI("Dolby AC-4 IMS");
-assert.equal(activeBadge.innerText, "[TIDAL] AC-4 IMS \u00b7 bitrate pending\nrate n/a \u00b7 ch n/a");
+assert.equal(activeBadge.innerText, "[TIDAL API] AC-4 IMS \u00b7 bitrate pending\nrate n/a \u00b7 ch n/a");
 sandbox.seedClockSample();
 sandbox.invalidateEngineStatus("service unavailable");
 assert.equal(activeBadge.innerText, "Omniphony EX \u00b7 Idle");
@@ -3699,6 +3730,7 @@ assert.deepEqual(readinessBlocks, [], "a superseded failed preflight cannot over
 const failedSeekTraceEvents = [];
 const failedSeekTraceSandbox = {
   API_BASE: "http://127.0.0.1:8765",
+  ENGINE_SEEK_REQUEST_TIMEOUT_MS: 32_000,
   pluginDisposed: false,
   tracePlaybackEvent: (event, detail) => failedSeekTraceEvents.push({ event, ...detail }),
   requestWithTimeout: async () => ({

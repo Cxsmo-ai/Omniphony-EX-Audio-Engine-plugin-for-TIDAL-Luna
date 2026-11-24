@@ -1,6 +1,7 @@
 
 import io
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch, MagicMock
 import json
 import os
@@ -11,6 +12,42 @@ from pathlib import Path
 import omnifusion_service as service
 
 class DownloaderTests(unittest.TestCase):
+    def test_failed_download_redacts_signed_stream_url_from_job_status_and_logs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            job_id = "redaction-test-job"
+            signed_url = "https://cdn.example/audio.flac?token=secret-token&sig=secret-signature"
+            output = io.StringIO()
+            http_error = service.requests.HTTPError(
+                f"401 Client Error: Unauthorized for url: {signed_url}"
+            )
+            payload = {
+                "trackId": "123456",
+                "providerKey": "eclipse:" + "a" * 20,
+                "title": "Test Track",
+                "artist": "Test Artist",
+                "album": "Test Album",
+                "destinationFolder": temp,
+                "pathPattern": "{artist}/{album}/{title}",
+            }
+            with patch.object(service, "resolve_with_priority", return_value={
+                    "format": "LOSSLESS", "sourceProvider": "ECLIPSE", "sourceName": "Example Add-on",
+                    "sourceMetadata": {"title": "Provider Track", "artist": "Provider Artist"},
+                    "uri": signed_url, "transport": "DIRECT"}), \
+                    patch.object(service.requests, "get", side_effect=http_error), \
+                    patch.object(service, "get_python_tidal_session") as tidal_session, \
+                    redirect_stdout(output):
+                service.execute_track_download(job_id, payload)
+
+            job = service.ACTIVE_DOWNLOADS[job_id]
+            self.assertEqual(job["status"], "failed")
+            self.assertNotIn("cdn.example", job["error"])
+            self.assertNotIn("secret-token", job["error"])
+            self.assertNotIn("secret-signature", job["error"])
+            self.assertNotIn("cdn.example", output.getvalue())
+            self.assertNotIn("secret-token", output.getvalue())
+            self.assertNotIn("secret-signature", output.getvalue())
+            tidal_session.assert_not_called()
+
     def test_joc_export_command_uses_the_live_orender_studio_chain_before_input(self):
         command = service.build_joc_download_render_command(
             "http://127.0.0.1:4321/stream.mpd?sig=secret",
@@ -173,7 +210,7 @@ class DownloaderTests(unittest.TestCase):
             "sampleRate": 96000, "channels": 2, "bitsPerSample": 24, "totalSamples": 48000,
         })
 
-    def test_provider_metadata_is_bound_to_resolver_payload(self):
+    def test_generic_provider_metadata_is_bound_to_resolver_payload(self):
         state = {"title": "request title", "lyrics_text": ""}
         service.apply_provider_metadata({
             "title": "Amazon title", "artists": [{"name": "Artist A"}, {"name": "Artist B"}],

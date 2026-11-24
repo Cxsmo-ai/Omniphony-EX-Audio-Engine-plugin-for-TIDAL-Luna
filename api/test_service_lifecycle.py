@@ -3,6 +3,7 @@ import io
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -669,43 +670,732 @@ class ServiceLifecycleTests(unittest.TestCase):
         probe.assert_not_called()
         engine.cmd.assert_not_called()
 
-    def test_eclipse_manifest_urls_allow_https_and_local_development_only(self):
+    def test_account_manifest_urls_require_https_and_reject_embedded_credentials(self):
         self.assertEqual(
-            service.validate_eclipse_addon_urls([
-                " https://example.com/manifest.json ",
-                "http://localhost:3000/manifest.json",
-                "http://127.0.0.1:3000/manifest.json",
-                "http://[::1]:3000/manifest.json",
-            ]),
-            [
-                "https://example.com/manifest.json",
-                "http://localhost:3000/manifest.json",
-                "http://127.0.0.1:3000/manifest.json",
-                "http://[::1]:3000/manifest.json",
-            ],
+            service._validate_account_manifest_url(" https://example.com/manifest.json "),
+            "https://example.com/manifest.json",
+        )
+        for value in ("javascript:alert(1)", "http://example.com/manifest.json",
+                      "https://user:pass@example.com/manifest.json", "https://example.com/" + "a" * 2050,
+                      "https://example.com/manifest.json#fragment"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                service._validate_account_manifest_url(value)
+
+    def test_eclipse_authenticated_redirects_are_same_origin_only(self):
+        handler = service._SameOriginRedirectHandler()
+        request = service.urllib.request.Request("https://api.eclipsemusic.app/account", headers={
+            "Authorization": "Bearer secret",
+        })
+        headers = {}
+        self.assertIsNotNone(handler.redirect_request(
+            request, None, 302, "Found", headers, "https://api.eclipsemusic.app/next"
+        ))
+        self.assertIsNone(handler.redirect_request(
+            request, None, 302, "Found", headers, "https://attacker.example/steal"
+        ))
+        self.assertIsNone(handler.redirect_request(
+            request, None, 302, "Found", headers, "http://api.eclipsemusic.app/insecure"
+        ))
+
+    def test_eclipse_worker_base_preserves_tokenized_manifest_path(self):
+        self.assertEqual(
+            service._eclipse_worker_base_url(
+                "https://amazon-music-eclipse-addon.cyrusna29.workers.dev/0dd9c90858c14f98be288c82b747fbb9/manifest.json"
+            ),
+            "https://amazon-music-eclipse-addon.cyrusna29.workers.dev/0dd9c90858c14f98be288c82b747fbb9",
+        )
+        self.assertEqual(
+            service._eclipse_worker_base_url(
+                "https://tido.tido.tido.rickyaddons.dpdns.org/bd6335b8e3c74a388134bf5f5bc3b3df/manifest.json"
+            ),
+            "https://tido.tido.tido.rickyaddons.dpdns.org/bd6335b8e3c74a388134bf5f5bc3b3df",
+        )
+        self.assertEqual(
+            service._eclipse_worker_url(
+                "https://addons.example/account/manifest.json?edition=exclusive&token=scope",
+                "search",
+                {"q": "Natural & Imagine Dragons"},
+            ),
+            "https://addons.example/account/search?edition=exclusive&token=scope&q=Natural+%26+Imagine+Dragons",
         )
 
-    def test_eclipse_manifest_urls_reject_unsafe_schemes_and_credentials(self):
-        for value in (["javascript:alert(1)"], ["http://example.com/manifest.json"],
-                      ["https://user:pass@example.com/manifest.json"], ["https://example.com/" + "a" * 2050]):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                service.validate_eclipse_addon_urls(value)
+    def test_eclipse_jwt_force_refresh_reloads_saved_token_without_network_login(self):
+        with TemporaryDirectory() as temp:
+            session_file = Path(temp) / "eclipse-session.json"
+            session_file.write_text(json.dumps({
+                "jwt": "saved-token-from-session-file",
+            }), encoding="utf-8")
+            auth_cache = {
+                "jwt": "stale-in-memory-token",
+                "addon_tokens": {},
+                "manifest_cache": {},
+                "search_cache": {},
+                "stream_cache": {},
+            }
+            with patch.object(service, "ECLIPSE_SESSION_FILE", session_file), \
+                    patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache), \
+                    patch.object(service.urllib.request, "urlopen") as urlopen:
+                self.assertEqual(
+                    service._get_eclipse_jwt(force_refresh=True),
+                    "saved-token-from-session-file",
+                )
+            urlopen.assert_not_called()
+            self.assertEqual(auth_cache["jwt"], "saved-token-from-session-file")
+            self.assertEqual(auth_cache["addon_tokens"], {})
+            self.assertEqual(auth_cache["search_cache"], {})
+            self.assertEqual(auth_cache["stream_cache"], {})
 
-    def test_eclipse_manifest_urls_require_a_list_of_strings(self):
-        for value in ("https://example.com/manifest.json", [None], ["https://example.com/" for _ in range(17)]):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                service.validate_eclipse_addon_urls(value)
+    def test_eclipse_jwt_loader_does_not_attempt_placeholder_login_or_signup(self):
+        with TemporaryDirectory() as temp:
+            session_file = Path(temp) / "eclipse-session.json"
+            session_file.write_text(json.dumps({
+                "email": "synthetic@example.invalid",
+                "password": "synthetic-placeholder-password",
+            }), encoding="utf-8")
+            auth_cache = {
+                "jwt": None,
+                "addon_tokens": {},
+                "manifest_cache": {},
+                "search_cache": {},
+                "stream_cache": {},
+            }
+            with patch.object(service, "ECLIPSE_SESSION_FILE", session_file), \
+                    patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache), \
+                    patch.object(service.urllib.request, "urlopen") as urlopen:
+                self.assertIsNone(service._get_eclipse_jwt(force_refresh=True))
+            urlopen.assert_not_called()
+            self.assertIsNone(auth_cache["jwt"])
 
-    def test_invalid_saved_eclipse_manifests_are_ignored(self):
+    def test_eclipse_jwt_force_refresh_clears_stale_account_cache_when_saved_token_is_unavailable(self):
+        invalid_session_contents = (None, "not-json", json.dumps({"jwt": "  "}))
+        for contents in invalid_session_contents:
+            with self.subTest(contents=contents), TemporaryDirectory() as temp:
+                session_file = Path(temp) / "eclipse-session.json"
+                if contents is not None:
+                    session_file.write_text(contents, encoding="utf-8")
+                auth_cache = {
+                    "jwt": "stale-token",
+                    "addon_tokens": {"addon": {"token": "stale-addon-token"}},
+                    "manifest_cache": {"manifest": {"expires_at": 9999999999}},
+                    "search_cache": {"search": "old-account-result"},
+                    "stream_cache": {"stream": "old-account-stream"},
+                }
+                with patch.object(service, "ECLIPSE_SESSION_FILE", session_file), \
+                        patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache), \
+                        patch.object(service.urllib.request, "urlopen") as urlopen:
+                    self.assertIsNone(service._get_eclipse_jwt(force_refresh=True))
+                    self.assertIsNone(service._get_eclipse_jwt())
+                urlopen.assert_not_called()
+                self.assertIsNone(auth_cache["jwt"])
+                self.assertEqual(auth_cache["addon_tokens"], {})
+                self.assertEqual(auth_cache["search_cache"], {})
+                self.assertEqual(auth_cache["stream_cache"], {})
+                self.assertIn("manifest", auth_cache["manifest_cache"])
+
+    def test_eclipse_jwt_reload_invalidates_account_specific_caches_when_account_changes(self):
+        with TemporaryDirectory() as temp:
+            session_file = Path(temp) / "eclipse-session.json"
+            session_file.write_text(json.dumps({"jwt": "new-account-token"}), encoding="utf-8")
+            auth_cache = {
+                "jwt": "old-account-token",
+                "addon_tokens": {"addon": {"token": "old-addon-token"}},
+                "manifest_cache": {"manifest": {"expires_at": 9999999999}},
+                "search_cache": {"search": "old-account-result"},
+                "stream_cache": {"stream": "old-account-stream"},
+            }
+            with patch.object(service, "ECLIPSE_SESSION_FILE", session_file), \
+                    patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache):
+                self.assertEqual(service._get_eclipse_jwt(force_refresh=True), "new-account-token")
+
+            self.assertEqual(auth_cache["jwt"], "new-account-token")
+            self.assertEqual(auth_cache["addon_tokens"], {})
+            self.assertEqual(auth_cache["search_cache"], {})
+            self.assertEqual(auth_cache["stream_cache"], {})
+            self.assertIn("manifest", auth_cache["manifest_cache"])
+
+    def test_eclipse_login_persists_only_dpapi_protected_account_token(self):
+        with TemporaryDirectory() as temp:
+            session_file = Path(temp) / "eclipse-session.json"
+            user = {"id": "acct-1", "email": "listener@example.test", "name": "Listener"}
+            auth_cache = {
+                "jwt": "old-account-token", "addon_tokens": {"old": {"token": "stale"}},
+                "manifest_cache": {}, "search_cache": {"old": {}}, "stream_cache": {"old": {}},
+            }
+            account_status = {"user": None, "checked_at": 0.0, "session_mtime": None}
+            with patch.object(service, "ECLIPSE_SESSION_FILE", session_file), \
+                    patch.object(service, "CONFIG_DIR", Path(temp)), \
+                    patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache), \
+                    patch.object(service, "_ECLIPSE_ACCOUNT_STATUS", account_status), \
+                    patch.object(service, "_eclipse_token_protect", return_value="protected-dpapi-value"), \
+                    patch.object(service, "_verify_eclipse_account_token", return_value=(True, user, "rotated-account-token")):
+                connected, saved_user, error = service._complete_eclipse_login("callback-account-token")
+
+            self.assertTrue(connected)
+            self.assertIsNone(error)
+            self.assertEqual(saved_user, user)
+            persisted = json.loads(session_file.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["jwt_dpapi"], "protected-dpapi-value")
+            self.assertNotIn("jwt", persisted)
+            self.assertNotIn("callback-account-token", session_file.read_text(encoding="utf-8"))
+            self.assertNotIn("rotated-account-token", session_file.read_text(encoding="utf-8"))
+            self.assertEqual(auth_cache["jwt"], "rotated-account-token")
+            self.assertEqual(auth_cache["addon_tokens"], {})
+            self.assertEqual(auth_cache["search_cache"], {})
+            self.assertEqual(auth_cache["stream_cache"], {})
+
+    def test_eclipse_account_status_verifies_session_and_returns_no_token(self):
+        with TemporaryDirectory() as temp:
+            session_file = Path(temp) / "eclipse-session.json"
+            session_file.write_text(json.dumps({"version": 1, "jwt_dpapi": "protected-value"}), encoding="utf-8")
+            user = {"id": "acct-2", "email": "listener@example.test"}
+            auth_cache = {"jwt": None, "addon_tokens": {}, "manifest_cache": {}, "search_cache": {}, "stream_cache": {}}
+            account_status = {"user": None, "checked_at": 0.0, "session_mtime": None}
+            with patch.object(service, "ECLIPSE_SESSION_FILE", session_file), \
+                    patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache), \
+                    patch.object(service, "_ECLIPSE_ACCOUNT_STATUS", account_status), \
+                    patch.object(service, "_eclipse_token_unprotect", return_value="private-account-token"), \
+                    patch.object(service, "_verify_eclipse_account_token", return_value=(True, user, None)):
+                result = service.eclipse_account_status()
+
+            self.assertEqual(result, {"connected": True, "user": user})
+            self.assertNotIn("token", result)
+            self.assertEqual(auth_cache["jwt"], "private-account-token")
+
+    def test_eclipse_account_status_does_not_clear_newer_account_after_stale_401(self):
+        with TemporaryDirectory() as temp:
+            session_file = Path(temp) / "eclipse-session.json"
+            session_file.write_text(json.dumps({"version": 1, "jwt_dpapi": "old-protected"}), encoding="utf-8")
+            auth_cache = {"jwt": "old-account-token", "addon_tokens": {}, "account_addons": {}, "manifest_cache": {}, "search_cache": {}, "stream_cache": {}}
+            status = {"user": None, "checked_at": 0.0, "session_mtime": None}
+
+            def stale_unauthorized(_token):
+                with service._ECLIPSE_AUTH_LOCK:
+                    service._ECLIPSE_AUTH_CACHE["jwt"] = "new-account-token"
+                    service._invalidate_eclipse_account_cache(clear_jwt=False)
+                return False, None, "unauthorized"
+
+            with patch.object(service, "ECLIPSE_SESSION_FILE", session_file), \
+                    patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache), \
+                    patch.object(service, "_ECLIPSE_ACCOUNT_STATUS", status), \
+                    patch.object(service, "_eclipse_token_unprotect", return_value="old-account-token"), \
+                    patch.object(service, "_verify_eclipse_account_token", side_effect=stale_unauthorized):
+                result = service.eclipse_account_status(force_refresh=True)
+
+            self.assertEqual(result.get("reason"), "account_changed")
+            self.assertTrue(session_file.exists())
+            self.assertEqual(auth_cache["jwt"], "new-account-token")
+
+    def test_eclipse_login_does_not_overwrite_account_changed_during_verification(self):
+        with TemporaryDirectory() as temp:
+            session_file = Path(temp) / "eclipse-session.json"
+            auth_cache = {"jwt": "old-account-token", "addon_tokens": {}, "account_addons": {}, "manifest_cache": {}, "search_cache": {}, "stream_cache": {}}
+
+            def stale_success(_token):
+                with service._ECLIPSE_AUTH_LOCK:
+                    service._ECLIPSE_AUTH_CACHE["jwt"] = "new-account-token"
+                    service._invalidate_eclipse_account_cache(clear_jwt=False)
+                return True, {"id": "old"}, "rotated-old-token"
+
+            with patch.object(service, "ECLIPSE_SESSION_FILE", session_file), \
+                    patch.object(service, "CONFIG_DIR", Path(temp)), \
+                    patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache), \
+                    patch.object(service, "_eclipse_token_protect", return_value="protected"), \
+                    patch.object(service, "_verify_eclipse_account_token", side_effect=stale_success):
+                connected, _, error = service._complete_eclipse_login("old-callback-token")
+
+            self.assertFalse(connected)
+            self.assertEqual(error, "account_changed")
+            self.assertFalse(session_file.exists())
+            self.assertEqual(auth_cache["jwt"], "new-account-token")
+
+    def test_eclipse_account_addons_follow_connected_enabled_state_and_hide_token(self):
+        account_token = "private-eclipse-session-token"
+        addon_url = "https://supporter.example/account-secret/manifest.json"
+        payload = {
+            "addons": [
+                {"addonId": "supporter.music", "displayName": "Supporter Music", "kind": "community", "manifestUrl": addon_url, "isEnabled": True},
+                {"addonId": "disabled.music", "displayName": "Disabled Music", "kind": "community", "manifestUrl": "https://disabled.example/manifest.json", "isEnabled": False},
+                {"addonId": "bad.url", "displayName": "Bad URL", "manifestUrl": "http://not-allowed.example/manifest.json", "isEnabled": True},
+            ],
+            "order": ["supporter.music", "disabled.music", "bad.url"],
+        }
+        auth_cache = {"jwt": account_token, "addon_tokens": {}, "account_addons": {}}
+        opened = []
+
+        def fake_urlopen(request, timeout=None):
+            opened.append((request, timeout))
+            return io.BytesIO(json.dumps(payload).encode("utf-8"))
+
+        with patch.object(service, "_get_eclipse_jwt", return_value=account_token), \
+                patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache), \
+                patch.object(service, "_eclipse_authenticated_urlopen", side_effect=fake_urlopen):
+            result = service.eclipse_account_addons()
+            cached = service.eclipse_account_addons()
+
+        self.assertEqual(result, cached)
+        self.assertEqual(len(opened), 1)
+        request, timeout = opened[0]
+        self.assertEqual(request.full_url, service.ECLIPSE_ACCOUNT_ADDONS_URL)
+        self.assertEqual(request.get_header("Authorization"), f"Bearer {account_token}")
+        self.assertLessEqual(timeout, 8.0)
+        self.assertEqual([addon["addonId"] for addon in result["addons"]], ["supporter.music", "disabled.music"])
+        self.assertTrue(result["addons"][0]["isEnabled"])
+        self.assertFalse(result["addons"][1]["isEnabled"])
+        self.assertNotIn(account_token, json.dumps(result))
+
+    def test_eclipse_account_addon_response_is_discarded_if_account_disconnects_mid_request(self):
+        account_token = "account-A-token"
+        auth_cache = {"jwt": account_token, "addon_tokens": {}, "account_addons": {}}
+        started = threading.Event()
+        release = threading.Event()
+        result_holder = {}
+
+        def fake_urlopen(request, timeout=None):
+            started.set()
+            self.assertTrue(release.wait(2.0))
+            return io.BytesIO(json.dumps({"addons": [{
+                "addonId": "supporter.music",
+                "displayName": "Supporter Music",
+                "manifestUrl": "https://supporter.example/account-a/manifest.json",
+                "isEnabled": True,
+            }]}).encode("utf-8"))
+
+        with patch.object(service, "_get_eclipse_jwt", return_value=account_token), \
+                patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache), \
+                patch.object(service, "_ECLIPSE_AUTH_GENERATION", 0), \
+                patch.object(service, "_eclipse_authenticated_urlopen", side_effect=fake_urlopen):
+            worker = threading.Thread(target=lambda: result_holder.setdefault("result", service.eclipse_account_addons()))
+            worker.start()
+            self.assertTrue(started.wait(2.0))
+            with service._ECLIPSE_AUTH_LOCK:
+                service._invalidate_eclipse_account_cache(clear_jwt=True)
+            release.set()
+            worker.join(2.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result_holder["result"]["reason"], "account_changed")
+        self.assertEqual(result_holder["result"]["addons"], [])
+        self.assertEqual(auth_cache["account_addons"], {})
+
+    def test_public_eclipse_addons_redacts_account_manifest_urls(self):
+        secret_url = "https://addons.example/private-account-path/manifest.json?token=secret"
+        result = service.public_eclipse_account_addons({
+            "connected": True,
+            "available": True,
+            "order": ["supporter.music"],
+            "addons": [{
+                "addonId": "supporter.music",
+                "displayName": "Supporter Music",
+                "kind": "community",
+                "manifestUrl": secret_url,
+                "isEnabled": True,
+            }],
+        })
+
+        serialized = json.dumps(result)
+        self.assertNotIn(secret_url, serialized)
+        self.assertNotIn("manifestUrl", result["addons"][0])
+        self.assertEqual(result["addons"][0]["key"], service._eclipse_provider_key(secret_url, "supporter.music"))
+        self.assertEqual(result["addons"][0]["addonId"], "supporter.music")
+
+    def test_realmax_provider_configuration_defaults_to_tidal_then_enabled_eclipse_order(self):
+        account_url = "https://account.example/private/manifest.json"
+        account_addons = {
+            "connected": True,
+            "available": True,
+            "addons": [
+                {"addonId": "account.first", "displayName": "Account First", "kind": "community", "manifestUrl": account_url, "isEnabled": True},
+                {"addonId": "account.off", "displayName": "Account Off", "kind": "community", "manifestUrl": "https://account.example/off.json", "isEnabled": False},
+            ],
+            "order": ["account.first", "account.off"],
+        }
+        settings = {"realmax_provider_order": None}
+        with patch.object(service, "eclipse_account_addons", return_value=account_addons), \
+                patch.object(service, "is_main_tidal_api_authorized", return_value=True), \
+                patch.object(service, "_get_eclipse_manifest", return_value={"id": "manual.music", "name": "Manual Music"}):
+            config = service.realmax_provider_configuration(settings)
+
+        account_key = service._eclipse_provider_key(account_url, "account.first")
+        self.assertEqual(config["order"], ["tidal_api", account_key])
+        self.assertEqual([row["name"] for row in config["providers"] if row["selected"]], [
+            "TIDAL API (EbbLabs / python-tidal)", "Account First"
+        ])
+        self.assertNotIn("manifestUrl", config["providers"][1])
+        self.assertEqual(config["_internal_records"][account_key]["manifestUrl"], account_url)
+        self.assertFalse(any(row.get("source") == "manual" for row in config["providers"]))
+
+    def test_realmax_provider_order_validation_accepts_account_keys_and_rejects_duplicates(self):
+        account_key = "eclipse:" + "a" * 20
+        self.assertIsNone(service.validate_realmax_provider_order(None))
+        self.assertEqual(service.validate_realmax_provider_order(["tidal_api", account_key]), ["tidal_api", account_key])
+        with self.assertRaises(ValueError):
+            service.validate_realmax_provider_order([account_key, account_key])
+        with self.assertRaises(ValueError):
+            service.validate_realmax_provider_order(["eclipse:bad"])
+        capacity_keys = [f"eclipse:{index:020x}" for index in range(81)]
+        with self.assertRaises(ValueError):
+            service.validate_realmax_provider_order(capacity_keys + ["eclipse:" + "f" * 20])
+        self.assertEqual(len(service.validate_realmax_provider_order(capacity_keys)), 81)
+
+    def test_realmax_provider_configuration_preserves_unavailable_saved_provider_keys(self):
+        account_key = "eclipse:" + "c" * 20
+        settings = {"realmax_provider_order": ["tidal_api", account_key]}
+        with patch.object(service, "eclipse_account_addons", return_value={
+                "connected": True, "available": False, "addons": [], "order": [], "reason": "account_addons_unavailable"}), \
+                patch.object(service, "is_main_tidal_api_authorized", return_value=True):
+            config = service.realmax_provider_configuration(settings)
+
+        self.assertEqual(config["configuredOrder"], ["tidal_api", account_key])
+        self.assertEqual(config["order"], ["tidal_api"])
+        unavailable = next(row for row in config["providers"] if row["key"] == account_key)
+        self.assertFalse(unavailable["available"])
+        self.assertTrue(unavailable["selected"])
+
+    def test_realmax_provider_mode_filters_sources_without_changing_format_order(self):
+        tidal = {"key": "tidal_api", "type": "tidal_api", "available": True}
+        account_key = "eclipse:" + "b" * 20
+        addon = {"key": account_key, "type": "eclipse_account", "available": True}
+        records = {account_key: {"manifestUrl": "https://account.example/manifest.json"}}
+        config = {"providers": [tidal, addon], "order": ["tidal_api", account_key], "_internal_records": records}
+        with patch.object(service, "realmax_provider_configuration", return_value=config):
+            order, by_key = service._ordered_resolution_providers({"realmax_source": "eclipse_only"})
+        self.assertEqual(order, [account_key])
+        self.assertEqual(by_key, records)
+
+    def test_realmax_both_mode_preserves_saved_tidal_and_addon_priority(self):
+        account_key = "eclipse:" + "d" * 20
+        expected = [account_key, "tidal_api"]
+        records = {account_key: {"manifestUrl": "https://account.example/manifest.json"}}
+        config = {"providers": [], "order": expected, "_internal_records": records}
+        with patch.object(service, "realmax_provider_configuration", return_value=config):
+            order, by_key = service._ordered_resolution_providers({"realmax_source": "both"})
+        self.assertEqual(order, expected)
+        self.assertEqual(by_key, records)
+
+    def test_tidal_only_resolution_skips_eclipse_provider_discovery(self):
+        with patch.object(service, "is_main_tidal_api_authorized", return_value=True), \
+                patch.object(service, "realmax_provider_configuration") as discover:
+            order, records = service._ordered_resolution_providers({"realmax_source": "tidal_only"})
+        self.assertEqual(order, ["tidal_api"])
+        self.assertEqual(records, {})
+        discover.assert_not_called()
+
+    def test_tidal_only_respects_explicitly_empty_provider_selection(self):
+        with patch.object(service, "is_main_tidal_api_authorized", return_value=True), \
+                patch.object(service, "realmax_provider_configuration") as discover:
+            order, records = service._ordered_resolution_providers({
+                "realmax_source": "tidal_only",
+                "realmax_provider_order": [],
+            })
+        self.assertEqual(order, [])
+        self.assertEqual(records, {})
+        discover.assert_not_called()
+
+    def test_tidal_search_selection_keeps_quality_first_cross_provider_resolution_in_both_mode(self):
+        key = "eclipse:" + "e" * 20
+        provider = {"manifestUrl": "https://amazon.example/account/manifest.json", "addonId": "com.example.amazon", "name": "Amazon Music"}
+        track = Mock()
+        track.id = 123
+        track.name = "Natural"
+        track.full_name = "Natural"
+        track.duration = 189
+        track.artist = Mock(name="artist")
+        track.artist.name = "Imagine Dragons"
+        session = Mock()
+        session.track.return_value = track
+        session.search.return_value = {"tracks": []}
+        expected = {"format": "EAC3_JOC", "sourceProvider": "AMAZON", "sourceName": "Amazon Music"}
+
+        with patch.object(service, "load_settings", return_value={"realmax_source": "both"}), \
+                patch.object(service, "_ordered_resolution_providers", return_value=(["tidal_api", key], {key: provider})), \
+                patch.object(service, "is_main_tidal_api_authorized", return_value=True), \
+                patch.object(service, "get_python_tidal_session", return_value=session), \
+                patch.object(service, "get_python_tidal_mobile_session", return_value=None), \
+                patch.object(service, "resolve_eac3_joc", return_value=None), \
+                patch.object(service, "resolve_eclipse_addon", return_value=expected) as resolve_addon:
+            result = service.resolve_with_priority(123, ["EAC3_JOC", "LOSSLESS"], provider_key="tidal_api")
+
+        self.assertEqual(result, expected)
+        resolve_addon.assert_called_once()
+
+    def test_eclipse_only_does_not_request_tidal_track_metadata(self):
+        key = "eclipse:" + "f" * 20
+        provider = {"manifestUrl": "https://addons.example/manifest.json", "addonId": "com.example.addon", "name": "Example"}
+        with patch.object(service, "load_settings", return_value={"realmax_source": "eclipse_addons"}), \
+                patch.object(service, "_ordered_resolution_providers", return_value=([key], {key: provider})), \
+                patch.object(service, "is_main_tidal_api_authorized", return_value=True), \
+                patch.object(service, "get_python_tidal_session") as tidal_session, \
+                patch.object(service, "get_python_tidal_mobile_session") as mobile_session, \
+                patch.object(service, "resolve_eclipse_addon", return_value={"format": "EAC3_JOC", "uri": "https://cdn.example/stream"}):
+            result = service.resolve_with_priority(321, ["EAC3_JOC"])
+        self.assertEqual(result["format"], "EAC3_JOC")
+        tidal_session.assert_not_called()
+        mobile_session.assert_not_called()
+
+    def test_eclipse_search_track_rejects_unrelated_or_conflicting_recordings(self):
+        unrelated = [{"id": "wrong", "title": "Different Song", "artist": "Different Artist", "isrc": "USAAA0000001"}]
+        conflicting = [{"id": "wrong-isrc", "title": "Natural", "artist": "Imagine Dragons", "isrc": "USAAA0000001"}]
+        self.assertIsNone(service._select_eclipse_search_track(unrelated, "Natural", "Imagine Dragons", "EAC3_JOC", "USAAA0000002", 189))
+        self.assertIsNone(service._select_eclipse_search_track(conflicting, "Natural", "Imagine Dragons", "EAC3_JOC", "USAAA0000002", 189))
+        self.assertEqual(
+            service._select_eclipse_search_track(
+                [{"id": "match", "title": "Natural", "artist": "Imagine Dragons", "duration": 189}],
+                "Natural", "Imagine Dragons", "EAC3_JOC", duration=189,
+            )["id"],
+            "match",
+        )
+
+    def test_tidal_alternate_edition_match_requires_same_recording_identity(self):
+        original = Mock(id=100, name="Natural", duration=189, isrc="USAAA0000001")
+        original.name = "Natural"
+        original.artist.name = "Imagine Dragons"
+        wrong_artist = Mock(id=101, name="Natural", duration=189, isrc="")
+        wrong_artist.name = "Natural"
+        wrong_artist.artist.name = "Different Artist"
+        conflicting_isrc = Mock(id=102, name="Natural", duration=189, isrc="USAAA0000002")
+        conflicting_isrc.name = "Natural"
+        conflicting_isrc.artist.name = "Imagine Dragons"
+        matching_isrc = Mock(id=103, name="Natural", duration=189, isrc="USAAA0000001")
+        matching_isrc.name = "Natural"
+        matching_isrc.artist.name = "Another credited performer"
+
+        self.assertFalse(service._tidal_alternate_track_matches(original, wrong_artist))
+        self.assertFalse(service._tidal_alternate_track_matches(original, conflicting_isrc))
+        self.assertTrue(service._tidal_alternate_track_matches(original, matching_isrc))
+
+        no_isrc_original = Mock(id=200, name="Natural", duration=189, isrc="")
+        no_isrc_original.name = "Natural"
+        no_isrc_original.artist.name = "Imagine Dragons"
+        same_artist = Mock(id=201, name="Natural", duration=194, isrc="")
+        same_artist.name = "Natural"
+        same_artist.artist.name = "Imagine Dragons"
+        self.assertTrue(service._tidal_alternate_track_matches(no_isrc_original, same_artist))
+
+    def test_realmax_resolves_in_format_order_then_selected_provider_order(self):
+        first_key = "eclipse:" + "1" * 20
+        second_key = "eclipse:" + "2" * 20
+        providers = {
+            first_key: {"manifestUrl": "https://first.example/manifest.json", "displayName": "First"},
+            second_key: {"manifestUrl": "https://second.example/manifest.json", "displayName": "Second"},
+        }
+        attempts = []
+
+        def resolve_addon(url, isrc, fmt, *args, **kwargs):
+            attempts.append((url, fmt))
+            return {"format": fmt, "sourceProvider": "second"} if url == providers[second_key]["manifestUrl"] else None
+
+        with patch.object(service, "load_settings", return_value={"realmax_source": "auto"}), \
+                patch.object(service, "_ordered_resolution_providers", return_value=([first_key, second_key, "tidal_api"], providers)), \
+                patch.object(service, "is_main_tidal_api_authorized", return_value=True), \
+                patch.object(service, "get_python_tidal_session", return_value=None), \
+                patch.object(service, "get_python_tidal_mobile_session", return_value=None), \
+                patch.object(service, "resolve_eclipse_addon", side_effect=resolve_addon), \
+                patch.object(service, "resolve_eac3_joc") as resolve_tidal:
+            result = service.resolve_with_priority(12345, ["EAC3_JOC", "LOSSLESS"])
+
+        self.assertEqual(result["format"], "EAC3_JOC")
+        self.assertEqual(attempts, [
+            (providers[first_key]["manifestUrl"], "EAC3_JOC"),
+            (providers[second_key]["manifestUrl"], "EAC3_JOC"),
+        ])
+        resolve_tidal.assert_not_called()
+
+    def test_search_result_provider_key_keeps_numeric_eclipse_id_on_its_originating_addon(self):
+        first_key = "eclipse:" + "a" * 20
+        second_key = "eclipse:" + "b" * 20
+        providers = {
+            first_key: {"manifestUrl": "https://first.example/manifest.json", "addonId": "com.example.first", "name": "First"},
+            second_key: {"manifestUrl": "https://second.example/manifest.json", "addonId": "com.example.second", "name": "Second"},
+        }
+        attempts = []
+
+        def resolve_addon(url, isrc, fmt, *args, **kwargs):
+            attempts.append((url, kwargs.get("explicit_track_id"), kwargs.get("addon_id")))
+            return {"format": fmt, "uri": "https://cdn.example/first.flac"} if url == providers[first_key]["manifestUrl"] else None
+
+        with patch.object(service, "load_settings", return_value={"realmax_source": "auto"}), \
+                patch.object(service, "_ordered_resolution_providers", return_value=([first_key, second_key, "tidal_api"], providers)), \
+                patch.object(service, "is_main_tidal_api_authorized", return_value=True), \
+                patch.object(service, "resolve_eclipse_addon", side_effect=resolve_addon), \
+                patch.object(service, "resolve_eac3_joc") as resolve_tidal:
+            result = service.resolve_with_priority(
+                123456,
+                ["AC4_IMS", "EAC3_JOC", "LOSSLESS"],
+                provider_key=first_key,
+            )
+
+        self.assertEqual(result["format"], "EAC3_JOC")
+        self.assertEqual(attempts, [(providers[first_key]["manifestUrl"], "123456", "com.example.first")])
+        resolve_tidal.assert_not_called()
+
+    def test_eclipse_login_rejects_malformed_callback_token_without_network(self):
+        with patch.object(service, "_verify_eclipse_account_token") as verify:
+            for value in ("", "bad\ntoken", "x" * 8193):
+                with self.subTest(value_length=len(value)):
+                    connected, user, error = service._complete_eclipse_login(value)
+                    self.assertFalse(connected)
+                    self.assertIsNone(user)
+                    self.assertEqual(error, "invalid_token")
+            verify.assert_not_called()
+
+    @unittest.skipUnless(service.os.name == "nt", "Windows DPAPI is used for the persisted Eclipse session")
+    def test_eclipse_token_dpapi_round_trip(self):
+        token = "test-only-eclipse-account-token"
+        protected = service._eclipse_token_protect(token)
+        self.assertNotEqual(protected, token)
+        self.assertEqual(service._eclipse_token_unprotect(protected), token)
+
+    def test_multi_search_queries_each_configured_eclipse_provider_with_its_manifest_id(self):
+        amazon_url = "https://amazon.example/token/manifest.json"
+        tido_url = "https://tido.tido.tido.rickyaddons.dpdns.org/bd6335b8e3c74a388134bf5f5bc3b3df/manifest.json"
+        manifests = {
+            amazon_url: {"id": "com.yourname.amazonmusic", "name": "AMZM"},
+            tido_url: {"id": "com.yourname.tidal.hifi", "name": "Tido"},
+        }
+        response_by_path = {
+            "/token/search?q=Natural": {"tracks": [{"id": "amz-1", "title": "Natural", "artist": "Imagine Dragons"}]},
+        }
+        seen_urls = []
+
+        def fake_urlopen(request, timeout=None):
+            seen_urls.append(request.full_url)
+            parsed = urllib.parse.urlparse(request.full_url)
+            payload = response_by_path.get(parsed.path + "?" + parsed.query)
+            return io.BytesIO(json.dumps(payload or {"tracks": [{"id": "97874144", "title": "Natural", "artist": "Imagine Dragons"}]}).encode("utf-8"))
+
+        account_addons = {"connected": True, "available": True, "order": ["com.yourname.amazonmusic", "com.yourname.tidal.hifi"], "addons": [
+            {"addonId": "com.yourname.amazonmusic", "displayName": "AMZM", "manifestUrl": amazon_url, "isEnabled": True},
+            {"addonId": "com.yourname.tidal.hifi", "displayName": "Tido", "manifestUrl": tido_url, "isEnabled": True},
+        ]}
+        with patch.object(service, "get_python_tidal_session", return_value=None), \
+                patch.object(service, "load_settings", return_value={"realmax_provider_order": None}), \
+                patch.object(service, "eclipse_account_addons", return_value=account_addons), \
+                patch.object(service, "is_main_tidal_api_authorized", return_value=False), \
+                patch.object(service, "_get_eclipse_manifest", side_effect=lambda url: manifests[url]), \
+                patch.object(service, "_get_eclipse_addon_access_token", side_effect=lambda addon_id: None) as token_for, \
+                patch.object(service, "_eclipse_authenticated_urlopen", side_effect=fake_urlopen):
+            result = service.execute_multi_source_search("Natural", limit=10)
+
+        self.assertEqual({item["source"] for item in result["tracks"]}, {"AMAZON", "TIDAL_ECLIPSE"})
+        token_for.assert_any_call("com.yourname.amazonmusic")
+        token_for.assert_any_call("com.yourname.tidal.hifi")
+        self.assertIn("https://amazon.example/token/search?q=Natural", seen_urls)
+        self.assertTrue(all(item.get("providerKey") for item in result["tracks"]))
+        self.assertIn(
+            "https://tido.tido.tido.rickyaddons.dpdns.org/bd6335b8e3c74a388134bf5f5bc3b3df/search?q=Natural",
+            seen_urls,
+        )
+
+    def test_multi_search_keeps_results_from_distinct_addons_with_same_display_name(self):
+        first = "eclipse:" + "1" * 20
+        second = "eclipse:" + "2" * 20
+        records = {
+            first: {"manifestUrl": "https://one.example/manifest.json", "addonId": "one", "name": "Shared Name"},
+            second: {"manifestUrl": "https://two.example/manifest.json", "addonId": "two", "name": "Shared Name"},
+        }
+
+        def fake_open(request, timeout=None):
+            track_id = "one-track" if "one.example" in request.full_url else "two-track"
+            return io.BytesIO(json.dumps({"tracks": [{"id": track_id, "title": "Same Song", "artist": "Same Artist"}]}).encode())
+
+        with patch.object(service, "load_settings", return_value={}), \
+                patch.object(service, "_ordered_resolution_providers", return_value=([first, second], records)), \
+                patch.object(service, "get_python_tidal_session", return_value=None), \
+                patch.object(service, "_get_eclipse_addon_access_token", return_value=None), \
+                patch.object(service, "_eclipse_authenticated_urlopen", side_effect=fake_open):
+            result = service.execute_multi_source_search("Same Song", limit=10)
+
+        self.assertEqual({item["id"] for item in result["tracks"]}, {"one-track", "two-track"})
+
+    def test_generic_eclipse_resolution_uses_provider_token_and_label(self):
+        manifest_url = "https://apple.example/account-scope/manifest.json"
+        access_token = "scoped-short-lived-token"
+        seen_requests = []
+        payload = {"streams": [{
+            "url": "https://cdn.example/track.flac",
+            "codec": "flac",
+            "quality": "Lossless",
+            "sampleRate": 44100,
+            "bitDepth": 16,
+            "channels": 2,
+        }]}
+
+        def fake_urlopen(request, timeout=None):
+            seen_requests.append(request)
+            return io.BytesIO(json.dumps(payload).encode("utf-8"))
+
+        with patch.object(service, "_ECLIPSE_AUTH_CACHE", {"search_cache": {}, "stream_cache": {}, "addon_tokens": {}}), \
+                patch.object(service, "_get_eclipse_addon_access_token", return_value=access_token) as get_token, \
+                patch.object(service, "_probe_direct_audio_bitrate", return_value=(1_411_200, "test")), \
+                patch.object(service, "_probe_direct_media_transport", return_value="DIRECT"), \
+                patch.object(service, "_eclipse_authenticated_urlopen", side_effect=fake_urlopen):
+            result = service.resolve_eclipse_addon(
+                manifest_url,
+                "USABC1234567",
+                "LOSSLESS",
+                explicit_track_id="apple-track-1",
+                addon_id="com.example.applemusic",
+                addon_name="Apple Music Eclipse",
+            )
+
+        self.assertIsNotNone(result)
+        get_token.assert_called_once_with("com.example.applemusic")
+        self.assertEqual(len(seen_requests), 1)
+        self.assertEqual(
+            next(value for key, value in seen_requests[0].header_items() if key.lower() == "x-eclipse-access"),
+            access_token,
+        )
+        self.assertEqual(result["sourceProvider"], "ECLIPSE")
+        self.assertEqual(result["sourceName"], "Apple Music Eclipse")
+        self.assertTrue(result["label"].startswith("[Apple Music Eclipse]"))
+
+    def test_multi_search_follows_all_selected_eclipse_providers_when_tidal_api_is_authorized(self):
+        amazon_url = "https://amazon.example/token/manifest.json"
+        tido_url = "https://tido.tido.tido.rickyaddons.dpdns.org/bd6335b8e3c74a388134bf5f5bc3b3df/manifest.json"
+        manifests = {
+            amazon_url: {"id": "com.yourname.amazonmusic", "name": "AMZM"},
+            tido_url: {"id": "com.yourname.tidal.hifi", "name": "Tido"},
+        }
+        urls = []
+
+        def fake_urlopen(request, timeout=None):
+            urls.append(request.full_url)
+            return io.BytesIO(json.dumps({"tracks": []}).encode("utf-8"))
+
+        account_addons = {"connected": True, "available": True, "order": ["com.yourname.amazonmusic", "com.yourname.tidal.hifi"], "addons": [
+            {"addonId": "com.yourname.amazonmusic", "displayName": "AMZM", "manifestUrl": amazon_url, "isEnabled": True},
+            {"addonId": "com.yourname.tidal.hifi", "displayName": "Tido", "manifestUrl": tido_url, "isEnabled": True},
+        ]}
+        with patch.object(service, "get_python_tidal_session", return_value=None), \
+                patch.object(service, "load_settings", return_value={"realmax_provider_order": None}), \
+                patch.object(service, "eclipse_account_addons", return_value=account_addons), \
+                patch.object(service, "is_main_tidal_api_authorized", return_value=True), \
+                patch.object(service, "_get_eclipse_manifest", side_effect=lambda url: manifests[url]) as get_manifest, \
+                patch.object(service, "_get_eclipse_addon_access_token", return_value=None), \
+                patch.object(service, "_eclipse_authenticated_urlopen", side_effect=fake_urlopen):
+            service.execute_multi_source_search("Natural", limit=10)
+
+        get_manifest.assert_not_called()
+        self.assertCountEqual(urls, [
+            "https://amazon.example/token/search?q=Natural",
+            "https://tido.tido.tido.rickyaddons.dpdns.org/bd6335b8e3c74a388134bf5f5bc3b3df/search?q=Natural",
+        ])
+
+    def test_legacy_manual_eclipse_manifests_are_removed_from_saved_settings(self):
         with TemporaryDirectory() as temp:
             settings_file = Path(temp) / "settings.json"
             settings_file.write_text(
-                json.dumps({"eclipse_addons": ["javascript:alert(1)"]}),
+                json.dumps({"eclipse_addons": ["https://legacy.example/private/path?token=secret"], "volume": 71}),
                 encoding="utf-8",
             )
             with patch.object(service, "SETTINGS_FILE", settings_file):
                 settings = service.load_settings()
-        self.assertEqual(settings["eclipse_addons"], [])
+            persisted_text = settings_file.read_text(encoding="utf-8")
+            persisted = json.loads(persisted_text)
+        self.assertNotIn("eclipse_addons", settings)
+        self.assertNotIn("eclipse_addons", persisted)
+        self.assertNotIn("secret", persisted_text)
+        self.assertEqual(settings["volume"], 71)
 
     def test_audio_device_default_is_portable_and_saved_device_is_preserved(self):
         self.assertEqual(service.DEFAULT_SETTINGS["audio_device"], "auto")

@@ -1,53 +1,62 @@
-# Omniphony EX & OmniFusion Engine — Technical Architecture
+# Omniphony EX and OmniFusion Architecture
 
-## 1. System Identity & Responsibilities
+## Components
 
-| Component | File / Binary | Role |
-| :--- | :--- | :--- |
-| **Omniphony EX Frontend** | `omniphony.mjs`, `index.js` | Intercepts TIDAL Desktop playback intents, detaches Chromium audio output without muting, synchronizes `libmpv` timeline back into TIDAL Redux/Radiant state, and renders the native footer badge, floating drawer, and `@luna/ui` Settings modal. |
-| **OmniFusion Audio Service** | `api/omnifusion_service.py` | Local loopback HTTP server (`127.0.0.1:8765`) managing RealMAX multi-source stream resolution, `TidalDashProxy`, OxideAV AC-4 IMS decoding to a seekable stereo raw-PCM stream, and named-pipe JSON IPC (`//./pipe/omnifusion-standalone.mpv`) to `libmpv`. AC-4 playback creates no WAV; inactive encoded-MP4 cache entries are pruned toward a 256 MiB limit. |
-| **Headless `libmpv` + `orender`** | `mpv/mpv.exe`, `orender.dll` | Executes bit-accurate FLAC and E-AC-3 JOC decoding, negotiates shared WASAPI output on the user-selected endpoint, and streams spatial object beds/objects to Omniphony Studio. |
-| **Omniphony Studio** | `studio/omniphony-studio-egui.exe` | Real-time 3D object spatializer and SOFA HRIR binaural headphone processor communicating with `orender.dll` over loopback TCP port `9000`. |
-| **OxideAV AC-4 Adapter** | `oxideav/adapter-v0.1.71/ac4-to-wav.exe` | Probes MP4 `dac4` DSI and AC-4 TOC bitstreams to verify genuine 2-channel Dolby Atmos Immersive Stereo (`AC4_IMS`) before decoding to 48 kHz binaural PCM. |
+| Component | Location | Responsibility |
+| --- | --- | --- |
+| TIDAL Luna plugin | `omniphony.mjs` | Native TIDAL playback integration, RealMAX controls, Eclipse account UI, transport synchronization and status display. |
+| OmniFusion service | `api/omnifusion_service.py` | Loopback API on `127.0.0.1:8765`, TIDAL and Eclipse provider resolution, playback telemetry, and lifecycle ownership. |
+| `libmpv` | User-selected MPV folder | Audio decoding and output to the selected Windows audio endpoint. E-AC-3 JOC is routed through the configured Omniphony renderer. |
+| Omniphony Studio | User-selected executable | Headphone spatialization and SOFA profile processing for supported E-AC-3 JOC playback. |
+| OxideAV AC-4 adapter | Bundled service runtime | Probes AC-4 IMS and exposes seekable stereo PCM to MPV without creating an intermediate WAV during playback. |
 
----
+MPV and Omniphony Studio remain user-selected applications. ASIO is not required; output selection is handled through the configured audio device.
 
-## 1.1 Per-Stream MPV Demuxer Selection
+## Playback source selection
 
-The service configures the existing headless MPV instance for each resolved transport before calling `loadfile`:
+RealMAX evaluates the configured format priority across the selected providers:
 
-- **E-AC-3 JOC and FLAC DASH:** retain MPV's automatic demuxer selection and set the Lavf format to `dash`; the loopback `TidalDashProxy` supplies the validated manifest and segment URLs.
-- **Amazon Eclipse extensionless MP4:** the resolver requires a valid byte-range response, `audio/mp4` MIME type, and an ISO-BMFF `ftyp` box. MPV is set to `lavf` with the `mov` format so an extensionless HTTPS URL is parsed as MP4. The next non-MP4 stream resets MPV to automatic demuxer selection.
-- **AC-4 IMS:** OxideAV reads the encoded MP4 and exposes seekable stereo raw PCM; MPV uses the `rawaudio` demuxer. Playback does not create an intermediate WAV.
+- **TIDAL API:** bundled EbbLabs `python-tidal` integration. AC-4 IMS remains available through this source when TIDAL returns it.
+- **Eclipse account add-ons:** the user signs into Eclipse with Discord in the plugin's sign-in window. The service verifies the account, protects its session with current-user Windows DPAPI, and reads enabled add-ons and their account playback order from Eclipse. Add-on access tokens remain in the service and are not returned to the TIDAL renderer.
+- **Account connections:** Amazon Music, TIDAL-compatible Eclipse add-ons, and other enabled account connections are discovered from the signed-in account. No manifest URL is manually entered in the current settings UI. Tido is usable when present as an enabled account connection; the plugin does not inject an unauthenticated hard-coded fallback.
 
----
+The source selector offers exactly **Both**, **TIDAL API**, and **Eclipse add-ons**. In Both mode, format priority is the outer loop and provider priority is the inner loop: for each requested quality, the first provider able to return it wins; when none can, RealMAX tries the next quality. TIDAL API mode limits the provider list to TIDAL. Eclipse add-ons mode follows the account playback order or the user's saved provider priority. An explicit empty provider order means no provider is selected. AC-4 IMS is not requested from Eclipse add-ons.
 
-## 2. Sub-Millisecond UI & Lyrics Synchronization
+## Eclipse account and request handling
 
-1. **Non-Destructive Media Detachment:**
-   - Rather than muting the Windows mixer or zeroing `<audio>` element volume, `omniphony.mjs` detaches TIDAL's media element playback pipeline while keeping TIDAL's internal track state active.
-2. **Dual-Cadence Loopback Sync:**
-   - **`GET /clock` (50 ms cadence):** Read-only high-frequency position sample returning `timePos`, `timePosSampledAtUnixMs`, and IPC request bracket duration so the native progress bar and word-by-word synced lyrics advance with sub-millisecond smoothness.
-   - **`GET /status` (100 ms cadence):** Full transport and telemetry reconciliation including `format`, `sourceProvider`, `sourceBitrate`, `sourceSampleRate`, `sourceChannels`, `sourceBitDepth`, `audioParams`, `audioOutputParams`, and `omniphonyRoute`.
-3. **Paused Track Preparation (`startPaused: true`):**
-   - Users can arm **Prepare next selection paused** in the drawer to resolve, probe, and load a track into `libmpv` while holding playback paused until Play is explicitly clicked.
+The plugin opens Eclipse's regular sign-in page in an isolated sign-in window and completes authorization through the service callback. It does not read the user's Edge profile or depend on the Eclipse Windows application. Account verification, connection discovery, add-on token exchange, and provider requests run in the service. Tokens are DPAPI-protected at rest; public settings responses contain add-on identity and status but omit account-scoped manifest URLs and credentials.
 
----
+Account changes invalidate account-specific token, inventory, search, and stream caches. Asynchronous verification and inventory requests check the captured authentication generation before changing persisted session state or publishing results, preventing delayed responses for an old account from replacing a newer sign-in.
 
-## 3. Loopback HTTP API (`127.0.0.1:8765`)
+Resource requests retain query configuration supplied by the account's manifest URL and merge it with operation parameters such as search term and quality. Signed requests use same-origin HTTPS redirect handling so bearer and add-on access headers are not forwarded to a different origin. The bottom-right TIDAL badge identifies the actual source provider and connected add-on name as well as the format and measured/reported bitrate.
 
-The loopback API responds with `Access-Control-Allow-Origin: *` for any browser origin, without credentialed cookies. Preflight remains limited to `GET`, `POST`, and the `Content-Type` / `Cache-Control` request headers.
+Legacy manually entered Eclipse manifest settings are removed during settings migration. The current UI deliberately uses Eclipse account connections instead of a manual manifest editor.
 
-| Method & Path | Purpose |
-| :--- | :--- |
-| `GET /health` | Returns service version (`2.1.36`), the owning TIDAL PID, ownership source and process creation time, whether that exact process is still alive, plugin/data/MPV/Studio path identities, `serviceInstanceId`, active `mpvInstanceId`, and capability flags (`prepared-playback-v1`, `playback-clock-v1`). It never returns the shutdown credential. |
-| `GET /clock` | Lightweight 50 ms position and pause-state sample with IPC timing brackets. |
-| `GET /status` | Full track, codec, bitrate, WASAPI output, and Omniphony Studio route telemetry. |
-| `GET /config` / `POST /config` | Reads or atomically updates `priority`, `realmax_source` (`auto`, `tidal_only`, `amazon_only`), and `eclipse_addons`. |
-| `GET /devices` / `POST /device` | Enumerates and configures `libmpv` WASAPI audio endpoints. |
-| `POST /play` | Resolves the requested track via `resolve_with_priority()`, initializes `TidalDashProxy`, validated MP4, or AC-4 raw-PCM transport, verifies WASAPI + Omniphony Studio routing, and loads the stream into `libmpv`. |
-| `POST /pause` / `POST /resume` / `POST /seek` | Generation-checked transport controls with settled seek verification. |
-| `POST /login/start` / `GET /login/status` | Initiates and polls EbbLabs `python-tidal` device link authorization. |
-| `POST /shutdown` | Gracefully terminates `libmpv` and exits the service. Requires the per-launch bearer secret and matching `X-Omniphony-Service-Instance` header; the credential is used only by the native supervisor and is not exposed to browser code. |
+## Playback transports and synchronization
 
-The loopback service intentionally keeps wildcard origin support for the normal API, but CORS preflight does not allow the shutdown authorization headers. The plugin renderer does not request shutdown on unload; the API watchdog binds cleanup to the exact owner process. A new TIDAL process never adopts or shuts down a service owned by another live process. Legacy services with no owner identity are reported as unverifiable and must be allowed to exit through their existing lifecycle before the new service starts. The API refuses to bind or start `mpv` without a verified TIDAL owner; it never falls back to watching any process named `TIDAL.exe`.
+- E-AC-3 JOC and FLAC DASH streams are served through `TidalDashProxy` and loaded by MPV.
+- Eclipse extensionless MP4 streams are validated as MP4 and assigned MPV's `lavf`/`mov` demuxer for that stream; later formats return to automatic demuxer selection.
+- AC-4 IMS is decoded by OxideAV to seekable stereo PCM and streamed to MPV; playback does not write an intermediate WAV file.
+- The plugin polls the lightweight playback clock and full service status to synchronize TIDAL progress, lyrics, seek, and codec/output telemetry. Status distinguishes encoded source details from decoded/output details.
+
+For E-AC-3 JOC, stereo headphone output is expected after Omniphony processing even when the selected Windows endpoint reports a multichannel device format.
+
+## Loopback service API
+
+The loopback API intentionally responds with `Access-Control-Allow-Origin: *` and does not use credentialed browser cookies. Preflight permits the plugin's required methods and request headers.
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /health` | Reports service version, exact TIDAL owner identity, runtime paths, service and MPV instance identities, and supported capabilities. Shutdown credentials are never returned. |
+| `GET /clock` | Lightweight playback time and pause-state sample. |
+| `GET /status` | Track, codec, bitrate, output-device and Omniphony route telemetry. |
+| `GET /config`, `POST /config` | Reads or updates RealMAX format priority, source mode, and selected account provider order. |
+| `GET /devices`, `POST /device` | Lists and selects MPV audio endpoints. |
+| `GET /eclipse-auth/status`, `GET /eclipse-auth/addons` | Reports redacted Eclipse account state and enabled account connections. |
+| `POST /eclipse-auth/complete`, `POST /eclipse-auth/disconnect` | Verifies and stores an Eclipse sign-in or disconnects the account. |
+| `POST /play` | Resolves a track in RealMAX order and loads the selected TIDAL or Eclipse transport. |
+| `POST /pause`, `/resume`, `/seek` | Generation-checked transport controls. |
+| `POST /login/start`, `GET /login/status` | Starts and polls bundled EbbLabs `python-tidal` authorization. |
+| `POST /shutdown` | Authenticated native-supervisor shutdown; the per-launch credential is not exposed to browser code. |
+
+The service watches the exact TIDAL process that owns it. It does not adopt or stop another live TIDAL instance, and it refuses to start playback infrastructure without a verified owner process.

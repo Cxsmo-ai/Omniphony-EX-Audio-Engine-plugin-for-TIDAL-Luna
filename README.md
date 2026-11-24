@@ -4,8 +4,8 @@
 
 <br />
 
-[![Plugin Version](https://img.shields.io/badge/Plugin-v2.1.61-00d2c4?style=for-the-badge&logo=tidal&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna)
-[![API Service](https://img.shields.io/badge/API_Service-v2.1.38-31d8ff?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases)
+[![Plugin Version](https://img.shields.io/badge/Plugin-v2.1.63-00d2c4?style=for-the-badge&logo=tidal&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna)
+[![API Service](https://img.shields.io/badge/API_Service-v2.1.40-31d8ff?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases)
 [![Dolby Atmos](https://img.shields.io/badge/Dolby_Atmos-AC--4_IMS_%7C_E--AC--3_JOC-f5c400?style=for-the-badge)](docs/ARCHITECTURE.md)
 [![Hi-Res Audio](https://img.shields.io/badge/FLAC-24--bit_%2F_192_kHz-00ff88?style=for-the-badge)](docs/ARCHITECTURE.md)
 [![Bundled API](https://img.shields.io/badge/API-Python%20%2B%20python--tidal-00ff88?style=for-the-badge)](docs/ARCHITECTURE.md)
@@ -27,7 +27,7 @@
   - **Dolby AC-4 IMS:** Decoded via OxideAV and exported as bit-perfect WAV or compressed 24-bit/48 kHz FLAC.
   - **Full Metadata & Artwork Tagging:** Automatically injects Vorbis comments (`TITLE`, `ARTIST`, `ALBUM`, `DATE`, `TRACKNUMBER`, `ISRC`, `SPATIAL_BINAURAL`, `LYRICS`), embeds high-resolution front cover artwork (type 3), and writes synchronized `.lrc` sidecar lyrics files.
   - **Customizable Folder & Path Templates:** Supports `{artist}/{album}/{trackNumber} - {title}` and native Windows folder picker (`showOpenDialog`).
-- **RealMAX Multi-Source Resolution:** Dynamically evaluates all 24 user-selectable format priority orders across **TIDAL** (`EbbLabs/python-tidal`), user-supplied **Amazon Music Eclipse** addons, and an automatic **Tido Eclipse** fallback when the main TIDAL API is not yet linked.
+- **RealMAX Multi-Source Resolution:** Evaluates the selected 24-format priority order across **TIDAL** (`EbbLabs/python-tidal`) and the add-ons connected to the user's authenticated **Eclipse account**, including Amazon Music when enabled there.
 
 ---
 
@@ -68,7 +68,7 @@ All screenshots below are real captures taken directly from a live Windows 11 se
 </p>
 
 ### 4. In-TIDAL Omniphony EX Control Drawer (`E-AC-3 JOC` vs. `AC-4 IMS`)
-*Side-by-side real captures of the floating Omniphony EX settings drawer showing live source/decoded/output telemetry, paused preparation control, 24-order RealMAX priority selector, RealMAX Source Provider selector (`Both` / `TIDAL Only` / `Amazon Music Only`), WASAPI device selector, 1-click TIDAL OAuth link, engine paths, and Eclipse addon manifest loader:*
+*Side-by-side captures of the Omniphony EX settings drawer showing playback telemetry, paused preparation, RealMAX priority, provider selection, audio-device selection, account sign-in, and engine paths:*
 
 | `E-AC-3 JOC` Active (`Omniphony Studio ↔ orender` Confirmed) | `AC-4 IMS` Active (`OxideAV` MP4 Packet Average Confirmed) |
 | :---: | :---: |
@@ -103,8 +103,7 @@ flowchart TD
 
     subgraph SOURCES["Multi-Source Providers"]
         EBB["EbbLabs python-tidal - PKCE, Mobile OAuth, TV Atmos"]
-        AMZM["Amazon Music Eclipse Addon - Optional"]
-        TIDO["Tido Eclipse - Unauthenticated Fallback"]
+        ECLIPSE["Authenticated Eclipse Account Connections"]
     end
 
     subgraph ENGINE["Native Spatial Audio Engine"]
@@ -117,13 +116,12 @@ flowchart TD
     DETACH -->|"Play, Seek, Pause, Resume"| PRIO
 
     PRIO --> EBB
-    PRIO --> AMZM
-    PRIO --> TIDO
+    PRIO --> ECLIPSE
 
     EBB -->|"AC-4 IMS MP4"| OXIDE
     EBB -->|"E-AC-3 JOC or FLAC MPD"| DASH
-    TIDO -->|"E-AC-3 JOC or FLAC MPD"| DASH
-    AMZM -->|"Direct HTTPS MP4 (lavf/mov)"| MPV
+    ECLIPSE -->|"Account-enabled addon formats"| DASH
+    ECLIPSE -->|"Validated direct MP4"| MPV
 
     OXIDE -->|"Verified 48kHz Binaural PCM"| MPV
     DASH -->|"HTTP Audio Segments"| MPV
@@ -153,17 +151,19 @@ flowchart TD
 
 | Mode | Selector Label | Routing Behavior |
 | :--- | :--- | :--- |
-| **`auto`** *(Default)* | **Both (TIDAL + Amazon Music / Eclipse)** | Evaluates each format in your exact 24-permutation priority order across both providers. If a track is stereo-only on TIDAL (e.g., *Imagine Dragons — Natural (Live in Vegas)*) but has a Dolby Atmos `E-AC-3 JOC` mix on your configured Amazon Music Eclipse addon, RealMAX automatically upgrades the track to the Amazon Atmos stream. |
-| **`tidal_only`** | **TIDAL Only (Atmos AC-4/JOC + Hi-Res)** | Resolves exclusively through TIDAL (including cross-edition discovery for alternate Atmos / Deluxe Hi-Res album releases). |
-| **`amazon_only`** | **Amazon Music Only (No AC-4 IMS)** | Resolves exclusively through your user-supplied Amazon Music Eclipse addon (`Atmos_EC-3`, `Max` 24-bit/192 kHz, and `Lossless` 16-bit/44.1 kHz). Automatically skips `AC4_IMS` since AC-4 IMS is exclusive to TIDAL. |
+| **`both`** *(Default)* | **Both (TIDAL API + Eclipse add-ons)** | For each format in quality priority, checks selected providers in provider priority and uses the first that can serve it. Then advances to the next format if none can. |
+| **`tidal_api`** | **TIDAL API only** | Resolves formats exclusively through the bundled TIDAL API. |
+| **`eclipse_addons`** | **Eclipse add-ons only** | Resolves through enabled account add-ons in Eclipse playback order or the user's provider priority. AC-4 IMS is available only through the main TIDAL API. |
 
 ### Authentication & Automatic Unauthenticated Fallback
 
 | Auth State | Active Resolver | Capabilities |
 | :--- | :--- | :--- |
 | **Main TIDAL API Linked** *(Recommended)* | Bundled **EbbLabs `python-tidal`** (`PKCE` + Mobile `OAuth` + `TV` Atmos profiles) | Full access to **Dolby AC-4 IMS**, **Dolby Atmos E-AC-3 JOC**, **24-bit/192 kHz Hi-Res FLAC**, **16-bit/44.1 kHz Lossless FLAC**, and cross-edition catalog discovery. |
-| **Main TIDAL API Not Yet Linked** | Built-in **Tido Eclipse Fallback** (`com.yourname.tidal.hifi`) | Works out-of-the-box before linking a TIDAL account: resolves **Dolby Atmos E-AC-3 JOC**, **Hi-Res FLAC**, and **Lossless FLAC** (`AC-4 IMS` requires linking the main TIDAL API). |
-| **User-Added Eclipse Manifest** *(Optional)* | **Amazon Music Eclipse Addon** (`com.yourname.amazonmusic`) | Users paste their own Eclipse `manifest.json` URL in Settings; OmniFusion handles the 2-step `X-Eclipse-Access` token handshake automatically in the background. |
+| **Main TIDAL API Linked** | Bundled **EbbLabs `python-tidal`** | TIDAL streams and formats returned for the authenticated account, including AC-4 IMS when available. |
+| **Eclipse Account Linked** *(Optional)* | **Connect Eclipse with Discord** in Omniphony EX settings | Opens the normal Eclipse sign-in in an isolated window, verifies the account, and reads enabled add-on connections and playback order. The session is protected for the current Windows user; no Eclipse Windows client or pasted manifest URL is needed. |
+
+The bottom-right playback badge reports the active stream source (TIDAL API, TIDAL Eclipse add-on, Amazon Music, or the connected Eclipse add-on), format, and source bitrate.
 
 ---
 
@@ -196,8 +196,9 @@ MPV and Omniphony Studio remain separate user-provided applications. The Python 
 ### Step 3 — Authenticate and choose sources
 1. Click **Link / Authenticate TIDAL Account** to authorize the bundled `python-tidal` API.
 2. Set the RealMAX format order and source mode in plugin settings.
-3. Optionally paste an Eclipse addon `manifest.json` URL under **Eclipse Addon Providers** for Amazon Music/Eclipse resolution.
-4. Apply the engine paths and confirm the service health and selected output device before starting a track.
+3. For account-gated Eclipse addons, choose **Connect Eclipse with Discord** and finish sign-in in the Eclipse window that opens. The returned session is verified before it is saved; disconnect it from the same settings panel at any time.
+4. Refresh **Eclipse Account Connections** to load the add-ons enabled on your account. Use RealMAX provider settings to choose TIDAL, Eclipse, Amazon Music, or a custom provider priority order.
+5. Apply the engine paths and confirm service health and the selected output device before starting a track.
 
 ---
 

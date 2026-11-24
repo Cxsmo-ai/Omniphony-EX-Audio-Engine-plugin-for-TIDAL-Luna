@@ -16,18 +16,14 @@
  */
 
 const API_BASE = "http://127.0.0.1:8765";
-const REQUIRED_SERVICE_VERSION = "2.1.38";
-const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.61";
-function parseEclipseManifestUrl(value) {
-  const parsed = new URL(String(value ?? "").trim());
-  const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  const localHttp = parsed.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(hostname);
-  if ((parsed.protocol !== "https:" && !localHttp) || !parsed.hostname || parsed.username || parsed.password) {
-    throw new Error("Enter an HTTPS manifest URL (HTTP is allowed only for localhost development).");
-  }
-  return parsed.href;
+function normalizeRealmaxSourceMode(value) {
+  if (value === "tidal_api" || value === "tidal_only") return "tidal_api";
+  if (value === "eclipse_addons" || value === "eclipse_only" || value === "amazon_only") return "eclipse_addons";
+  return "both";
 }
+const REQUIRED_SERVICE_VERSION = "2.1.40";
+const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
+const PLUGIN_BUILD = "2.1.63";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -111,6 +107,106 @@ const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
     return { installed: false, restored: true };
   },
 };`;
+const NATIVE_ECLIPSE_AUTH_MODULE_ID = "OmniphonyEX/eclipse-auth.native.js";
+const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
+  async startLogin(serviceBase) {
+    const { BrowserWindow, net } = require("electron");
+    const crypto = require("crypto");
+    const stateKey = Symbol.for("omniphony-ex.eclipse-auth-window");
+    const state = globalThis[stateKey] || (globalThis[stateKey] = { window: null, partition: null, busy: false });
+    let endpoint;
+    try { endpoint = new URL(serviceBase); } catch (_) { return { started: false, error: "invalid_service_url" }; }
+    if (endpoint.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(endpoint.hostname)) {
+      return { started: false, error: "service_must_be_loopback" };
+    }
+    if (state.window && !state.window.isDestroyed()) {
+      state.window.show();
+      state.window.focus();
+      return { started: true, existing: true };
+    }
+    const partition = "temp:omniphony-eclipse-auth-" + crypto.randomBytes(12).toString("hex");
+    const win = new BrowserWindow({
+      width: 620, height: 760, minWidth: 480, minHeight: 600, show: true,
+      title: "Connect Eclipse account", backgroundColor: "#17191d",
+      webPreferences: { partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true },
+    });
+    state.window = win;
+    state.partition = partition;
+    win.setMenuBarVisibility(false);
+    const allowedHost = (host) => ["eclipsemusic.app", "www.eclipsemusic.app", "api.eclipsemusic.app", "discord.com", "www.discord.com", "discordapp.com", "www.discordapp.com"].includes(host.toLowerCase());
+    const cleanUp = async () => {
+      const ses = win.webContents.session;
+      state.window = null;
+      state.partition = null;
+      state.busy = false;
+      if (!win.isDestroyed()) win.destroy();
+      try { await ses.clearStorageData(); } catch (_) {}
+    };
+    const postToken = (token) => new Promise((resolve, reject) => {
+      const target = new URL("/eclipse-auth/complete", endpoint);
+      const body = JSON.stringify({ token });
+      const request = net.request({
+        method: "POST", protocol: target.protocol, hostname: target.hostname,
+        port: target.port, path: target.pathname,
+        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), "Origin": endpoint.origin },
+      });
+      let responseBody = "";
+      request.on("response", (response) => {
+        response.on("data", (chunk) => { responseBody += chunk.toString("utf8"); });
+        response.on("end", () => {
+          if (response.statusCode < 200 || response.statusCode >= 300) return reject(new Error("eclipse_token_rejected"));
+          try { resolve(JSON.parse(responseBody)); } catch (_) { reject(new Error("invalid_service_response")); }
+        });
+      });
+      request.on("error", () => reject(new Error("service_unavailable")));
+      request.write(body);
+      request.end();
+    });
+    const handleNavigation = (event, targetUrl) => {
+      let parsed;
+      try { parsed = new URL(targetUrl); } catch (_) { event.preventDefault(); return; }
+      if (parsed.protocol !== "https:" || !allowedHost(parsed.hostname)) { event.preventDefault(); return; }
+      if (!["eclipsemusic.app", "www.eclipsemusic.app"].includes(parsed.hostname.toLowerCase())
+          || !/^\/sign-in(?:\.html)?\/?$/.test(parsed.pathname)
+          || !parsed.searchParams.has("token")) return;
+      event.preventDefault();
+      if (state.busy) return;
+      state.busy = true;
+      const token = parsed.searchParams.get("token");
+      if (!token || token.length > 8192 || /[\u0000-\u001f]/.test(token)) { void cleanUp(); return; }
+      void postToken(token).then((result) => {
+        if (result?.connected === true) return cleanUp();
+        state.busy = false;
+        if (!win.isDestroyed()) { win.setTitle("Eclipse sign-in was not accepted"); void win.loadURL("https://eclipsemusic.app/sign-in"); }
+      }).catch(() => {
+        state.busy = false;
+        if (!win.isDestroyed()) { win.setTitle("Eclipse sign-in could not be verified"); void win.loadURL("https://eclipsemusic.app/sign-in"); }
+      });
+    };
+    win.webContents.on("will-redirect", handleNavigation);
+    win.webContents.on("will-navigate", handleNavigation);
+    win.webContents.setWindowOpenHandler(({ url }) => {
+      let parsed;
+      try { parsed = new URL(url); } catch (_) { return { action: "deny" }; }
+      if (parsed.protocol === "https:" && allowedHost(parsed.hostname)) setImmediate(() => { if (!win.isDestroyed()) void win.loadURL(url); });
+      return { action: "deny" };
+    });
+    win.on("closed", () => {
+      if (state.window === win) { state.window = null; state.partition = null; state.busy = false; }
+    });
+    void win.loadURL("https://eclipsemusic.app/sign-in").catch(() => { if (!win.isDestroyed()) win.setTitle("Eclipse sign-in could not be opened"); });
+    return { started: true, existing: false };
+  },
+  async closeLogin() {
+    const state = globalThis[Symbol.for("omniphony-ex.eclipse-auth-window")];
+    if (!state?.window || state.window.isDestroyed()) return { closed: false };
+    state.window.destroy();
+    state.window = null;
+    state.partition = null;
+    state.busy = false;
+    return { closed: true };
+  },
+};`;
 const NATIVE_SERVICE_SUPERVISOR_MODULE_ID = "OmniphonyEX/service-supervisor.native.js";
 const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
   async ensureService(requiredVersion, runtimeConfig = {}) {
@@ -153,11 +249,11 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.61");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.63");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.61/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "5E5D71A3CBD4B9AA9B02118AC5E4A89EA7048F6FFC057DC7DF0BFBD93D69C131";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.63/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "3B25072F36CCCC2E4E58C4806331BAE3BF99ABD9D81F61CE67BD8D29D39022F6";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -229,7 +325,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.61"
+        return marker.pluginVersion === "2.1.63"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -298,7 +394,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.61", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.63", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -668,7 +764,9 @@ const priorityPresets = permutations(supportedFormats).map((value) => ({
 }));
 let currentConfig = {
   priority: ["AC4_IMS", "EAC3_JOC", "HI_RES_LOSSLESS", "LOSSLESS"],
-  audio_device: "auto"
+  audio_device: "auto",
+  realmax_source: "both",
+  realmax_provider_order: null
 };
 let availableDevices = [];
 let lastSettingsFetchFailure = null;
@@ -6220,7 +6318,15 @@ function formatSourceBitrate(status, bitrate = getSourceBitrate(status)) {
 }
 
 function getSourcePlaybackSummary(status, format) {
-  const provider = status?.sourceProvider || (String(status?.streamTransport || '').includes('amazon') || String(status?.streamTransport || '').includes('amzm') ? 'AMAZON' : 'TIDAL');
+  const providerType = String(status?.sourceProvider || (String(status?.streamTransport || '').includes('amazon') || String(status?.streamTransport || '').includes('amzm') ? 'AMAZON' : 'TIDAL')).toUpperCase();
+  const sourceName = String(status?.sourceName || "").trim();
+  const provider = providerType === "TIDAL"
+    ? (sourceName || "TIDAL API")
+    : providerType === "TIDAL_ECLIPSE"
+      ? (sourceName || "TIDAL Eclipse add-on")
+      : providerType === "AMAZON"
+        ? (sourceName && !/amazon/i.test(sourceName) ? `Amazon Music · ${sourceName}` : "Amazon Music")
+        : sourceName || "Eclipse add-on";
   const sampleRate = getAudioParam({ value: status?.sourceSampleRate }, "value");
   const channels = getAudioParam({ value: status?.sourceChannels }, "value");
   const bitrate = getSourceBitrate(status);
@@ -6410,6 +6516,11 @@ function updateBadgeUI(label) {
 }
 
 function toggleSettingsPanel() {
+  const normalizeSourceMode = (value) => value === "tidal_api" || value === "tidal_only"
+    ? "tidal_api"
+    : value === "eclipse_addons" || value === "eclipse_only" || value === "amazon_only"
+      ? "eclipse_addons"
+      : "both";
   let panel = document.getElementById("omniphony-settings-panel");
   if (panel) {
     if (panel._omniphonyResizeHandler) {
@@ -6613,7 +6724,7 @@ function toggleSettingsPanel() {
   panel.appendChild(priorityHelp);
   panel.appendChild(prioritySaveStatus);
 
-  // RealMAX Source Provider Selector (Both / TIDAL Only / Amazon Music Only)
+  // RealMAX Source Provider Selector (Both / TIDAL API / Eclipse add-ons)
   const sourceLabel = document.createElement("label");
   sourceLabel.innerText = "RealMAX Source Provider:";
   sourceLabel.style.fontWeight = "600";
@@ -6635,9 +6746,9 @@ function toggleSettingsPanel() {
   sourceSelect.id = "omniphony-source-select";
   sourceSelect.setAttribute("aria-label", "RealMAX source provider mode");
   [
-    { value: "auto", label: "Both (TIDAL + Amazon Music / Eclipse)" },
-    { value: "tidal_only", label: "TIDAL Only (Atmos AC-4/JOC + Hi-Res)" },
-    { value: "amazon_only", label: "Amazon Music Only (No AC-4 IMS)" },
+    { value: "both", label: "Both (TIDAL API + Eclipse add-ons)" },
+    { value: "tidal_api", label: "TIDAL API only" },
+    { value: "eclipse_addons", label: "Eclipse add-ons only" },
   ].forEach((opt) => {
     const el = document.createElement("option");
     el.value = opt.value;
@@ -6837,7 +6948,7 @@ function toggleSettingsPanel() {
   const searchInput = document.createElement("input");
   searchInput.id = "omniphony-multi-search-input";
   searchInput.type = "text";
-  searchInput.placeholder = "Search tracks, Atmos editions, exclusives across TIDAL & Amazon...";
+  searchInput.placeholder = "Search TIDAL and connected Eclipse account add-ons...";
   searchInput.style.cssText = "width:100%;box-sizing:border-box;background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:8px 10px;margin-bottom:8px;font:inherit;font-size:12px;";
   panel.appendChild(searchInput);
 
@@ -6880,7 +6991,7 @@ function toggleSettingsPanel() {
       return;
     }
     searchResultsContainer.style.display = "block";
-    setSearchMessage("Searching across TIDAL & Amazon Music...");
+    setSearchMessage("Searching TIDAL and your enabled Eclipse account add-ons...");
 
     searchDebounceTimer = setTimeout(async () => {
       try {
@@ -6925,10 +7036,12 @@ function toggleSettingsPanel() {
 
           const titleLine = document.createElement("div");
           const isAmazon = t.source === "AMAZON";
+          const isTidalEclipse = t.source === "TIDAL_ECLIPSE";
+          const sourceLabel = isAmazon ? "AMAZON MUSIC" : isTidalEclipse ? "TIDAL ECLIPSE" : t.source === "TIDAL" ? "TIDAL" : String(t.sourceName || "ECLIPSE").toUpperCase();
           titleLine.appendChild(createTextBadge(
-            isAmazon ? "AMAZON MUSIC" : "TIDAL",
-            `display:inline-flex;align-items:center;background:${isAmazon ? "#ff9900" : "#00d2c4"};color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;gap:3px;`,
-            isAmazon ? amazonLogoSvg : tidalLogoSvg,
+            sourceLabel,
+            `display:inline-flex;align-items:center;background:${isAmazon ? "#ff9900" : isTidalEclipse || t.source === "TIDAL" ? "#00d2c4" : "#5865f2"};color:#000;font-weight:700;font-size:9px;padding:2px 5px;border-radius:3px;margin-right:4px;vertical-align:middle;line-height:1;gap:3px;`,
+            isAmazon ? amazonLogoSvg : isTidalEclipse || t.source === "TIDAL" ? tidalLogoSvg : null,
           ));
           if (t.upgrade && t.upgrade.provider === "AMAZON") {
             titleLine.appendChild(createTextBadge(
@@ -6969,6 +7082,7 @@ function toggleSettingsPanel() {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   trackId: t.id,
+                  providerKey: t.providerKey,
                   title: t.title,
                   artist: t.artist,
                   album: t.album,
@@ -7058,78 +7172,192 @@ function toggleSettingsPanel() {
 
 
   // External Eclipse Addon Providers
-  const addonDivider = document.createElement("div");
-  addonDivider.style.cssText = "height:1px;background:rgba(255,255,255,0.1);margin:14px 0 12px;";
-  panel.appendChild(addonDivider);
+  const eclipseAuthDivider = document.createElement("div");
+  eclipseAuthDivider.style.cssText = "height:1px;background:rgba(255,255,255,0.1);margin:14px 0 12px;";
+  panel.appendChild(eclipseAuthDivider);
 
-  const addonLabel = document.createElement("label");
-  addonLabel.innerText = "Eclipse Addon Providers (RealMAX Multi-Source):";
-  addonLabel.style.fontWeight = "600";
-  addonLabel.style.display = "block";
-  addonLabel.style.marginBottom = "6px";
-  panel.appendChild(addonLabel);
+  const eclipseAuthHeading = document.createElement("label");
+  eclipseAuthHeading.innerText = "Eclipse account (Discord):";
+  eclipseAuthHeading.style.cssText = "font-weight:600;display:block;margin-bottom:6px;";
+  panel.appendChild(eclipseAuthHeading);
 
-  const addonInput = document.createElement("input");
-  addonInput.id = "omniphony-addon-input";
-  addonInput.type = "url";
-  addonInput.placeholder = "https://.../manifest.json";
-  addonInput.style.cssText = "width:100%;box-sizing:border-box;background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:8px;margin-bottom:6px;font:inherit;font-size:11px;";
-  panel.appendChild(addonInput);
+  const eclipseAuthStatus = document.createElement("div");
+  eclipseAuthStatus.id = "omniphony-eclipse-auth-status";
+  eclipseAuthStatus.style.cssText = "min-height:16px;color:#aaa;font-size:11px;line-height:1.4;margin:0 0 8px;overflow-wrap:anywhere;";
+  eclipseAuthStatus.textContent = "Connect your Eclipse account to use account-gated add-ons.";
+  panel.appendChild(eclipseAuthStatus);
 
-  const addAddonBtn = document.createElement("button");
-  addAddonBtn.id = "omniphony-add-addon-btn";
-  addAddonBtn.type = "button";
-  addAddonBtn.innerText = "+ Add Eclipse Manifest / Provider";
-  addAddonBtn.style.cssText = "width:100%;background:#31d8ff;color:#000;font-weight:700;border:none;border-radius:6px;padding:7px 10px;cursor:pointer;font:inherit;margin-bottom:8px;";
-  panel.appendChild(addAddonBtn);
+  const eclipseConnectButton = document.createElement("button");
+  eclipseConnectButton.id = "omniphony-eclipse-connect";
+  eclipseConnectButton.type = "button";
+  eclipseConnectButton.textContent = "Connect Eclipse with Discord";
+  eclipseConnectButton.style.cssText = "width:100%;background:#5865f2;color:#fff;font-weight:700;border:none;border-radius:6px;padding:8px 10px;cursor:pointer;font:inherit;margin-bottom:6px;";
+  panel.appendChild(eclipseConnectButton);
 
-  const addonStatus = document.createElement("div");
-  addonStatus.id = "omniphony-addon-status";
-  addonStatus.style.cssText = "min-height:16px;color:#aaa;font-size:11px;line-height:1.4;margin:0 0 10px;overflow-wrap:anywhere;";
-  addonStatus.innerText = "Default: Amazon Music Eclipse Addon supported (ISRC / title matching).";
-  panel.appendChild(addonStatus);
-  const setAddonStatus = (message, color = "#aaa", emphasize = false) => {
-    addonStatus.replaceChildren();
-    const statusText = document.createElement(emphasize ? "strong" : "span");
-    statusText.style.color = color;
-    statusText.textContent = String(message ?? "");
-    addonStatus.appendChild(statusText);
-  };
+  const eclipseDisconnectButton = document.createElement("button");
+  eclipseDisconnectButton.id = "omniphony-eclipse-disconnect";
+  eclipseDisconnectButton.type = "button";
+  eclipseDisconnectButton.textContent = "Disconnect Eclipse account";
+  eclipseDisconnectButton.style.cssText = "display:none;width:100%;background:#292b30;color:#ddd;border:1px solid #45474d;border-radius:6px;padding:7px 10px;cursor:pointer;font:inherit;margin-bottom:8px;";
+  panel.appendChild(eclipseDisconnectButton);
 
-  addAddonBtn.onclick = async () => {
-    let url;
+  const eclipseConnectionsButton = document.createElement("button");
+  eclipseConnectionsButton.id = "omniphony-eclipse-refresh-addons";
+  eclipseConnectionsButton.type = "button";
+  eclipseConnectionsButton.textContent = "Refresh Eclipse account add-ons";
+  eclipseConnectionsButton.style.cssText = "display:none;width:100%;background:#202a35;color:#dce8f2;border:1px solid #40556a;border-radius:6px;padding:7px 10px;cursor:pointer;font:inherit;margin-bottom:6px;";
+  panel.appendChild(eclipseConnectionsButton);
+
+  const eclipseConnectionsStatus = document.createElement("div");
+  eclipseConnectionsStatus.id = "omniphony-eclipse-connections-status";
+  eclipseConnectionsStatus.style.cssText = "display:none;min-height:16px;color:#aaa;font-size:11px;line-height:1.4;margin:0 0 8px;overflow-wrap:anywhere;";
+  eclipseConnectionsStatus.textContent = "Enabled Eclipse account add-ons are picked up automatically in the account's playback order.";
+  panel.appendChild(eclipseConnectionsStatus);
+
+  const eclipseConnectionsList = document.createElement("div");
+  eclipseConnectionsList.id = "omniphony-eclipse-connections-list";
+  eclipseConnectionsList.style.cssText = "display:none;max-height:120px;overflow:auto;margin:0 0 8px;padding:0 8px;border-left:2px solid #40556a;color:#bbb;font-size:10px;line-height:1.5;";
+  panel.appendChild(eclipseConnectionsList);
+
+  let eclipseAuthNativeChannel = null;
+  let eclipseAuthStatusTimer = null;
+  let eclipseAccountWasConnected = false;
+  let eclipseConnectionsRequest = 0;
+  const refreshEclipseConnections = async () => {
+    const requestId = ++eclipseConnectionsRequest;
+    eclipseConnectionsButton.disabled = true;
+    eclipseConnectionsStatus.textContent = "Loading your Eclipse account connections…";
+    eclipseConnectionsList.replaceChildren();
     try {
-      url = parseEclipseManifestUrl(addonInput.value);
-    } catch (err) {
-      setAddonStatus(err.message || "Please enter a valid HTTPS manifest URL.", "#ff7272");
-      return;
+      const response = await requestWithTimeout(`${API_BASE}/eclipse-auth/addons?refresh=1`, {}, 12000);
+      if (!response.ok) throw new Error(`Account add-on refresh failed (${response.status})`);
+      const data = await response.json();
+      if (requestId !== eclipseConnectionsRequest || !panel.isConnected) return;
+      if (data?.connected !== true) {
+        eclipseConnectionsStatus.textContent = "Connect your Eclipse account to load its add-ons.";
+        eclipseConnectionsStatus.style.color = "#e4b363";
+        return;
+      }
+      if (data?.available !== true) {
+        eclipseConnectionsStatus.textContent = data?.reason === "unauthorized"
+          ? "Eclipse rejected the saved session. Reconnect with Discord to refresh account access."
+          : "Could not load the Eclipse account add-ons right now. Try Refresh again.";
+        eclipseConnectionsStatus.style.color = "#e4b363";
+        return;
+      }
+      const addons = Array.isArray(data.addons) ? data.addons : [];
+      const active = addons.filter((addon) => addon?.isEnabled === true && typeof addon.key === "string");
+      const inactive = addons.filter((addon) => addon?.isEnabled !== true);
+      eclipseConnectionsStatus.textContent = active.length
+        ? `${active.length} enabled account add-on${active.length === 1 ? "" : "s"} ready for RealMAX, following your Eclipse playback order${inactive.length ? ` · ${inactive.length} disabled` : ""}.`
+        : "No enabled Eclipse account add-ons with a manifest URL were found. Add-ons enabled on your Eclipse account will appear here.";
+      eclipseConnectionsStatus.style.color = active.length ? "#00d98b" : "#aaa";
+      for (const addon of addons) {
+        const row = document.createElement("div");
+        row.textContent = `${addon?.isEnabled === true ? "✓" : "○"} ${String(addon?.displayName || addon?.addonId || "Eclipse add-on")}${addon?.isEnabled === true ? " · enabled" : " · disabled in Eclipse"}`;
+        eclipseConnectionsList.appendChild(row);
+      }
+    } catch (_) {
+      if (requestId === eclipseConnectionsRequest && panel.isConnected) {
+        eclipseConnectionsStatus.textContent = "Eclipse account connections could not be loaded. Check the service connection and try again.";
+        eclipseConnectionsStatus.style.color = "#e4b363";
+      }
+    } finally {
+      if (requestId === eclipseConnectionsRequest) eclipseConnectionsButton.disabled = false;
     }
-    addonStatus.innerText = "Saving & probing Eclipse addon manifest...";
+  };
+  eclipseConnectionsButton.onclick = () => { void refreshEclipseConnections(); };
+  const updateEclipseAuthStatus = async () => {
     try {
-      const saveRes = await requestWithTimeout(`${API_BASE}/config`, {
+      const response = await requestWithTimeout(`${API_BASE}/eclipse-auth/status`, {}, 5000);
+      if (!response.ok) throw new Error(`status ${response.status}`);
+      const data = await response.json();
+      if (!panel.isConnected) {
+        if (eclipseAuthStatusTimer) clearInterval(eclipseAuthStatusTimer);
+        return;
+      }
+      const user = data?.user && typeof data.user === "object" ? data.user : {};
+      const identity = [user.name, user.email].filter((value) => typeof value === "string" && value.trim()).join(" · ");
+      if (data?.connected === true) {
+        eclipseAuthStatus.textContent = `Connected${identity ? ` as ${identity}` : ""}. Eclipse account access is ready.`;
+        eclipseAuthStatus.style.color = "#00d98b";
+        eclipseConnectButton.textContent = "Reconnect Eclipse with Discord";
+        eclipseConnectButton.disabled = false;
+        eclipseDisconnectButton.style.display = "block";
+        eclipseConnectionsButton.style.display = "block";
+        eclipseConnectionsStatus.style.display = "block";
+        eclipseConnectionsList.style.display = "block";
+        if (!eclipseAccountWasConnected) void refreshEclipseConnections();
+        eclipseAccountWasConnected = true;
+      } else {
+        eclipseAuthStatus.textContent = data?.reason === "verification_unavailable"
+          ? "Eclipse could not be reached. The saved account will be checked again automatically."
+          : "Not connected. Connect your Eclipse account to use account-gated add-ons.";
+        eclipseAuthStatus.style.color = data?.reason === "verification_unavailable" ? "#e4b363" : "#aaa";
+        eclipseConnectButton.textContent = "Connect Eclipse with Discord";
+        eclipseConnectButton.disabled = false;
+        eclipseDisconnectButton.style.display = "none";
+        eclipseConnectionsButton.style.display = "none";
+        eclipseConnectionsStatus.style.display = "none";
+        eclipseConnectionsList.style.display = "none";
+        eclipseConnectionsList.replaceChildren();
+        eclipseAccountWasConnected = false;
+      }
+    } catch (_) {
+      eclipseAuthStatus.textContent = "OmniFusion service is not available for Eclipse account sign-in.";
+      eclipseAuthStatus.style.color = "#e4b363";
+    }
+  };
+  eclipseConnectButton.onclick = async () => {
+    eclipseConnectButton.disabled = true;
+    eclipseAuthStatus.textContent = "Opening Eclipse’s official Discord sign-in…";
+    eclipseAuthStatus.style.color = "#aaa";
+    try {
+      const ipc = window?.__ipcRenderer;
+      if (typeof ipc?.invoke !== "function") throw new Error("TidaLuna native IPC is unavailable");
+      if (!eclipseAuthNativeChannel) {
+        eclipseAuthNativeChannel = await ipc.invoke("__Luna.registerNative", NATIVE_ECLIPSE_AUTH_MODULE_ID, NATIVE_ECLIPSE_AUTH_MODULE_CODE);
+        if (typeof eclipseAuthNativeChannel !== "string" || !eclipseAuthNativeChannel.startsWith("__LunaNative.")) {
+          eclipseAuthNativeChannel = null;
+          throw new Error("TidaLuna did not create the Eclipse sign-in window handler");
+        }
+        unloads.add(() => {
+          const channel = eclipseAuthNativeChannel;
+          eclipseAuthNativeChannel = null;
+          if (channel) void ipc.invoke(channel, "closeLogin").catch(() => {});
+        });
+      }
+      const result = await ipc.invoke(eclipseAuthNativeChannel, "startLogin", API_BASE);
+      if (result?.started !== true) throw new Error(result?.error || "Eclipse sign-in could not be opened");
+      eclipseAuthStatus.textContent = "Sign in to Eclipse with Discord in the window that opened. The account will be verified before it is saved.";
+      if (eclipseAuthStatusTimer) clearInterval(eclipseAuthStatusTimer);
+      eclipseAuthStatusTimer = setInterval(updateEclipseAuthStatus, 2000);
+    } catch (error) {
+      eclipseAuthStatus.textContent = error?.message || "Could not start Eclipse sign-in.";
+      eclipseAuthStatus.style.color = "#ff7272";
+      eclipseConnectButton.disabled = false;
+    }
+  };
+  eclipseDisconnectButton.onclick = async () => {
+    if (!window.confirm("Disconnect this Eclipse account from Omniphony EX?")) return;
+    eclipseDisconnectButton.disabled = true;
+    try {
+      const response = await requestWithTimeout(`${API_BASE}/eclipse-auth/disconnect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ eclipse_addons: [url] })
-      }, 4000);
-      if (!saveRes.ok) {
-        throw new Error(`Service rejected manifest (${saveRes.status})`);
-      }
-      if (typeof localStorage !== "undefined") {
-        localStorage.setItem("omniphony_eclipse_manifest", url);
-      }
-      currentConfig.eclipse_addons = [url];
-      const r = await fetch(url).catch(() => null);
-      if (r && r.ok) {
-        const manifest = await r.json();
-        setAddonStatus(`✓ Saved & Loaded ${String(manifest.name || "Addon")} v${String(manifest.version || "1.0")} (${String(manifest.description || "Active")})`, "#00ff88", true);
-      } else {
-        setAddonStatus(`✓ Saved Eclipse Manifest to RealMAX Engine (${url})`, "#00ff88", true);
-      }
-    } catch (err) {
-      addonStatus.innerText = `Error: ${err.message}`;
+        body: "{}",
+      }, 5000);
+      if (!response.ok) throw new Error(`Disconnect failed (${response.status})`);
+      await updateEclipseAuthStatus();
+    } catch (error) {
+      eclipseAuthStatus.textContent = error?.message || "Could not disconnect the Eclipse account.";
+      eclipseAuthStatus.style.color = "#ff7272";
+    } finally {
+      eclipseDisconnectButton.disabled = false;
     }
   };
-
+  void updateEclipseAuthStatus();
+  unloads.add(() => { if (eclipseAuthStatusTimer) clearInterval(eclipseAuthStatusTimer); });
 
   let authPollTimer = null;
   const updateAuthStatus = async () => {
@@ -7213,13 +7441,7 @@ function toggleSettingsPanel() {
       settingsUiVerified = false;
     } else {
       currentConfig = { ...currentConfig, ...loaded };
-      if (document.getElementById("omniphony-source-select")) document.getElementById("omniphony-source-select").value = loaded?.realmax_source || "auto";
-      if (Array.isArray(loaded?.eclipse_addons) && loaded.eclipse_addons.length > 0) {
-        if (addonInput && !addonInput.value) addonInput.value = loaded.eclipse_addons[0];
-        if (addonStatus) {
-          setAddonStatus(`✓ Active Eclipse Manifest: ${String(loaded.eclipse_addons[0])}`, "#00ff88", true);
-        }
-      }
+      if (document.getElementById("omniphony-source-select")) document.getElementById("omniphony-source-select").value = normalizeSourceMode(loaded?.realmax_source);
       prioritySelect.value = loaded.priority.join(",");
       updatePriorityTitle();
       prioritySelect.disabled = false;
@@ -7301,6 +7523,7 @@ async function queueTrackDownload(trackMeta) {
   const syncedLyrics = typeof trackMeta.syncedLyrics === "string" ? trackMeta.syncedLyrics : trackMeta.subtitles || trackMeta.lrc || "";
   const payload = {
     trackId: trackMeta.id || trackMeta.trackId,
+    providerKey: trackMeta.providerKey,
     title: trackMeta.title || trackMeta.name || "Unknown Title",
     artist: artistName,
     album: albumName,
@@ -7478,14 +7701,147 @@ export const Settings = () => {
   const [priority, setPriority] = React.useState(currentConfig.priority.join(","));
   const priorityTouched = React.useRef(false);
   const [device, setDevice] = React.useState(currentConfig.audio_device);
-  const [sourceMode, setSourceMode] = React.useState(localStorage.getItem("omniphony_realmax_source") || "auto");
+  const savedSourceMode = normalizeRealmaxSourceMode(localStorage.getItem("omniphony_realmax_source") || currentConfig.realmax_source);
+  const [sourceMode, setSourceMode] = React.useState(savedSourceMode);
+  const [realmaxProviders, setRealmaxProviders] = React.useState([]);
+  const [providerOrder, setProviderOrder] = React.useState([]);
+  const [providerStatus, setProviderStatus] = React.useState("Loading TIDAL and Eclipse providers…");
+  const [eclipseAccountStatus, setEclipseAccountStatus] = React.useState("Checking Eclipse account…");
+  const [eclipseNativeChannel, setEclipseNativeChannel] = React.useState(null);
+  const providerOrderRef = React.useRef([]);
+  const providerSaveQueue = React.useRef(Promise.resolve());
+  const providerMutationSequence = React.useRef(0);
+  const providerRefreshSequence = React.useRef(0);
+  const eclipseConnectPollRef = React.useRef(null);
   const [mpvPath, setMpvPath] = React.useState(localStorage.getItem("omniphony_mpv_path") || "");
   const [studioPath, setStudioPath] = React.useState(localStorage.getItem("omniphony_studio_path") || "");
-  const [addonUrl, setAddonUrl] = React.useState("");
   const [authStatus, setAuthStatus] = React.useState("Ready");
   const [dlFolder, setDlFolder] = React.useState(localStorage.getItem("omniphony_download_folder") || "");
   const [ac4Format, setAc4Format] = React.useState(localStorage.getItem("omniphony_download_ac4_format") || "flac");
   const [dlPattern, setDlPattern] = React.useState(localStorage.getItem("omniphony_download_pattern") || "{artist}/{album}/{trackNumber} - {title}");
+
+  const refreshRealmaxProviders = React.useCallback(async (forceRefresh = false) => {
+    const refreshSequence = ++providerRefreshSequence.current;
+    setProviderStatus("Loading TIDAL and Eclipse account connections…");
+    try {
+      const response = await requestWithTimeout(`${API_BASE}/realmax/providers${forceRefresh ? "?refresh=1" : ""}`, { cache: "no-store" }, 15000);
+      if (!response.ok) throw new Error(`provider list returned ${response.status}`);
+      const data = await response.json();
+      if (refreshSequence !== providerRefreshSequence.current) return;
+      const rows = Array.isArray(data?.providers) ? data.providers : [];
+      const order = Array.isArray(data?.configuredOrder) ? data.configuredOrder : (Array.isArray(data?.order) ? data.order : []);
+      setRealmaxProviders(rows);
+      providerOrderRef.current = order;
+      setProviderOrder(order);
+      const enabledCount = order.length;
+      const eclipseCount = rows.filter((row) => row?.type !== "tidal_api" && row?.available).length;
+      const tidalReady = rows.some((row) => row?.key === "tidal_api" && row?.available);
+      if (data?.accountConnected !== true) setProviderStatus("Connect your Eclipse account with Discord to load its add-ons.");
+      else if (data?.accountAvailable !== true) setProviderStatus("Eclipse is signed in, but its add-on connections are temporarily unavailable. Refresh to retry.");
+      else setProviderStatus(`${enabledCount} provider${enabledCount === 1 ? "" : "s"} selected · ${tidalReady ? "TIDAL API ready" : "TIDAL API needs authorization"} · ${eclipseCount} Eclipse account add-on${eclipseCount === 1 ? "" : "s"} available${data?.customized ? " · custom priority" : " · following Eclipse account order"}`);
+    } catch (error) {
+      if (refreshSequence === providerRefreshSequence.current) setProviderStatus(`Provider list unavailable: ${error?.message || "service error"}`);
+    }
+  }, []);
+
+  const refreshEclipseAccount = React.useCallback(async () => {
+    try {
+      const statusResponse = await requestWithTimeout(`${API_BASE}/eclipse-auth/status`, { cache: "no-store" }, 8000);
+      if (!statusResponse.ok) throw new Error(`status ${statusResponse.status}`);
+      const status = await statusResponse.json();
+      if (status?.connected !== true) {
+        setEclipseAccountStatus("Not connected. Connect with Discord to use this Eclipse account’s add-ons.");
+        return;
+      }
+      const addonsResponse = await requestWithTimeout(`${API_BASE}/eclipse-auth/addons?refresh=1`, { cache: "no-store" }, 15000);
+      if (!addonsResponse.ok) throw new Error(`connections ${addonsResponse.status}`);
+      const addons = await addonsResponse.json();
+      if (addons?.available !== true) {
+        setEclipseAccountStatus(addons?.reason === "unauthorized"
+          ? "Eclipse session expired. Reconnect with Discord to refresh account access."
+          : "Signed in, but Eclipse account add-ons could not be loaded. Try Refresh Connections.");
+        return;
+      }
+      const count = (addons.addons || []).filter((addon) => addon?.isEnabled === true).length;
+      setEclipseAccountStatus(`${status.user?.name || status.user?.email || "Eclipse account"} · ${count} enabled account add-on${count === 1 ? "" : "s"} loaded in Eclipse playback order`);
+      void refreshRealmaxProviders(true);
+    } catch (error) {
+      setEclipseAccountStatus(`Eclipse account status unavailable: ${error?.message || "service error"}`);
+    }
+  }, [refreshRealmaxProviders]);
+
+  const connectEclipseAccount = React.useCallback(async () => {
+    try {
+      const ipc = window?.__ipcRenderer;
+      if (typeof ipc?.invoke !== "function") throw new Error("TidaLuna native IPC is unavailable");
+      let channel = eclipseNativeChannel;
+      if (!channel) {
+        channel = await ipc.invoke("__Luna.registerNative", NATIVE_ECLIPSE_AUTH_MODULE_ID, NATIVE_ECLIPSE_AUTH_MODULE_CODE);
+        if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) throw new Error("TidaLuna did not create the Eclipse sign-in handler");
+        setEclipseNativeChannel(channel);
+      }
+      const result = await ipc.invoke(channel, "startLogin", API_BASE);
+      if (result?.started !== true) throw new Error(result?.error || "Eclipse sign-in could not be opened");
+      setEclipseAccountStatus("Complete the official Eclipse Discord sign-in in the window that opened.");
+      if (eclipseConnectPollRef.current) clearInterval(eclipseConnectPollRef.current);
+      eclipseConnectPollRef.current = setInterval(async () => {
+        try {
+          const response = await requestWithTimeout(`${API_BASE}/eclipse-auth/status`, { cache: "no-store" }, 5000);
+          const status = response.ok ? await response.json() : null;
+          if (status?.connected === true) {
+            clearInterval(eclipseConnectPollRef.current);
+            eclipseConnectPollRef.current = null;
+            await refreshEclipseAccount();
+          }
+        } catch (_) {}
+      }, 2000);
+    } catch (error) {
+      setEclipseAccountStatus(error?.message || "Could not open Eclipse sign-in.");
+    }
+  }, [eclipseNativeChannel, refreshEclipseAccount]);
+
+  React.useEffect(() => {
+    void refreshEclipseAccount();
+    return () => {
+      if (eclipseConnectPollRef.current) clearInterval(eclipseConnectPollRef.current);
+      eclipseConnectPollRef.current = null;
+    };
+  }, [refreshEclipseAccount]);
+
+  const saveProviderOrder = React.useCallback(async (nextOrder) => {
+    const uniqueOrder = [...new Set(nextOrder)];
+    providerOrderRef.current = uniqueOrder;
+    providerRefreshSequence.current += 1;
+    const mutationSequence = ++providerMutationSequence.current;
+    setProviderOrder(uniqueOrder);
+    setRealmaxProviders((rows) => rows.map((row) => ({
+      ...row,
+      selected: uniqueOrder.includes(row.key),
+      priority: uniqueOrder.includes(row.key) ? uniqueOrder.indexOf(row.key) + 1 : null
+    })));
+    const savePromise = providerSaveQueue.current.catch(() => {}).then(async () => {
+      const response = await requestWithTimeout(`${API_BASE}/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ realmax_provider_order: uniqueOrder })
+      }, 5000);
+      if (!response.ok) throw new Error(`save returned ${response.status}`);
+      return true;
+    });
+    providerSaveQueue.current = savePromise;
+    try {
+      await savePromise;
+      if (mutationSequence === providerMutationSequence.current) {
+        setProviderStatus("RealMAX provider selection and order saved.");
+        currentConfig.realmax_provider_order = uniqueOrder;
+      }
+    } catch (error) {
+      if (mutationSequence === providerMutationSequence.current) {
+        setProviderStatus(`Could not save provider order: ${error?.message || "service error"}`);
+        void refreshRealmaxProviders(false);
+      }
+    }
+  }, [refreshRealmaxProviders]);
 
   React.useEffect(() => {
     let active = true;
@@ -7499,18 +7855,32 @@ export const Settings = () => {
         const isSupportedPriority = priorityPresets.some(
           (preset) => preset.value.join(",") === loadedPriority
         );
-        if (active && !priorityTouched.current && isSupportedPriority) {
+        if (active) {
           currentConfig = { ...currentConfig, ...config };
-          setPriority(loadedPriority);
+          if (!priorityTouched.current && isSupportedPriority) setPriority(loadedPriority);
+          const loadedSourceMode = normalizeRealmaxSourceMode(config?.realmax_source);
+          setSourceMode(loadedSourceMode);
+          localStorage.setItem("omniphony_realmax_source", loadedSourceMode);
         }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => { if (active) void refreshRealmaxProviders(false); });
     return () => { active = false; };
-  }, []);
+  }, [refreshRealmaxProviders]);
   
   return React.createElement(
     LunaSettings,
     { title: "Omniphony EX Engine & RealMAX" },
+    React.createElement(LunaButtonSetting, {
+      title: "Eclipse Account Connections",
+      desc: eclipseAccountStatus,
+      onClick: refreshEclipseAccount
+    }, "Refresh Eclipse Connections"),
+    React.createElement(LunaButtonSetting, {
+      title: "Eclipse Discord Sign-in",
+      desc: "Use your own Eclipse account. Enabled connections and supporter add-ons come from that account.",
+      onClick: connectEclipseAccount
+    }, "Connect Eclipse with Discord"),
     React.createElement(
       LunaSelectSetting,
       {
@@ -7538,25 +7908,95 @@ export const Settings = () => {
       LunaSelectSetting,
       {
         title: "RealMAX Source Provider",
-        desc: "Choose between TIDAL only, Amazon Music only, or Both (highest quality wins). Amazon Music has no AC-4 IMS.",
+        desc: "Choose which source family may resolve tracks. Provider switches and priority ranks below choose the exact TIDAL/Eclipse connections.",
         value: sourceMode,
         onChange: async (e) => {
           const val = e.target.value;
           setSourceMode(val);
           localStorage.setItem("omniphony_realmax_source", val);
           try {
-            await fetch(`${API_BASE}/config`, {
+            const response = await fetch(`${API_BASE}/config`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ realmax_source: val })
             });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            void refreshRealmaxProviders(false);
           } catch (_) {}
         }
       },
-      React.createElement(LunaSelectItem, { value: "auto" }, "Both (TIDAL + Amazon Music / Eclipse)"),
-      React.createElement(LunaSelectItem, { value: "tidal_only" }, "TIDAL Only (Atmos AC-4/JOC + Hi-Res)"),
-      React.createElement(LunaSelectItem, { value: "amazon_only" }, "Amazon Music Only (No AC-4 IMS)")
+      React.createElement(LunaSelectItem, { value: "both" }, "Both: TIDAL API + Eclipse add-ons"),
+      React.createElement(LunaSelectItem, { value: "tidal_api" }, "TIDAL API only"),
+      React.createElement(LunaSelectItem, { value: "eclipse_addons" }, "Eclipse add-ons only")
     ),
+    React.createElement(LunaButtonSetting, {
+      title: "RealMAX Provider Connections",
+      desc: providerStatus,
+      onClick: async () => { await refreshRealmaxProviders(true); }
+    }, "Refresh TIDAL / Eclipse Providers"),
+    realmaxProviders.flatMap((provider) => {
+      const key = provider.key;
+      const isSelected = providerOrder.includes(key);
+      const selection = isSelected ? providerOrder.indexOf(key) + 1 : "off";
+      const description = provider.type === "tidal_api"
+        ? (provider.available ? "EbbLabs / python-tidal source; supports the authorized TIDAL formats." : "Link the main TIDAL API account before enabling this provider.")
+        : `${provider.accountConnected ? "Connected to your Eclipse account" : "Reconnect this Eclipse account to restore the connection"}${provider.available ? " · available" : " · disabled or temporarily unavailable"}`;
+      return [
+        React.createElement(LunaSwitchSetting, {
+          key: `${key}:enabled`,
+          title: provider.name,
+          desc: description,
+          checked: isSelected,
+          disabled: !provider.available && !isSelected,
+          onChange: (_, checked) => {
+            const currentOrder = providerOrderRef.current;
+            const next = checked ? [...currentOrder, key] : currentOrder.filter((item) => item !== key);
+            void saveProviderOrder(next);
+          }
+        }),
+        React.createElement(LunaSelectSetting, {
+          key: `${key}:priority`,
+          title: `Priority: ${provider.name}`,
+          desc: "Choose where this provider is tried among selected sources.",
+          value: String(selection),
+          disabled: !provider.available && !isSelected,
+          onChange: (event) => {
+            const value = event?.target?.value;
+            const next = providerOrderRef.current.filter((item) => item !== key);
+            if (value !== "off") {
+              const targetIndex = Math.max(0, Math.min(Number(value) - 1, next.length));
+              next.splice(targetIndex, 0, key);
+            }
+            void saveProviderOrder(next);
+          }
+        }, [
+          React.createElement(LunaSelectItem, { key: "off", value: "off" }, "Not selected"),
+          ...Array.from({ length: Math.max(providerOrder.length + 1, realmaxProviders.length) }, (_, index) =>
+            React.createElement(LunaSelectItem, { key: String(index + 1), value: String(index + 1) }, `Priority ${index + 1}`)
+          )
+        ])
+      ];
+    }),
+    React.createElement(LunaButtonSetting, {
+      title: "Use all available providers",
+      desc: "Restore TIDAL API plus the enabled Eclipse account connections in account playback order.",
+      onClick: async () => {
+        try {
+          const response = await requestWithTimeout(`${API_BASE}/config`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ realmax_provider_order: null })
+          }, 5000);
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          currentConfig.realmax_provider_order = null;
+          providerOrderRef.current = [];
+          providerMutationSequence.current += 1;
+          await refreshRealmaxProviders(true);
+        } catch (error) {
+          setProviderStatus(`Could not restore account order: ${error?.message || "service error"}`);
+        }
+      }
+    }, "Use Eclipse Account Order"),
     React.createElement(LunaTextSetting, {
       title: "MPV Engine Directory",
       desc: "Directory containing mpv.exe and orender.dll.",
@@ -7589,30 +8029,6 @@ export const Settings = () => {
         }
       }
     }, "Apply Paths / Restart API"),
-    React.createElement(LunaTextSetting, {
-      title: "Amazon Music Eclipse Manifest URL",
-      desc: "Eclipse add-on manifest URL for multi-source Amazon Music resolution.",
-      value: addonUrl,
-      onChange: (e) => setAddonUrl(e.target.value)
-    }),
-    React.createElement(LunaButtonSetting, {
-      title: "Add / Update Eclipse Manifest",
-      desc: "Registers manifest with local RealMAX resolver.",
-      onClick: async () => {
-        if (!addonUrl.trim()) return;
-        try {
-          await fetch(`${API_BASE}/config`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ eclipse_addons: [addonUrl.trim()] })
-          });
-          alert("Saved Eclipse Manifest!");
-        } catch (err) {
-          alert("Failed to save manifest: " + err.message);
-        }
-      }
-    }, "Save Eclipse Manifest"),
-    
     React.createElement(LunaTextSetting, {
       title: "RealMAX Download Folder",
       desc: "Directory where downloaded tracks, albums, and lyrics are saved.",
