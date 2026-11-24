@@ -1,9 +1,9 @@
 {
   "name": "Omniphony EX Audio Engine",
-  "description": "RealMAX playback for TIDAL and Eclipse Amazon Music with AC-4 IMS, E-AC-3 JOC routing, FLAC quality selection, and native transport controls.",
+  "description": "RealMAX playback for TIDAL and enabled Eclipse account add-ons with AC-4 IMS, E-AC-3 JOC routing, FLAC quality selection, and native transport controls.",
   "type": "module",
   "author": "Pickymarker",
-  "version": "2.1.74",
+  "version": "2.1.75",
   "plugins": [
     "omniphony.mjs"
   ]

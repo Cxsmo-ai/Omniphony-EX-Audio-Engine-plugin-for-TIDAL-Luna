@@ -1,9 +1,9 @@
 {
   "name": "Omniphony EX Audio Engine",
-  "description": "OmniFusion TIDAL playback with verified Omniphony JOC routing and codec telemetry.",
+  "description": "RealMAX TIDAL and enabled Eclipse add-on playback with AC-4 IMS, E-AC-3 JOC routing, and native transport controls.",
   "author": "Pickymarker",
   "dependencies": {},
-  "version": "2.1.74",
-  "main": "omniphony.mjs?version=2.1.74&service=2.1.44",
-  "hash": "55FFA5359EBD0FCB381051DE7CD1E62963756607907D5096D1F0713249AF50B4"
+  "version": "2.1.75",
+  "main": "omniphony.mjs?version=2.1.75&service=2.1.45",
+  "hash": "777F4981F2346117AF1F57E2A832305A96BBBF581D965B3FA93AF2472C04711F"
 }

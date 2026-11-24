@@ -25,6 +25,8 @@ const supervisorCode = supervisorCodeTemplate?.replace(
   () => nativeAuthModuleCode,
 );
 assert.ok(supervisorCode, "the native service supervisor is embedded in the plugin entrypoint");
+assert.match(supervisorCode, /catch \(promotionError\)[\s\S]*?fs\.renameSync\(backup, bundledRuntimeRoot\)[\s\S]*?throw promotionError/,
+  "a failed runtime promotion restores the previous bundle before reporting failure");
 assert.doesNotMatch(supervisorCode, /new Function\s*\(/,
   "the supervisor contains no runtime code generation forbidden by TidaLuna's secure loader");
 assert.match(supervisorCode, /async startEclipseLogin\(serviceBase, requiredVersion, runtimeConfig = \{\}\)[\s\S]*?module\.exports\.ensureService\(requiredVersion, runtimeConfig\)/,

@@ -253,6 +253,130 @@ class PlaybackTransportTests(unittest.TestCase):
             ["set_property", "demuxer-lavf-format", "dash"],
         ])
 
+    def test_implicit_dash_selects_lavf_for_supported_dash_formats(self):
+        for fmt in ("EAC3_JOC", "HI_RES_LOSSLESS", "LOSSLESS"):
+            with self.subTest(fmt=fmt):
+                calls = []
+
+                def command(args):
+                    calls.append(args)
+                    return {"error": "success"}
+
+                result = service.prepare_mpv_demuxer_format(fmt, command)
+
+                self.assertEqual(result, "dash")
+                self.assertEqual(calls, [
+                    ["set_property", "options/demuxer", "lavf"],
+                    ["set_property", "demuxer-lavf-format", "dash"],
+                ])
+
+    def test_dash_proxy_selection_preserves_mp4_direct_and_ac4_routes(self):
+        dash_manifest = {
+            "manifestXml": "<MPD></MPD>",
+            "segmentUrls": ["https://cdn.example/init", "https://cdn.example/1"],
+        }
+        for fmt in ("EAC3_JOC", "HI_RES_LOSSLESS", "LOSSLESS"):
+            with self.subTest(fmt=fmt):
+                self.assertTrue(service.stream_requires_dash_proxy(
+                    fmt, {**dash_manifest, "transport": "DASH"}
+                ))
+                self.assertTrue(service.stream_requires_dash_proxy(fmt, dash_manifest))
+                dash_calls = []
+
+                def dash_command(args):
+                    dash_calls.append(args)
+                    return {"error": "success"}
+
+                self.assertEqual(service.prepare_mpv_demuxer_format(fmt, dash_command), "dash")
+                self.assertEqual(dash_calls, [
+                    ["set_property", "options/demuxer", "lavf"],
+                    ["set_property", "demuxer-lavf-format", "dash"],
+                ])
+
+                self.assertFalse(service.stream_requires_dash_proxy(
+                    fmt, {"transport": "MP4", "uri": "https://cdn.example/audio"}
+                ))
+                mp4_calls = []
+
+                def mp4_command(args):
+                    mp4_calls.append(args)
+                    return {"error": "success"}
+
+                self.assertEqual(service.prepare_mpv_demuxer_format(fmt, mp4_command, "MP4"), "mov")
+                self.assertEqual(mp4_calls, [
+                    ["set_property", "options/demuxer", "lavf"],
+                    ["set_property", "demuxer-lavf-format", "mov"],
+                ])
+
+                self.assertFalse(service.stream_requires_dash_proxy(
+                    fmt, {"transport": "DIRECT", "uri": "https://cdn.example/audio.flac"}
+                ))
+
+        self.assertFalse(service.stream_requires_dash_proxy(
+            "AC4_IMS", {**dash_manifest, "transport": "DASH"}
+        ))
+
+    def test_tidal_hires_dash_resolution_declares_dash_transport(self):
+        import tidalapi
+
+        class Manifest:
+            is_encrypted = False
+
+            @staticmethod
+            def get_codecs():
+                return "FLAC"
+
+            @staticmethod
+            def get_urls():
+                return [
+                    "https://cdn.example/0.mp4",
+                    "https://cdn.example/1.mp4",
+                ]
+
+        class Stream:
+            audio_quality = tidalapi.Quality.hi_res_lossless
+            is_mpd = True
+
+            @staticmethod
+            def get_stream_manifest():
+                return Manifest()
+
+            @staticmethod
+            def get_manifest_data():
+                return "<MPD></MPD>"
+
+        class Track:
+            @staticmethod
+            def get_stream():
+                return Stream()
+
+        class Session:
+            audio_quality = tidalapi.Quality.high_lossless
+            request_session = object()
+
+            @staticmethod
+            def track(_track_id):
+                return Track()
+
+        dash_metadata = {
+            "sourceCodec": "flac",
+            "sourceManifestFormat": "FLAC_HIRES",
+            "sourceBitrate": 1_500_000,
+            "sourceBitrateBasis": "MPD representation bandwidth",
+            "sourceSampleRate": 96_000,
+            "sourceChannels": 2,
+            "sourceBitDepth": 24,
+        }
+        with patch.object(service, "get_python_tidal_session", return_value=Session()), \
+                patch.object(service, "dash_manifest_contains_content_protection", return_value=False), \
+                patch.object(service, "get_tidal_dash_audio_metadata", return_value=dash_metadata), \
+                patch.object(service, "is_verified_python_tidal_hires", return_value=True):
+            result = service.resolve_hi_res_or_lossless(12345, "HI_RES_LOSSLESS")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["transport"], "DASH")
+        self.assertEqual(result["segmentUrls"], Manifest.get_urls())
+
     def test_direct_track_resets_mp4_demuxer_override(self):
         calls = []
 

@@ -264,7 +264,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.44"
+SERVICE_VERSION = "2.1.45"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 SHUTDOWN_TOKEN = os.environ.get("OMNIFUSION_SHUTDOWN_TOKEN", "")
 if not re.fullmatch(r"[a-f0-9]{64}", SHUTDOWN_TOKEN):
@@ -742,8 +742,14 @@ def prepare_mpv_demuxer_format(fmt: str, command, transport: str | None = None) 
             is_dash = False
         else:
             raise RuntimeError(f"Unsupported stream transport for {fmt}: {transport!r}")
-    if demuxer_format != "mov":
-        demuxer_format = "dash" if is_dash else ""
+    if is_dash:
+        # Explicit and inferred DASH routes both require libavformat before
+        # the DASH container override can take effect. Leaving the inferred
+        # route on `auto` fails for extensionless loopback MPD URLs.
+        demuxer = "lavf"
+        demuxer_format = "dash"
+    elif demuxer_format != "mov":
+        demuxer_format = ""
     result = command(["set_property", "options/demuxer", demuxer])
     if not mpv_command_succeeded(result):
         raise RuntimeError(
@@ -756,6 +762,23 @@ def prepare_mpv_demuxer_format(fmt: str, command, transport: str | None = None) 
             f"{fmt}: {result.get('error')}"
         )
     return demuxer_format
+
+
+def stream_requires_dash_proxy(fmt: str, stream_info: dict) -> bool:
+    """Select the DASH proxy only for DASH transports, never MP4/direct media."""
+    if fmt not in {"EAC3_JOC", "HI_RES_LOSSLESS", "LOSSLESS"}:
+        return False
+    transport = stream_info.get("transport")
+    if isinstance(transport, str) and transport.strip():
+        normalized_transport = transport.strip().upper().replace("-", "_")
+        return normalized_transport in {"DASH", "MPEG_DASH", "MPD"}
+    segment_urls = stream_info.get("segmentUrls")
+    return bool(
+        isinstance(stream_info.get("manifestXml"), str)
+        and stream_info["manifestXml"].strip()
+        and isinstance(segment_urls, (list, tuple))
+        and len(segment_urls) >= 2
+    )
 
 
 def prepare_mpv_raw_audio(sample_rate: int, channels: int, command) -> None:
@@ -4172,6 +4195,7 @@ def resolve_hi_res_or_lossless(track_id: int, quality="HI_RES_LOSSLESS") -> dict
         return {
             "format": quality, "codec": "flac", "label": label,
             "uri": segment_urls[0],
+            "transport": "DASH",
             "sourceCodec": codec,
             "sourceManifestFormat": dash.get("sourceManifestFormat"),
             "sourceBitrate": dash.get("sourceBitrate"),
@@ -5818,6 +5842,7 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
             normalized_addon_id = str(manifest.get("id") or "").strip()[:256] if isinstance(manifest, dict) else ""
             if not normalized_addon_name and isinstance(manifest, dict):
                 normalized_addon_name = str(manifest.get("name") or "").strip()[:256]
+        is_gravity_addon = normalized_addon_id.lower() == "app.eclipsemusic.gravity"
         is_amazon = (
             normalized_addon_id.lower() == "com.yourname.amazonmusic"
             or "amazon" in normalized_addon_name.lower()
@@ -5842,6 +5867,9 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
                     with _eclipse_authenticated_urlopen(req, timeout=timeout) as resp:
                         return json.loads(resp.read().decode("utf-8"))
                 except urllib.error.HTTPError as exc:
+                    if exc.code == 415 and is_gravity_addon:
+                        print("[-] Eclipse/Gravity requires compatible protected playback (HTTP 415)")
+                        return None
                     if exc.code in (401, 403) and attempt == 0:
                         refreshed = _get_eclipse_addon_access_token(normalized_addon_id, force_refresh=True) if normalized_addon_id else None
                         if refreshed:
@@ -5925,7 +5953,7 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
             return None
 
         quality_map = {
-            "EAC3_JOC": "Atmos_EC-3",
+            "EAC3_JOC": "Atmos" if is_gravity_addon else "Atmos_EC-3",
             "HI_RES_LOSSLESS": "Max",
             "LOSSLESS": "Max",
         }
@@ -5956,6 +5984,13 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
         if not isinstance(s_data, dict):
             return None
 
+        if is_gravity_addon and (
+            s_data.get("encrypted") is True
+            or bool(s_data.get("drm"))
+            or any(s_data.get(key) for key in ("keySystem", "licenseUrl", "licenseURL", "drmSystem"))
+        ):
+            return None
+
         # If LOSSLESS was explicitly requested and Max returned >48kHz/24-bit, request 16-bit/44.1kHz Lossless specifically
         if requested_fmt == "LOSSLESS":
             sr_check = int(s_data.get("sampleRate") or 44100)
@@ -5966,14 +6001,35 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
                 if isinstance(lossless_data, dict):
                     s_data = lossless_data
 
+        if is_gravity_addon and (
+            s_data.get("encrypted") is True
+            or bool(s_data.get("drm"))
+            or any(s_data.get(key) for key in ("keySystem", "licenseUrl", "licenseURL", "drmSystem"))
+        ):
+            return None
+
         streams = s_data.get("streams") if isinstance(s_data.get("streams"), list) else [s_data]
         for s in streams:
             if not isinstance(s, dict) or not s.get("url"):
                 continue
+            if is_gravity_addon and (
+                s.get("encrypted") is True
+                or bool(s.get("drm"))
+                or any(s.get(key) for key in ("keySystem", "licenseUrl", "licenseURL", "drmSystem"))
+            ):
+                continue
             raw_codec = str(s.get("codec") or s.get("format") or "flac").strip().lower()
+            codec_token = str(s.get("codec") or "").strip().lower()
             quality_label = str(s.get("quality") or s.get("format") or "").strip()
+            if is_gravity_addon:
+                if codec_token not in {"eac3_joc", "flac"}:
+                    continue
+                if requested_fmt == "EAC3_JOC" and codec_token != "eac3_joc":
+                    continue
+                if requested_fmt in {"HI_RES_LOSSLESS", "LOSSLESS"} and codec_token != "flac":
+                    continue
             sample_rate = int(s.get("sampleRate") or 48000 if "ec-3" in raw_codec or "eac3" in raw_codec else int(s.get("sampleRate") or 44100))
-            is_atmos = (
+            is_atmos = codec_token == "eac3_joc" if is_gravity_addon else (
                 "ec-3" in raw_codec
                 or "eac3" in raw_codec
                 or "joc" in raw_codec
@@ -8074,7 +8130,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             candidate_proxy = None
             route_status = None
 
-            if (fmt in {"HI_RES_LOSSLESS", "LOSSLESS"} and stream_info.get("transport") != "DIRECT") or (fmt == "EAC3_JOC" and stream_info.get("transport") == "DASH"):
+            if stream_requires_dash_proxy(fmt, stream_info):
                 try:
                     candidate_proxy = TidalDashProxy(
                         stream_info.get("manifestXml"),
