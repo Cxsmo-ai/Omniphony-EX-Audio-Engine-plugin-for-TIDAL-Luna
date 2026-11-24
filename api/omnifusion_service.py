@@ -106,7 +106,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.41"
+SERVICE_VERSION = "2.1.42"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 SHUTDOWN_TOKEN = os.environ.get("OMNIFUSION_SHUTDOWN_TOKEN", "")
 if not re.fullmatch(r"[a-f0-9]{64}", SHUTDOWN_TOKEN):
@@ -4357,9 +4357,14 @@ _ECLIPSE_AUTH_CACHE: dict[str, object] = {
 _ECLIPSE_AUTH_GENERATION = 0
 ECLIPSE_SESSION_FILE = CONFIG_DIR / "eclipse-session.json"
 ECLIPSE_AUTH_VERIFY_URL = "https://api.eclipsemusic.app/api/auth/mobile/verify"
+ECLIPSE_ACCOUNT_LINKING_SUPPORTED = False
 _ECLIPSE_ACCOUNT_STATUS: dict[str, object] = {"user": None, "checked_at": 0.0, "session_mtime": None}
 _ECLIPSE_LAST_LOGIN_ERROR: str | None = None
 _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID: str | None = None
+_ECLIPSE_ACTIVE_LOGIN_ATTEMPT_STARTED_AT = 0.0
+_ECLIPSE_FINALIZED_LOGIN_ATTEMPTS: dict[str, float] = {}
+ECLIPSE_LOGIN_ATTEMPT_TTL_SECONDS = 900.0
+ECLIPSE_FINALIZED_ATTEMPT_TTL_SECONDS = 900.0
 _ECLIPSE_ACCOUNT_SESSION_GENERATION = 0
 
 
@@ -4372,11 +4377,19 @@ class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
             parsed = urllib.parse.urlsplit(url)
             if parsed.scheme.lower() != "https" or not parsed.hostname:
                 return None
-            return "https", parsed.hostname.rstrip(".").lower(), parsed.port or 443
+            port = parsed.port
+            if port not in (None, 443):
+                return None
+            return "https", parsed.hostname.lower(), 443
         except ValueError:
             return None
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            _validate_account_manifest_url(req.full_url)
+            _validate_account_manifest_url(newurl)
+        except (TypeError, ValueError):
+            return None
         if self._origin(req.full_url) != self._origin(newurl):
             return None
         return super().redirect_request(req, fp, code, msg, headers, newurl)
@@ -4384,7 +4397,15 @@ class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 def _eclipse_authenticated_urlopen(request, timeout: float):
     """Open an authenticated HTTPS request without following cross-origin redirects."""
+    _validate_account_manifest_url(request.full_url)
     return urllib.request.build_opener(_SameOriginRedirectHandler()).open(request, timeout=timeout)
+
+
+def _eclipse_session_file_mtime() -> float | None:
+    try:
+        return ECLIPSE_SESSION_FILE.stat().st_mtime
+    except OSError:
+        return None
 
 
 def _normalize_verified_eclipse_user(raw_user: object) -> dict | None:
@@ -4400,13 +4421,24 @@ def _normalize_verified_eclipse_user(raw_user: object) -> dict | None:
         if not value or len(value) > 512 or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
             continue
         user[key] = value
+    if re.fullmatch(r"omni_test_user_[a-z0-9_-]+@test\.com", user.get("email", ""), re.IGNORECASE):
+        return None
     if not any(user.get(key) for key in ("id", "userId", "email")):
         return None
     return user
 
 
+def _is_synthetic_eclipse_user(raw_user: object) -> bool:
+    if not isinstance(raw_user, dict):
+        return False
+    email = raw_user.get("email")
+    return isinstance(email, str) and re.fullmatch(
+        r"omni_test_user_[a-z0-9_-]+@test\.com", email.strip(), re.IGNORECASE
+    ) is not None
+
+
 def _validate_account_manifest_url(value: str) -> str:
-    """Validate a manifest URL received from the authenticated Eclipse account API."""
+    """Validate an HTTPS URL used for an Eclipse account manifest or add-on request."""
     if not isinstance(value, str):
         raise ValueError("manifest URL must be a string")
     candidate = value.strip()
@@ -4419,7 +4451,9 @@ def _validate_account_manifest_url(value: str) -> str:
     except ValueError as exc:
         raise ValueError("manifest URL is malformed") from exc
     if parsed.scheme.lower() != "https" or not hostname:
-        raise ValueError("account add-on manifests must use HTTPS")
+        raise ValueError("Eclipse add-on URLs must use HTTPS")
+    if parsed.port not in (None, 443):
+        raise ValueError("Eclipse add-on URLs must use the standard HTTPS port")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("manifest URL must not contain embedded credentials")
     if parsed.fragment:
@@ -4529,22 +4563,34 @@ def _verify_eclipse_account_token(token: str) -> tuple[bool, dict | None, str | 
         return False, None, "unauthorized" if exc.code == 401 else "verification_failed"
     except (OSError, ValueError, json.JSONDecodeError):
         return False, None, "verification_unavailable"
-    if not isinstance(payload, dict) or payload.get("success") is not True:
-        return False, None, "account_not_verified"
-    user = _normalize_verified_eclipse_user(payload.get("user"))
+    if not isinstance(payload, dict):
+        return False, None, "verification_failed"
+    if payload.get("success") is False:
+        return False, None, "unauthorized"
+    if payload.get("success") is not True:
+        return False, None, "verification_failed"
+    raw_user = payload.get("user")
+    if _is_synthetic_eclipse_user(raw_user):
+        return False, None, "synthetic_account_rejected"
+    user = _normalize_verified_eclipse_user(raw_user)
     if user is None:
-        return False, None, "account_not_verified"
+        return False, None, "invalid_identity"
     replacement = payload.get("token") if isinstance(payload.get("token"), str) else None
     return True, user, replacement
 
 
 def _complete_eclipse_login(token: str, attempt_id: str | None = None) -> tuple[bool, dict | None, str | None]:
+    global _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID, _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_STARTED_AT
+    global _ECLIPSE_LAST_LOGIN_ERROR, _ECLIPSE_ACCOUNT_SESSION_GENERATION
+    if not ECLIPSE_ACCOUNT_LINKING_SUPPORTED:
+        return False, None, "unsupported_account_integration"
     if not token or len(token) > 8192 or any(ord(char) < 0x20 for char in token):
         return False, None, "invalid_token"
     with _ECLIPSE_AUTH_LOCK:
-        if (attempt_id is not None
-                and _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID != attempt_id):
-            return False, None, "account_changed"
+        if attempt_id is not None:
+            if (_ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID != attempt_id
+                    or time.time() - _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_STARTED_AT > ECLIPSE_LOGIN_ATTEMPT_TTL_SECONDS):
+                return False, None, "account_changed"
         auth_generation = _ECLIPSE_AUTH_GENERATION
     valid, user, replacement = _verify_eclipse_account_token(token)
     if not valid:
@@ -4553,16 +4599,25 @@ def _complete_eclipse_login(token: str, attempt_id: str | None = None) -> tuple[
     with _ECLIPSE_AUTH_LOCK:
         if _ECLIPSE_AUTH_GENERATION != auth_generation:
             return False, None, "account_changed"
-        if (attempt_id is not None
-                and _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID != attempt_id):
-            return False, None, "account_changed"
+        if attempt_id is not None:
+            if (_ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID != attempt_id
+                    or time.time() - _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_STARTED_AT > ECLIPSE_LOGIN_ATTEMPT_TTL_SECONDS):
+                return False, None, "account_changed"
         try:
             _write_eclipse_session(saved_token, user)
         except (OSError, ValueError, TypeError):
             return False, None, "secure_storage_unavailable"
         _invalidate_eclipse_account_cache(clear_jwt=True)
         _ECLIPSE_AUTH_CACHE["jwt"] = saved_token
-        _ECLIPSE_ACCOUNT_STATUS.update({"user": user, "checked_at": time.time(), "session_mtime": ECLIPSE_SESSION_FILE.stat().st_mtime})
+        _ECLIPSE_ACCOUNT_STATUS.update({
+            "user": user,
+            "checked_at": time.time(),
+            "session_mtime": _eclipse_session_file_mtime(),
+        })
+        if attempt_id is not None:
+            _finalize_eclipse_login_attempt_locked(attempt_id)
+            _ECLIPSE_LAST_LOGIN_ERROR = None
+        _ECLIPSE_ACCOUNT_SESSION_GENERATION += 1
     return True, user, None
 
 
@@ -4596,6 +4651,8 @@ def _invalidate_eclipse_account_cache(clear_jwt: bool = False) -> None:
 
 def _get_eclipse_jwt(force_refresh: bool = False) -> str | None:
     """Load the saved Eclipse account token; force_refresh reloads local storage only."""
+    if not ECLIPSE_ACCOUNT_LINKING_SUPPORTED:
+        return None
     with _ECLIPSE_AUTH_LOCK:
         if not force_refresh and isinstance(_ECLIPSE_AUTH_CACHE.get("jwt"), str) and _ECLIPSE_AUTH_CACHE["jwt"]:
             return str(_ECLIPSE_AUTH_CACHE["jwt"])
@@ -4604,7 +4661,7 @@ def _get_eclipse_jwt(force_refresh: bool = False) -> str | None:
         if isinstance(token, str) and token.strip():
             token = token.strip()
             if token != _ECLIPSE_AUTH_CACHE.get("jwt"):
-                _invalidate_eclipse_account_cache()
+                _invalidate_eclipse_account_cache(clear_jwt=True)
             _ECLIPSE_AUTH_CACHE["jwt"] = token
             return token
 
@@ -4615,17 +4672,23 @@ def _get_eclipse_jwt(force_refresh: bool = False) -> str | None:
 
 def eclipse_account_status(force_refresh: bool = False) -> dict:
     """Verify the local Eclipse session and return only non-secret account details."""
+    if not ECLIPSE_ACCOUNT_LINKING_SUPPORTED:
+        return {
+            "connected": False,
+            "available": False,
+            "user": None,
+            "reason": "unsupported_account_integration",
+        }
     token = _get_eclipse_jwt(force_refresh=force_refresh)
     if not token:
         return {"connected": False, "user": None}
-    try:
-        session_mtime = ECLIPSE_SESSION_FILE.stat().st_mtime
-    except OSError:
-        session_mtime = None
+    session_mtime = _eclipse_session_file_mtime()
     with _ECLIPSE_AUTH_LOCK:
         cached_user = _ECLIPSE_ACCOUNT_STATUS.get("user")
         checked_at = float(_ECLIPSE_ACCOUNT_STATUS.get("checked_at") or 0)
         if (not force_refresh and isinstance(cached_user, dict)
+                and _normalize_verified_eclipse_user(cached_user) is not None
+                and session_mtime is not None
                 and _ECLIPSE_ACCOUNT_STATUS.get("session_mtime") == session_mtime
                 and time.time() - checked_at < 60):
             return {"connected": True, "user": cached_user}
@@ -4636,13 +4699,18 @@ def eclipse_account_status(force_refresh: bool = False) -> dict:
                 or _ECLIPSE_AUTH_CACHE.get("jwt") != token):
             return {"connected": False, "user": None, "reason": "account_changed"}
         if not valid:
-            if replacement == "unauthorized":
+            permanent_failure = replacement in {"unauthorized", "synthetic_account_rejected", "invalid_token"}
+            cleanup_failed = False
+            if permanent_failure:
                 try:
                     ECLIPSE_SESSION_FILE.unlink(missing_ok=True)
                 except OSError:
-                    pass
-                _invalidate_eclipse_account_cache(clear_jwt=True)
-            return {"connected": False, "user": None, "reason": replacement}
+                    cleanup_failed = True
+            _invalidate_eclipse_account_cache(clear_jwt=permanent_failure)
+            if not permanent_failure:
+                _ECLIPSE_ACCOUNT_STATUS.update({"user": None, "checked_at": 0.0, "session_mtime": None})
+            reason = "session_cleanup_failed" if cleanup_failed else replacement
+            return {"connected": False, "user": None, "reason": reason}
         saved_token = replacement.strip() if isinstance(replacement, str) and replacement.strip() else token
         if saved_token != token or not isinstance(_ECLIPSE_ACCOUNT_STATUS.get("user"), dict):
             try:
@@ -4655,15 +4723,42 @@ def eclipse_account_status(force_refresh: bool = False) -> dict:
         _ECLIPSE_ACCOUNT_STATUS.update({
             "user": user,
             "checked_at": time.time(),
-            "session_mtime": ECLIPSE_SESSION_FILE.stat().st_mtime,
+            "session_mtime": _eclipse_session_file_mtime(),
         })
     return {"connected": True, "user": user}
+
+
+def _verified_eclipse_session_snapshot(force_refresh: bool = False) -> tuple[str, dict, int] | None:
+    """Capture the credential, verified identity and generation for one account operation."""
+    status = eclipse_account_status(force_refresh=force_refresh)
+    if status.get("connected") is not True:
+        return None
+    with _ECLIPSE_AUTH_LOCK:
+        token = _ECLIPSE_AUTH_CACHE.get("jwt")
+        user = _normalize_verified_eclipse_user(_ECLIPSE_ACCOUNT_STATUS.get("user"))
+        if (not isinstance(token, str) or not token or user is None
+                or user != status.get("user")):
+            return None
+        return token, user, _ECLIPSE_AUTH_GENERATION
+
+
+def _eclipse_identity_key(user: dict) -> tuple[str, str] | None:
+    normalized = _normalize_verified_eclipse_user(user)
+    if normalized is None:
+        return None
+    for key in ("id", "userId"):
+        value = normalized.get(key)
+        if value:
+            return key, value.casefold()
+    email = normalized.get("email")
+    return ("email", email.casefold()) if email else None
 
 
 def public_eclipse_auth_status() -> dict:
     """Expose account state plus a safe, transient sign-in failure code."""
     status = dict(eclipse_account_status())
     with _ECLIPSE_AUTH_LOCK:
+        _expire_eclipse_login_attempt_locked(time.time())
         last_login_error = _ECLIPSE_LAST_LOGIN_ERROR
         status["sessionGeneration"] = _ECLIPSE_ACCOUNT_SESSION_GENERATION
         status["loginAttemptActive"] = _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID is not None
@@ -4675,20 +4770,54 @@ def public_eclipse_auth_status() -> dict:
 def record_eclipse_login_flow_status(reason: object, attempt_id: object) -> str:
     """Record a correlated, allowlisted status from the native OAuth handoff."""
     global _ECLIPSE_LAST_LOGIN_ERROR, _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID
-    if not isinstance(reason, str) or reason not in {"started", "callback_missing", "oauth_denied", "oauth_cancelled"}:
+    global _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_STARTED_AT
+    if not isinstance(reason, str) or reason not in {"started", "callback_missing", "invalid_token", "oauth_denied", "oauth_cancelled"}:
         return "invalid"
     if not isinstance(attempt_id, str) or not re.fullmatch(r"[a-f0-9]{32}", attempt_id):
         return "invalid"
     with _ECLIPSE_AUTH_LOCK:
+        now = time.time()
+        _expire_eclipse_login_attempt_locked(now)
         if reason == "started":
+            finalized_until = _ECLIPSE_FINALIZED_LOGIN_ATTEMPTS.get(attempt_id, 0.0)
+            if finalized_until > now:
+                return "stale"
+            if _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID == attempt_id:
+                return "recorded"
+            if _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID is not None:
+                return "busy"
             _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID = attempt_id
+            _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_STARTED_AT = now
             _ECLIPSE_LAST_LOGIN_ERROR = None
             return "recorded"
         if _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID != attempt_id:
             return "stale"
         _ECLIPSE_LAST_LOGIN_ERROR = reason
-        _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID = None
+        _finalize_eclipse_login_attempt_locked(attempt_id)
         return "recorded"
+
+
+def _expire_eclipse_login_attempt_locked(now: float) -> None:
+    """Expire stale attempts and trim finalized IDs while holding the auth lock."""
+    global _ECLIPSE_LAST_LOGIN_ERROR
+    if (_ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID is not None
+            and now - _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_STARTED_AT > ECLIPSE_LOGIN_ATTEMPT_TTL_SECONDS):
+        expired = _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID
+        _finalize_eclipse_login_attempt_locked(expired, now=now)
+        _ECLIPSE_LAST_LOGIN_ERROR = "oauth_cancelled"
+    for attempt, expires_at in tuple(_ECLIPSE_FINALIZED_LOGIN_ATTEMPTS.items()):
+        if expires_at <= now:
+            _ECLIPSE_FINALIZED_LOGIN_ATTEMPTS.pop(attempt, None)
+
+
+def _finalize_eclipse_login_attempt_locked(attempt_id: str, now: float | None = None) -> None:
+    """Mark one attempt terminal so delayed duplicate start/callback messages stay stale."""
+    global _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID, _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_STARTED_AT
+    finalized_at = time.time() if now is None else now
+    _ECLIPSE_FINALIZED_LOGIN_ATTEMPTS[attempt_id] = finalized_at + ECLIPSE_FINALIZED_ATTEMPT_TTL_SECONDS
+    if _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID == attempt_id:
+        _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID = None
+        _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_STARTED_AT = 0.0
 
 
 ECLIPSE_ACCOUNT_ADDONS_URL = "https://eclipsemusic.app/music/addons"
@@ -4697,14 +4826,31 @@ ECLIPSE_ACCOUNT_ADDONS_TTL_SECONDS = 45.0
 
 def eclipse_account_addons(force_refresh: bool = False) -> dict:
     """Read the signed-in account's Eclipse Connections list without returning its token."""
-    token = _get_eclipse_jwt(force_refresh=force_refresh)
-    if not token:
-        return {"connected": False, "addons": [], "order": []}
+    if not ECLIPSE_ACCOUNT_LINKING_SUPPORTED:
+        return {
+            "connected": False,
+            "available": False,
+            "addons": [],
+            "order": [],
+            "reason": "unsupported_account_integration",
+        }
+    session = _verified_eclipse_session_snapshot(force_refresh=force_refresh)
+    if session is None:
+        status = eclipse_account_status()
+        reason = status.get("reason") if status.get("connected") is not True else "account_changed"
+        return {
+            "connected": False,
+            "available": False,
+            "addons": [],
+            "order": [],
+            **({"reason": reason} if isinstance(reason, str) else {}),
+        }
+    token, _user, auth_generation = session
     token_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
     with _ECLIPSE_AUTH_LOCK:
-        if _ECLIPSE_AUTH_CACHE.get("jwt") != token:
+        if (_ECLIPSE_AUTH_CACHE.get("jwt") != token
+                or _ECLIPSE_AUTH_GENERATION != auth_generation):
             return {"connected": False, "addons": [], "order": [], "reason": "account_changed"}
-        auth_generation = _ECLIPSE_AUTH_GENERATION
     now = time.time()
     with _ECLIPSE_AUTH_LOCK:
         if (_ECLIPSE_AUTH_GENERATION != auth_generation
@@ -4890,6 +5036,7 @@ def realmax_provider_configuration(settings: dict | None = None, force_account_r
         "customized": isinstance(saved_order, list),
         "accountConnected": account.get("connected") is True,
         "accountAvailable": account.get("available") is True,
+        "accountReason": account.get("reason"),
         "_internal_records": {row["key"]: row for row in records},
     }
 
@@ -4912,8 +5059,18 @@ def _ordered_resolution_providers(settings: dict | None = None) -> tuple[list[st
 
 def _get_eclipse_addon_access_token(addon_id: str = "com.yourname.amazonmusic", force_refresh: bool = False) -> str | None:
     """Mint a short-lived X-Eclipse-Access token for an Eclipse addon."""
+    session = _verified_eclipse_session_snapshot(force_refresh=force_refresh)
+    if session is None:
+        return None
+    jwt_token, user, auth_generation = session
+    identity_key = _eclipse_identity_key(user)
+    if identity_key is None:
+        return None
     now = time.time()
     with _ECLIPSE_AUTH_LOCK:
+        if (_ECLIPSE_AUTH_CACHE.get("jwt") != jwt_token
+                or _ECLIPSE_AUTH_GENERATION != auth_generation):
+            return None
         addon_tokens = _ECLIPSE_AUTH_CACHE.setdefault("addon_tokens", {})
         if not force_refresh and isinstance(addon_tokens, dict):
             entry = addon_tokens.get(addon_id)
@@ -4923,39 +5080,66 @@ def _get_eclipse_addon_access_token(addon_id: str = "com.yourname.amazonmusic", 
                 if isinstance(token, str) and token and now < expires_at - 20:
                     return token
 
-        for attempt in range(2):
-            jwt_token = _get_eclipse_jwt(force_refresh=(attempt > 0 or force_refresh))
-            if not jwt_token:
+    for attempt in range(2):
+        if attempt > 0:
+            refreshed = _verified_eclipse_session_snapshot(force_refresh=True)
+            if refreshed is None:
                 return None
-            token_url = f"https://api.eclipsemusic.app/api/addon-access/token?addon={urllib.parse.quote(addon_id)}"
-            req = urllib.request.Request(
-                token_url,
-                data=b"",
-                headers={
-                    "Authorization": f"Bearer {jwt_token}",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                },
-            )
+            refreshed_token, refreshed_user, refreshed_generation = refreshed
+            if _eclipse_identity_key(refreshed_user) != identity_key:
+                return None
+            jwt_token = refreshed_token
+            auth_generation = refreshed_generation
+
+        token_url = f"https://api.eclipsemusic.app/api/addon-access/token?addon={urllib.parse.quote(addon_id)}"
+        req = urllib.request.Request(
+            token_url,
+            data=b"",
+            headers={
+                "Authorization": f"Bearer {jwt_token}",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            },
+        )
+        try:
+            with _eclipse_authenticated_urlopen(req, timeout=6) as resp:
+                raw_payload = resp.read(65537)
+            if len(raw_payload) > 65536:
+                return None
+            data = json.loads(raw_payload.decode("utf-8"))
+            addon_token = data.get("token") if isinstance(data, dict) else None
+            if (not isinstance(addon_token, str) or not addon_token
+                    or addon_token != addon_token.strip() or len(addon_token) > 8192
+                    or any(ord(char) < 0x20 or ord(char) == 0x7F for char in addon_token)):
+                return None
             try:
-                with _eclipse_authenticated_urlopen(req, timeout=6) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    addon_token = data.get("token")
-                    expires_in = float(data.get("expiresIn") or 300)
-                    if isinstance(addon_token, str) and addon_token.strip():
-                        addon_token = addon_token.strip()
-                        if isinstance(addon_tokens, dict):
-                            addon_tokens[addon_id] = {
-                                "token": addon_token,
-                                "expires_at": time.time() + expires_in,
-                            }
-                        return addon_token
-            except urllib.error.HTTPError as exc:
-                if exc.code in (401, 403) and attempt == 0:
-                    continue
-                break
-            except Exception:
-                break
-        return None
+                expires_in = float(data.get("expiresIn") or 300)
+            except (TypeError, ValueError, OverflowError):
+                expires_in = 300.0
+            if not math.isfinite(expires_in) or expires_in <= 0:
+                expires_in = 300.0
+            expires_in = min(expires_in, 3600.0)
+            with _ECLIPSE_AUTH_LOCK:
+                current_user = _normalize_verified_eclipse_user(_ECLIPSE_ACCOUNT_STATUS.get("user"))
+                if (_ECLIPSE_AUTH_CACHE.get("jwt") != jwt_token
+                        or _ECLIPSE_AUTH_GENERATION != auth_generation
+                        or _eclipse_identity_key(current_user or {}) != identity_key):
+                    return None
+                current_tokens = _ECLIPSE_AUTH_CACHE.setdefault("addon_tokens", {})
+                if isinstance(current_tokens, dict):
+                    current_tokens[addon_id] = {
+                        "token": addon_token,
+                        "expires_at": time.time() + expires_in,
+                    }
+            return addon_token
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403) and attempt == 0:
+                continue
+            return None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+        except Exception:
+            return None
+    return None
 
 
 def _is_tido_eclipse_addon(addon_manifest_url: str) -> bool:
@@ -4970,7 +5154,7 @@ def _eclipse_worker_base_url(addon_manifest_url: str) -> str:
     Eclipse tokenized addon URLs keep their path prefix on every resource
     request. Removing it turns a valid per-user URL into an unscoped request.
     """
-    u = (addon_manifest_url or "").strip()
+    u = _validate_account_manifest_url(addon_manifest_url)
     parsed = urllib.parse.urlsplit(u)
     if parsed.scheme and parsed.netloc:
         path = parsed.path
@@ -4987,7 +5171,12 @@ def _eclipse_worker_url(addon_manifest_url: str, resource_path: str, params: dic
     resource_params = list((params or {}).items())
     merged = manifest_query + resource_params
     query = urllib.parse.urlencode(merged, doseq=True)
-    return f"{base}/{resource_path.lstrip('/')}" + (f"?{query}" if query else "")
+    result = f"{base}/{resource_path.lstrip('/')}" + (f"?{query}" if query else "")
+    manifest_origin = _SameOriginRedirectHandler._origin(addon_manifest_url)
+    result_origin = _SameOriginRedirectHandler._origin(result)
+    if manifest_origin is None or result_origin != manifest_origin:
+        raise ValueError("Eclipse add-on resource URL left its manifest origin")
+    return result
 
 
 def _get_eclipse_manifest(addon_manifest_url: str, force_refresh: bool = False) -> dict | None:
@@ -5002,8 +5191,9 @@ def _get_eclipse_manifest(addon_manifest_url: str, force_refresh: bool = False) 
                 manifest = item.get("manifest")
                 return manifest if isinstance(manifest, dict) else None
     try:
+        manifest_url = _validate_account_manifest_url(manifest_url)
         req = urllib.request.Request(manifest_url, headers={"User-Agent": "OmniphonyEX/1.0 Eclipse addon client"})
-        with urllib.request.urlopen(req, timeout=6.0) as response:
+        with _eclipse_authenticated_urlopen(req, timeout=6.0) as response:
             manifest = json.loads(response.read().decode("utf-8"))
         if not isinstance(manifest, dict) or not isinstance(manifest.get("id"), str) or not manifest["id"].strip():
             return None
@@ -6924,7 +7114,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     if engine.proc and engine.proc.poll() is None and engine.pipe
                     else None
                 ),
-                "capabilities": ["prepared-playback-v1", "playback-clock-v1", "eclipse-auth-flow-status-v1"],
+                "capabilities": ["prepared-playback-v1", "playback-clock-v1"],
             })
 
         elif parsed.path == "/devices":
@@ -7385,6 +7575,11 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             return self.send_json({"error": f"invalid JSON request: {exc}"}, status=400)
 
         if parsed.path == "/eclipse-auth/complete":
+            if not ECLIPSE_ACCOUNT_LINKING_SUPPORTED:
+                return self.send_json({
+                    "connected": False,
+                    "error": "unsupported_account_integration",
+                }, status=501)
             token = body.get("token")
             attempt_id = body.get("attemptId")
             if not isinstance(token, str) or not token.strip():
@@ -7395,24 +7590,30 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 if _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID != attempt_id:
                     return self.send_json({"connected": False, "error": "stale_login_attempt"}, status=409)
             connected, user, error = _complete_eclipse_login(token.strip(), attempt_id)
-            with _ECLIPSE_AUTH_LOCK:
-                if _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID != attempt_id:
-                    return self.send_json({"connected": False, "error": "stale_login_attempt"}, status=409)
-                _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID = None
-                _ECLIPSE_LAST_LOGIN_ERROR = None if connected else error or "verification_failed"
-                if connected:
-                    _ECLIPSE_ACCOUNT_SESSION_GENERATION += 1
             if not connected:
-                status = 401 if error in {"unauthorized", "account_not_verified", "invalid_token"} else 502
+                with _ECLIPSE_AUTH_LOCK:
+                    if _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID != attempt_id:
+                        return self.send_json({"connected": False, "error": "stale_login_attempt"}, status=409)
+                    _ECLIPSE_LAST_LOGIN_ERROR = error or "verification_failed"
+                    _finalize_eclipse_login_attempt_locked(attempt_id)
+            if not connected:
+                status = 401 if error in {"unauthorized", "synthetic_account_rejected", "account_not_verified", "invalid_token"} else 502
                 return self.send_json({"connected": False, "error": error}, status=status)
             return self.send_json({"connected": True, "user": user})
 
         elif parsed.path == "/eclipse-auth/flow-status":
+            if not ECLIPSE_ACCOUNT_LINKING_SUPPORTED:
+                return self.send_json({
+                    "recorded": False,
+                    "error": "unsupported_account_integration",
+                }, status=501)
             reason = body.get("reason")
             attempt_id = body.get("attemptId")
             result = record_eclipse_login_flow_status(reason, attempt_id)
             if result == "invalid":
                 return self.send_json({"error": "unsupported login flow status"}, status=400)
+            if result == "busy":
+                return self.send_json({"error": "another Eclipse sign-in attempt is already active"}, status=409)
             if result == "stale":
                 return self.send_json({"error": "login attempt is no longer active"}, status=409)
             return self.send_json({"recorded": True})
@@ -7423,6 +7624,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     ECLIPSE_SESSION_FILE.unlink(missing_ok=True)
                 except OSError:
                     return self.send_json({"error": "could not remove the saved account session"}, status=500)
+                if _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID is not None:
+                    _finalize_eclipse_login_attempt_locked(_ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID)
                 _invalidate_eclipse_account_cache(clear_jwt=True)
                 _ECLIPSE_LAST_LOGIN_ERROR = None
                 _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID = None

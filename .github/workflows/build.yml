@@ -51,6 +51,14 @@ jobs:
       - name: Test GitHub release asset naming
         run: python -m unittest tools.test_prepare_release
 
+      - name: Run Eclipse account-auth regression tests
+        shell: pwsh
+        run: |
+          python -m pip install pytest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest -q tests/test_eclipse_auth_status.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Test runtime digest contracts
         run: python -m unittest discover -s tests -p "test_runtime_package_verifier.py"
 

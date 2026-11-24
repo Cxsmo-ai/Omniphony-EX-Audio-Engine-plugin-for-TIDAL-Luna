@@ -1,7 +1,7 @@
 {
   "name": "@cxsmo-ai/omniphony-ex",
   "description": "Omniphony EX Audio Engine for TidaLuna",
-  "version": "2.1.65",
+  "version": "2.1.66",
   "type": "module",
   "author": {
     "name": "Pickymarker",
@@ -13,7 +13,7 @@
     "url": "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna.git"
   },
   "scripts": {
-    "build": "rimraf ./dist && tsx esbuild.config.ts && node tools/sync-manifest-hash.mjs",
+    "build": "rimraf ./dist && node tools/build-runtime-archive.mjs --output dist/OmniphonyEX-API-win-x64.tar.gz && node tools/sync-runtime-bundle-hash.mjs --archive dist/OmniphonyEX-API-win-x64.tar.gz && tsx esbuild.config.ts && node tools/sync-manifest-hash.mjs",
     "watch:build": "rimraf ./dist && tsx esbuild.config.ts --watch",
     "serve": "python tools/serve_luna_dev.py --port 3000",
     "watch": "concurrently \"pnpm:watch:build\" \"pnpm:serve\""

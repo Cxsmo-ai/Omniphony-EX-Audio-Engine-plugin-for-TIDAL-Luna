@@ -14,6 +14,13 @@ import tidalapi
 
 
 class ServiceLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self._eclipse_account_linking_supported = service.ECLIPSE_ACCOUNT_LINKING_SUPPORTED
+        service.ECLIPSE_ACCOUNT_LINKING_SUPPORTED = True
+
+    def tearDown(self):
+        service.ECLIPSE_ACCOUNT_LINKING_SUPPORTED = self._eclipse_account_linking_supported
+
     def test_owner_resolution_falls_back_only_for_empty_environment_value(self):
         with patch.object(service, "_verified_tidal_parent_pid", return_value=4567) as resolve_parent:
             self.assertEqual(service._resolve_tidal_owner(""), (4567, "verified_parent_fallback"))
@@ -134,6 +141,7 @@ class ServiceLifecycleTests(unittest.TestCase):
         payload = handler.send_json.call_args.args[0]
         self.assertEqual(payload["tidalOwnerPid"], 4567)
         self.assertEqual(payload["tidalOwnerSource"], "verified_parent_fallback")
+        self.assertEqual(payload["capabilities"], ["prepared-playback-v1", "playback-clock-v1"])
         self.assertNotIn("shutdownToken", payload)
 
     def test_shutdown_requires_matching_secret_and_service_instance(self):
@@ -929,14 +937,16 @@ class ServiceLifecycleTests(unittest.TestCase):
             "order": ["supporter.music", "disabled.music", "bad.url"],
         }
         auth_cache = {"jwt": account_token, "addon_tokens": {}, "account_addons": {}}
+        account_status = {"user": {"id": "account-1", "email": "listener@example.test"}}
         opened = []
 
         def fake_urlopen(request, timeout=None):
             opened.append((request, timeout))
             return io.BytesIO(json.dumps(payload).encode("utf-8"))
 
-        with patch.object(service, "_get_eclipse_jwt", return_value=account_token), \
+        with patch.object(service, "eclipse_account_status", return_value={"connected": True, **account_status}), \
                 patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache), \
+                patch.object(service, "_ECLIPSE_ACCOUNT_STATUS", account_status), \
                 patch.object(service, "_eclipse_authenticated_urlopen", side_effect=fake_urlopen):
             result = service.eclipse_account_addons()
             cached = service.eclipse_account_addons()

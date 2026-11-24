@@ -639,6 +639,7 @@ vm.createContext(readinessSandbox);
 vm.runInContext(`
   ${extractFunction("hasVisibleLayout")}
   ${extractFunction("getPlaybackFooter")}
+  ${extractFunction("localRequestFailureSummary")}
   ${extractFunction("checkPlaybackReadiness")}
   ${extractFunction("reportPlaybackReadinessBlock")}
 `, readinessSandbox);
@@ -660,7 +661,7 @@ assert.equal(staleReadiness.ready, false, "stale service build fails the playbac
 assert.match(staleReadiness.reason, new RegExp(`${requiredServiceVersion.replaceAll(".", "\\.")}.*2\\.1\\.17`));
 readinessVersion = requiredServiceVersion;
 assert.equal((await readinessSandbox.checkPlaybackReadiness()).ready, true,
-  "the exact required service and WASAPI endpoint pass readiness");
+  "prepared playback capability passes with no Eclipse-auth capability advertised");
 readinessBadge.getBoundingClientRect = () => ({ left: 40, top: 900, right: 40, bottom: 900, width: 0, height: 0 });
 const hiddenBadgeReadiness = await readinessSandbox.checkPlaybackReadiness();
 assert.equal(hiddenBadgeReadiness.ready, false,
@@ -751,6 +752,7 @@ vm.runInContext(`
   function reportPlaybackReadinessBlock() {}
   function getPlaybackFooter() { return globalThis.readinessFooter; }
   ${extractFunction("hasVisibleLayout")}
+  ${extractFunction("localRequestFailureSummary")}
   ${extractFunction("checkPlaybackReadiness")}
   ${extractFunction("triggerEnginePlay")}
   ${extractFunction("queueTransportCommand")}

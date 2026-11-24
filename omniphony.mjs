@@ -19,6 +19,9 @@ const API_BASE = "http://127.0.0.1:8765";
 function eclipseAuthFailureMessage(reason) {
   const messages = {
     unauthorized: "Eclipse rejected the sign-in token. Confirm the Discord flow completed, then try Connect again.",
+    synthetic_account_rejected: "A saved test account was rejected. Connect again with your Eclipse account.",
+    invalid_identity: "Eclipse did not return a verifiable account identity. Retry the sign-in.",
+    session_cleanup_failed: "The invalid Eclipse session could not be removed from secure storage. Disconnect and retry.",
     account_not_verified: "Eclipse returned a token that could not be verified for this account.",
     verification_failed: "Eclipse account verification failed. Try again in a moment.",
     verification_unavailable: "Could not reach Eclipse to verify the account. Check your connection and retry.",
@@ -28,6 +31,7 @@ function eclipseAuthFailureMessage(reason) {
     secure_storage_unavailable: "The verified account could not be saved with Windows secure storage.",
     account_changed: "The account changed during verification. Start sign-in again.",
     invalid_token: "Eclipse returned an invalid sign-in token. Start sign-in again.",
+    unsupported_account_integration: "Eclipse has not documented a supported third-party account sign-in flow. Account linking is disabled until one is available.",
   };
   return messages[reason] || "Eclipse sign-in returned to the login page without completing. Try again; if it repeats, share the displayed status with support.";
 }
@@ -36,10 +40,10 @@ function normalizeRealmaxSourceMode(value) {
   if (value === "eclipse_addons" || value === "eclipse_only" || value === "amazon_only") return "eclipse_addons";
   return "both";
 }
-const REQUIRED_SERVICE_VERSION = "2.1.41";
+const REQUIRED_SERVICE_VERSION = "2.1.42";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const REQUIRED_ECLIPSE_AUTH_CAPABILITY = "eclipse-auth-flow-status-v1";
-const PLUGIN_BUILD = "2.1.65";
+const ECLIPSE_ACCOUNT_LINKING_SUPPORTED = false;
+const PLUGIN_BUILD = "2.1.66";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -125,199 +129,10 @@ const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
 };`;
 const NATIVE_ECLIPSE_AUTH_MODULE_ID = "OmniphonyEX/eclipse-auth.native.js";
 const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
-  async startLogin(serviceBase) {
-    const { BrowserWindow, net } = require("electron");
-    const crypto = require("crypto");
-    const stateKey = Symbol.for("omniphony-ex.eclipse-auth-window");
-    const state = globalThis[stateKey] || (globalThis[stateKey] = { window: null, partition: null, busy: false });
-    let endpoint;
-    try { endpoint = new URL(serviceBase); } catch (_) { return { started: false, error: "invalid_service_url" }; }
-    if (endpoint.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(endpoint.hostname)) {
-      return { started: false, error: "service_must_be_loopback" };
-    }
-    if (state.window && !state.window.isDestroyed()) {
-      state.window.show();
-      state.window.focus();
-      return { started: true, existing: true };
-    }
-    const partition = "temp:omniphony-eclipse-auth-" + crypto.randomBytes(12).toString("hex");
-    state.sawEclipseCallback = false;
-    state.flowFailureReported = false;
-    state.loginSucceeded = false;
-    state.attemptId = crypto.randomBytes(16).toString("hex");
-    const win = new BrowserWindow({
-      width: 620, height: 760, minWidth: 480, minHeight: 600, show: true,
-      title: "Connect Eclipse account", backgroundColor: "#17191d",
-      webPreferences: { partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true },
-    });
-    state.window = win;
-    state.partition = partition;
-    win.setMenuBarVisibility(false);
-    const allowedHost = (host) => ["eclipsemusic.app", "www.eclipsemusic.app", "api.eclipsemusic.app", "discord.com", "www.discord.com", "discordapp.com", "www.discordapp.com"].includes(host.toLowerCase());
-    const cleanUp = async () => {
-      const ses = win.webContents.session;
-      state.window = null;
-      state.partition = null;
-      state.busy = false;
-      if (!win.isDestroyed()) win.destroy();
-      try { await ses.clearStorageData(); } catch (_) {}
-    };
-    const postToken = (token) => new Promise((resolve, reject) => {
-      const target = new URL("/eclipse-auth/complete", endpoint);
-      const body = JSON.stringify({ token, attemptId: state.attemptId });
-      const request = net.request({
-        method: "POST", protocol: target.protocol, hostname: target.hostname,
-        port: target.port, path: target.pathname,
-        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), "Origin": endpoint.origin },
-      });
-      let responseBody = "";
-      request.on("response", (response) => {
-        response.on("data", (chunk) => { responseBody += chunk.toString("utf8"); });
-        response.on("end", () => {
-          let result;
-          try { result = JSON.parse(responseBody); } catch (_) { return reject(new Error("invalid_service_response")); }
-          if (response.statusCode < 200 || response.statusCode >= 300 || result?.connected !== true) {
-            const code = typeof result?.error === "string" && /^[a-z_]{1,48}$/.test(result.error)
-              ? result.error : "verification_failed";
-            return reject(new Error(code));
-          }
-          resolve(result);
-        });
-      });
-      request.on("error", () => reject(new Error("service_unavailable")));
-      request.write(body);
-      request.end();
-    });
-    const postFlowStatus = (reason, attemptId = state.attemptId) => new Promise((resolve) => {
-      const target = new URL("/eclipse-auth/flow-status", endpoint);
-      const body = JSON.stringify({ reason, attemptId });
-      const request = net.request({
-        method: "POST", protocol: target.protocol, hostname: target.hostname,
-        port: target.port, path: target.pathname,
-        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), "Origin": endpoint.origin },
-      });
-      let settled = false;
-      let responseBody = "";
-      const finish = (recorded) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(recorded);
-      };
-      const timer = setTimeout(() => {
-        try { request.abort(); } catch (_) {}
-        finish(false);
-      }, 3000);
-      request.on("response", (response) => {
-        response.on("data", (chunk) => { responseBody += chunk.toString("utf8"); });
-        response.on("end", () => {
-          let result;
-          try { result = JSON.parse(responseBody); } catch (_) { return finish(false); }
-          finish(response.statusCode >= 200 && response.statusCode < 300 && result?.recorded === true);
-        });
-      });
-      request.on("error", () => finish(false));
-      request.write(body);
-      request.end();
-    });
-    const reportFlowFailure = (reason, title) => {
-      if (state.flowFailureReported) return;
-      state.flowFailureReported = true;
-      const attemptId = state.attemptId;
-      void postFlowStatus(reason, attemptId).then((recorded) => {
-        if (!win.isDestroyed()) win.setTitle(recorded ? title : title + " (status could not be saved)");
-      });
-    };
-    const observeAuthNavigation = (targetUrl, isMainFrame = true, navigationSettled = false) => {
-      if (isMainFrame === false) return;
-      let parsed;
-      try { parsed = new URL(targetUrl); } catch (_) { return; }
-      if (parsed.protocol !== "https:" || parsed.port || !allowedHost(parsed.hostname)) return;
-      if (parsed.hostname.toLowerCase() === "api.eclipsemusic.app"
-          && parsed.pathname === "/configure/auth/discord") {
-        if (state.sawEclipseCallback || state.flowFailureReported) {
-          state.attemptId = crypto.randomBytes(16).toString("hex");
-          state.sawEclipseCallback = false;
-          state.flowFailureReported = false;
-          void postFlowStatus("started", state.attemptId).then((recorded) => {
-            if (!recorded && !win.isDestroyed()) win.setTitle("Eclipse login status service is unavailable");
-          });
-        }
-      }
-      if (parsed.hostname.toLowerCase() === "api.eclipsemusic.app"
-          && parsed.pathname === "/api/auth/mobile/discord/callback") {
-        state.sawEclipseCallback = true;
-        if (parsed.searchParams.has("error")) {
-          reportFlowFailure("oauth_denied", "Eclipse Discord sign-in was denied");
-        }
-      }
-      if (["eclipsemusic.app", "www.eclipsemusic.app"].includes(parsed.hostname.toLowerCase())
-          && /^\/sign-in(?:\.html)?\/?$/.test(parsed.pathname)
-          && !parsed.searchParams.has("token")
-          && state.sawEclipseCallback
-          && navigationSettled) {
-        reportFlowFailure("callback_missing", "Eclipse returned without an account token");
-      }
-    };
-    const handleNavigation = (event, targetUrl, _isInPlace, isMainFrame) => {
-      let parsed;
-      try { parsed = new URL(targetUrl); } catch (_) { event.preventDefault(); return; }
-      if (parsed.protocol !== "https:" || parsed.port || !allowedHost(parsed.hostname)) { event.preventDefault(); return; }
-      if (isMainFrame === false) return;
-      observeAuthNavigation(targetUrl, isMainFrame, false);
-      if (!["eclipsemusic.app", "www.eclipsemusic.app"].includes(parsed.hostname.toLowerCase())
-          || !/^\/sign-in(?:\.html)?\/?$/.test(parsed.pathname)
-          || !parsed.searchParams.has("token")) return;
-      event.preventDefault();
-      if (state.busy) return;
-      state.busy = true;
-      const token = parsed.searchParams.get("token");
-      if (!token || token.length > 8192 || /[\u0000-\u001f]/.test(token)) { void cleanUp(); return; }
-      void postToken(token).then((result) => {
-        if (result?.connected === true) {
-          state.loginSucceeded = true;
-          return cleanUp();
-        }
-        state.busy = false;
-        if (!win.isDestroyed()) win.setTitle("Eclipse sign-in was not accepted");
-      }).catch((error) => {
-        state.flowFailureReported = true;
-        state.busy = false;
-        const code = typeof error?.message === "string" && /^[a-z_]{1,48}$/.test(error.message)
-          ? error.message : "verification_failed";
-        if (!win.isDestroyed()) win.setTitle("Eclipse sign-in failed: " + code);
-      });
-    };
-    win.webContents.on("will-redirect", handleNavigation);
-    win.webContents.on("will-navigate", handleNavigation);
-    win.webContents.on("did-navigate", (_event, targetUrl) => observeAuthNavigation(targetUrl, true, true));
-    win.webContents.on("did-navigate-in-page", (_event, targetUrl, isMainFrame) => observeAuthNavigation(targetUrl, isMainFrame, true));
-    win.webContents.setWindowOpenHandler(({ url }) => {
-      let parsed;
-      try { parsed = new URL(url); } catch (_) { return { action: "deny" }; }
-      if (parsed.protocol === "https:" && !parsed.port && allowedHost(parsed.hostname)) setImmediate(() => { if (!win.isDestroyed()) void win.loadURL(url); });
-      return { action: "deny" };
-    });
-    win.on("closed", () => {
-      if (state.window === win && !state.flowFailureReported && !state.loginSucceeded) {
-        state.flowFailureReported = true;
-        void postFlowStatus("oauth_cancelled", state.attemptId);
-      }
-      if (state.window === win) { state.window = null; state.partition = null; state.busy = false; }
-    });
-    void postFlowStatus("started", state.attemptId).then((recorded) => {
-      if (!recorded && !win.isDestroyed()) win.setTitle("Eclipse login status service is unavailable");
-    });
-    void win.loadURL("https://eclipsemusic.app/sign-in").catch(() => { if (!win.isDestroyed()) win.setTitle("Eclipse sign-in could not be opened"); });
-    return { started: true, existing: false };
+  async startLogin() {
+    return { started: false, error: "unsupported_account_integration" };
   },
   async closeLogin() {
-    const state = globalThis[Symbol.for("omniphony-ex.eclipse-auth-window")];
-    if (!state?.window || state.window.isDestroyed()) return { closed: false };
-    state.window.destroy();
-    state.window = null;
-    state.partition = null;
-    state.busy = false;
     return { closed: true };
   },
 };`;
@@ -363,11 +178,11 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.65");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.66");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.65/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "1AB914988BCF49E0BA48716F9BC917155F92EF1B77266A9AC44E386EF4FC8F62";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.66/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "CA4E1E587FA068803A268CBEF7C6059C72ED6124ABA796146CB23DC65D2E77C2";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -439,7 +254,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.65"
+        return marker.pluginVersion === "2.1.66"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -508,7 +323,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.65", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.66", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -636,9 +451,9 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     if (shared.startPromise) return shared.startPromise;
     shared.startPromise = (async () => {
       fs.mkdirSync(pluginRoot, { recursive: true });
-      let apiRoot = hasCompatibleLocalApiBundle()
-        ? localApiRoot
-        : (hasApiBundle(bundledApiRoot) && hasVerifiedRuntimeBundle() ? bundledApiRoot : null);
+      let apiRoot = hasApiBundle(bundledApiRoot) && hasVerifiedRuntimeBundle()
+        ? bundledApiRoot
+        : (hasCompatibleLocalApiBundle() ? localApiRoot : null);
       if (!apiRoot) apiRoot = await installRuntimeBundle();
       const pythonExe = path.join(apiRoot, "runtime", "python.exe");
       const serviceScript = path.join(apiRoot, "omnifusion_service.py");
@@ -1182,11 +997,10 @@ async function checkPlaybackReadiness() {
       };
     }
     if (!Array.isArray(health?.capabilities)
-        || !health.capabilities.includes(REQUIRED_SERVICE_CAPABILITY)
-        || !health.capabilities.includes(REQUIRED_ECLIPSE_AUTH_CAPABILITY)) {
+        || !health.capabilities.includes(REQUIRED_SERVICE_CAPABILITY)) {
       return {
         ready: false,
-        reason: `OmniFusion does not advertise required ${REQUIRED_SERVICE_CAPABILITY} and ${REQUIRED_ECLIPSE_AUTH_CAPABILITY} protocols.`
+        reason: `OmniFusion does not advertise required ${REQUIRED_SERVICE_CAPABILITY} protocol.`
       };
     }
     if (!config) return { ready: false, reason: "Saved RealMax priority could not be verified." };
@@ -7339,6 +7153,8 @@ function toggleSettingsPanel() {
   let eclipseAccountWasConnected = false;
   let eclipseAccountSessionKey = "";
   let eclipseConnectionsRequest = 0;
+  let eclipseAuthStatusRequest = 0;
+  let eclipseAuthStatusInFlight = false;
   const refreshEclipseConnections = async () => {
     const requestId = ++eclipseConnectionsRequest;
     eclipseConnectionsButton.disabled = true;
@@ -7384,11 +7200,17 @@ function toggleSettingsPanel() {
   };
   eclipseConnectionsButton.onclick = () => { void refreshEclipseConnections(); };
   const updateEclipseAuthStatus = async () => {
+    if (eclipseAuthStatusInFlight || !panel.isConnected) return;
+    eclipseAuthStatusInFlight = true;
+    const requestId = ++eclipseAuthStatusRequest;
     try {
       const response = await requestWithTimeout(`${API_BASE}/eclipse-auth/status`, {}, 5000);
       if (!response.ok) throw new Error(`status ${response.status}`);
       const data = await response.json();
+      if (requestId !== eclipseAuthStatusRequest) return;
       if (!panel.isConnected) {
+        eclipseAuthStatusRequest++;
+        eclipseConnectionsRequest++;
         if (eclipseAuthStatusTimer) clearInterval(eclipseAuthStatusTimer);
         return;
       }
@@ -7397,6 +7219,7 @@ function toggleSettingsPanel() {
       const identityKey = [user.id, user.userId, user.email, user.name].find((value) => typeof value === "string" && value.trim()) || "unknown-account";
       const accountSessionKey = `${Number.isSafeInteger(data?.sessionGeneration) ? data.sessionGeneration : 0}:${identityKey}`;
       if (data?.connected === true) {
+        eclipseConnectionsButton.disabled = false;
         const loginFailure = data?.lastLoginError ? eclipseAuthFailureMessage(data.lastLoginError) : "";
         const loginInProgress = data?.loginAttemptActive === true;
         const accountChanged = eclipseAccountWasConnected && eclipseAccountSessionKey !== accountSessionKey;
@@ -7422,14 +7245,19 @@ function toggleSettingsPanel() {
         eclipseAccountWasConnected = true;
         eclipseAccountSessionKey = accountSessionKey;
       } else {
+        eclipseConnectionsRequest++;
+        eclipseConnectionsButton.disabled = false;
+        eclipseConnectionsList.replaceChildren();
         eclipseAuthStatus.textContent = data?.lastLoginError
           ? eclipseAuthFailureMessage(data.lastLoginError)
+          : data?.reason === "unsupported_account_integration"
+            ? eclipseAuthFailureMessage(data.reason)
           : data?.reason === "verification_unavailable"
             ? "Eclipse could not be reached. The saved account will be checked again automatically."
             : "Not connected. Connect your Eclipse account to use account-gated add-ons.";
-        eclipseAuthStatus.style.color = data?.lastLoginError || data?.reason === "verification_unavailable" ? "#e4b363" : "#aaa";
-        eclipseConnectButton.textContent = "Connect Eclipse with Discord";
-        eclipseConnectButton.disabled = false;
+        eclipseAuthStatus.style.color = data?.lastLoginError || data?.reason === "verification_unavailable" || data?.reason === "unsupported_account_integration" ? "#e4b363" : "#aaa";
+        eclipseConnectButton.textContent = ECLIPSE_ACCOUNT_LINKING_SUPPORTED ? "Connect Eclipse with Discord" : "Eclipse account linking unavailable";
+        eclipseConnectButton.disabled = !ECLIPSE_ACCOUNT_LINKING_SUPPORTED;
         eclipseDisconnectButton.style.display = "none";
         eclipseConnectionsButton.style.display = "none";
         eclipseConnectionsStatus.style.display = "none";
@@ -7439,11 +7267,23 @@ function toggleSettingsPanel() {
         eclipseAccountSessionKey = "";
       }
     } catch (_) {
-      eclipseAuthStatus.textContent = "OmniFusion service is not available for Eclipse account sign-in.";
-      eclipseAuthStatus.style.color = "#e4b363";
+      if (requestId === eclipseAuthStatusRequest && panel.isConnected) {
+        eclipseAuthStatus.textContent = "OmniFusion service is not available for Eclipse account sign-in.";
+        eclipseAuthStatus.style.color = "#e4b363";
+      }
+    } finally {
+      if (requestId === eclipseAuthStatusRequest) eclipseAuthStatusInFlight = false;
     }
   };
   eclipseConnectButton.onclick = async () => {
+    if (!ECLIPSE_ACCOUNT_LINKING_SUPPORTED) {
+      eclipseAuthStatus.textContent = eclipseAuthFailureMessage("unsupported_account_integration");
+      eclipseAuthStatus.style.color = "#e4b363";
+      return;
+    }
+    eclipseAuthStatusRequest++;
+    eclipseAuthStatusInFlight = false;
+    eclipseConnectionsRequest++;
     eclipseConnectButton.disabled = true;
     eclipseAuthStatus.textContent = "Opening Eclipse’s official Discord sign-in…";
     eclipseAuthStatus.style.color = "#aaa";
@@ -7475,6 +7315,9 @@ function toggleSettingsPanel() {
   };
   eclipseDisconnectButton.onclick = async () => {
     if (!window.confirm("Disconnect this Eclipse account from Omniphony EX?")) return;
+    eclipseAuthStatusRequest++;
+    eclipseAuthStatusInFlight = false;
+    eclipseConnectionsRequest++;
     eclipseDisconnectButton.disabled = true;
     try {
       const response = await requestWithTimeout(`${API_BASE}/eclipse-auth/disconnect`, {
@@ -7848,6 +7691,9 @@ export const Settings = () => {
   const providerMutationSequence = React.useRef(0);
   const providerRefreshSequence = React.useRef(0);
   const eclipseConnectPollRef = React.useRef(null);
+  const eclipseAccountRequestRef = React.useRef(0);
+  const eclipseAccountInFlightRef = React.useRef(false);
+  const eclipseConnectPollInFlightRef = React.useRef(false);
   const [mpvPath, setMpvPath] = React.useState(localStorage.getItem("omniphony_mpv_path") || "");
   const [studioPath, setStudioPath] = React.useState(localStorage.getItem("omniphony_studio_path") || "");
   const [authStatus, setAuthStatus] = React.useState("Ready");
@@ -7871,7 +7717,8 @@ export const Settings = () => {
       const enabledCount = order.length;
       const eclipseCount = rows.filter((row) => row?.type !== "tidal_api" && row?.available).length;
       const tidalReady = rows.some((row) => row?.key === "tidal_api" && row?.available);
-      if (data?.accountConnected !== true) setProviderStatus("Connect your Eclipse account with Discord to load its add-ons.");
+      if (data?.accountReason === "unsupported_account_integration") setProviderStatus(eclipseAuthFailureMessage("unsupported_account_integration"));
+      else if (data?.accountConnected !== true) setProviderStatus("Connect your Eclipse account with Discord to load its add-ons.");
       else if (data?.accountAvailable !== true) setProviderStatus("Eclipse is signed in, but its add-on connections are temporarily unavailable. Refresh to retry.");
       else setProviderStatus(`${enabledCount} provider${enabledCount === 1 ? "" : "s"} selected · ${tidalReady ? "TIDAL API ready" : "TIDAL API needs authorization"} · ${eclipseCount} Eclipse account add-on${eclipseCount === 1 ? "" : "s"} available${data?.customized ? " · custom priority" : " · following Eclipse account order"}`);
     } catch (error) {
@@ -7880,19 +7727,26 @@ export const Settings = () => {
   }, []);
 
   const refreshEclipseAccount = React.useCallback(async () => {
+    if (eclipseAccountInFlightRef.current) return;
+    eclipseAccountInFlightRef.current = true;
+    const requestId = ++eclipseAccountRequestRef.current;
     try {
       const statusResponse = await requestWithTimeout(`${API_BASE}/eclipse-auth/status`, { cache: "no-store" }, 8000);
       if (!statusResponse.ok) throw new Error(`status ${statusResponse.status}`);
       const status = await statusResponse.json();
+      if (requestId !== eclipseAccountRequestRef.current) return;
       if (status?.connected !== true) {
         setEclipseAccountStatus(status?.lastLoginError
           ? eclipseAuthFailureMessage(status.lastLoginError)
-          : "Not connected. Connect with Discord to use this Eclipse account’s add-ons.");
+          : status?.reason === "unsupported_account_integration"
+            ? eclipseAuthFailureMessage(status.reason)
+            : "Not connected. Connect with Discord to use this Eclipse account’s add-ons.");
         return;
       }
       const addonsResponse = await requestWithTimeout(`${API_BASE}/eclipse-auth/addons?refresh=1`, { cache: "no-store" }, 15000);
       if (!addonsResponse.ok) throw new Error(`connections ${addonsResponse.status}`);
       const addons = await addonsResponse.json();
+      if (requestId !== eclipseAccountRequestRef.current) return;
       if (addons?.available !== true) {
         setEclipseAccountStatus(addons?.reason === "unauthorized"
           ? "Eclipse session expired. Reconnect with Discord to refresh account access."
@@ -7903,11 +7757,21 @@ export const Settings = () => {
       setEclipseAccountStatus(`${status.user?.name || status.user?.email || "Eclipse account"} · ${count} enabled account add-on${count === 1 ? "" : "s"} loaded in Eclipse playback order`);
       void refreshRealmaxProviders(true);
     } catch (error) {
-      setEclipseAccountStatus(`Eclipse account status unavailable: ${error?.message || "service error"}`);
+      if (requestId === eclipseAccountRequestRef.current) {
+        setEclipseAccountStatus(`Eclipse account status unavailable: ${error?.message || "service error"}`);
+      }
+    } finally {
+      if (requestId === eclipseAccountRequestRef.current) eclipseAccountInFlightRef.current = false;
     }
   }, [refreshRealmaxProviders]);
 
   const connectEclipseAccount = React.useCallback(async () => {
+    if (!ECLIPSE_ACCOUNT_LINKING_SUPPORTED) {
+      setEclipseAccountStatus(eclipseAuthFailureMessage("unsupported_account_integration"));
+      return;
+    }
+    eclipseAccountRequestRef.current++;
+    eclipseAccountInFlightRef.current = false;
     try {
       const ipc = window?.__ipcRenderer;
       if (typeof ipc?.invoke !== "function") throw new Error("TidaLuna native IPC is unavailable");
@@ -7922,15 +7786,22 @@ export const Settings = () => {
       setEclipseAccountStatus("Complete the official Eclipse Discord sign-in in the window that opened.");
       if (eclipseConnectPollRef.current) clearInterval(eclipseConnectPollRef.current);
       eclipseConnectPollRef.current = setInterval(async () => {
+        if (eclipseConnectPollInFlightRef.current) return;
+        eclipseConnectPollInFlightRef.current = true;
         try {
           const response = await requestWithTimeout(`${API_BASE}/eclipse-auth/status`, { cache: "no-store" }, 5000);
           const status = response.ok ? await response.json() : null;
           if (status?.connected === true) {
             clearInterval(eclipseConnectPollRef.current);
             eclipseConnectPollRef.current = null;
+            eclipseAccountRequestRef.current++;
+            eclipseAccountInFlightRef.current = false;
             await refreshEclipseAccount();
           }
-        } catch (_) {}
+        } catch (_) {
+        } finally {
+          eclipseConnectPollInFlightRef.current = false;
+        }
       }, 2000);
     } catch (error) {
       setEclipseAccountStatus(error?.message || "Could not open Eclipse sign-in.");
@@ -8015,9 +7886,12 @@ export const Settings = () => {
     }, "Refresh Eclipse Connections"),
     React.createElement(LunaButtonSetting, {
       title: "Eclipse Discord Sign-in",
-      desc: "Use your own Eclipse account. Enabled connections and supporter add-ons come from that account.",
+      desc: ECLIPSE_ACCOUNT_LINKING_SUPPORTED
+        ? "Use your own Eclipse account. Enabled connections and supporter add-ons come from that account."
+        : eclipseAuthFailureMessage("unsupported_account_integration"),
+      disabled: !ECLIPSE_ACCOUNT_LINKING_SUPPORTED,
       onClick: connectEclipseAccount
-    }, "Connect Eclipse with Discord"),
+    }, ECLIPSE_ACCOUNT_LINKING_SUPPORTED ? "Connect Eclipse with Discord" : "Eclipse account linking unavailable"),
     React.createElement(
       LunaSelectSetting,
       {
