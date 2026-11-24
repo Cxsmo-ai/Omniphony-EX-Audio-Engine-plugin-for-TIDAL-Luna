@@ -382,6 +382,43 @@ assert.match(source,
   "a stale next() rejection cannot clear a newer queue handoff");
 assert.match(source, /MAX_NATURAL_END_ADVANCE_ATTEMPTS = 3/,
   "natural-end queue retries have a fixed per-playback attempt budget");
+assert.match(source, /MAX_ENGINE_PLAY_ATTEMPTS = 3/,
+  "failed engine playback has a bounded per-track attempt budget");
+assert.match(source, /engine-play-retries-exhausted/,
+  "the plugin records when failed engine playback reaches its retry limit");
+assert.match(source,
+  /async function triggerEnginePlay\([\s\S]*?canAttemptEnginePlay\(key\)[\s\S]*?noteEnginePlayAttempt\(key\)/,
+  "all playback entry points share the bounded retry gate");
+assert.match(extractFunction("triggerEnginePlay"),
+  /updateBadgeUI\(currentFormatLabel\);\s*if \(typeof resetEnginePlayRetryState === "function"\) resetEnginePlayRetryState\(key\);\s*return true;/,
+  "the retry budget resets only after playback has fully resumed successfully");
+const enginePlayRetrySandbox = {
+  MAX_ENGINE_PLAY_ATTEMPTS: 3,
+  ENGINE_PLAY_RETRY_BACKOFF_MS: [5000, 15000],
+  enginePlayRetryState: { trackId: null, attempts: 0, retryAfter: 0, exhaustionReported: false },
+};
+vm.createContext(enginePlayRetrySandbox);
+vm.runInContext(extractFunction("resetEnginePlayRetryState"), enginePlayRetrySandbox);
+vm.runInContext(extractFunction("canAttemptEnginePlay"), enginePlayRetrySandbox);
+vm.runInContext(extractFunction("noteEnginePlayAttempt"), enginePlayRetrySandbox);
+assert.equal(enginePlayRetrySandbox.canAttemptEnginePlay("227401768", 1000), true,
+  "a newly selected track may start its first playback attempt immediately");
+assert.equal(enginePlayRetrySandbox.noteEnginePlayAttempt("227401768", 1000), true);
+assert.equal(enginePlayRetrySandbox.canAttemptEnginePlay("227401768", 5999), false,
+  "the first failed attempt observes the five second backoff");
+assert.equal(enginePlayRetrySandbox.canAttemptEnginePlay("227401768", 6000), true);
+assert.equal(enginePlayRetrySandbox.noteEnginePlayAttempt("227401768", 6000), true);
+assert.equal(enginePlayRetrySandbox.canAttemptEnginePlay("227401768", 20999), false,
+  "the second failed attempt observes the longer backoff");
+assert.equal(enginePlayRetrySandbox.canAttemptEnginePlay("227401768", 21000), true);
+assert.equal(enginePlayRetrySandbox.noteEnginePlayAttempt("227401768", 21000), true);
+assert.equal(enginePlayRetrySandbox.canAttemptEnginePlay("227401768", 100000), false,
+  "the retry budget cannot be exceeded after three attempts");
+assert.equal(enginePlayRetrySandbox.canAttemptEnginePlay("97874144", 21001), true,
+  "selecting a different track starts a fresh retry budget");
+enginePlayRetrySandbox.resetEnginePlayRetryState("227401768");
+assert.equal(enginePlayRetrySandbox.canAttemptEnginePlay("227401768", 21001), true,
+  "an explicit Play retry can re-arm the selected track");
 const naturalEndRetrySandbox = { MAX_NATURAL_END_ADVANCE_ATTEMPTS: 3 };
 vm.createContext(naturalEndRetrySandbox);
 vm.runInContext(extractFunction("getNaturalEndAdvanceFailureAction"), naturalEndRetrySandbox);

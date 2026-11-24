@@ -40,10 +40,10 @@ function normalizeRealmaxSourceMode(value) {
   if (value === "eclipse_addons" || value === "eclipse_only" || value === "amazon_only") return "eclipse_addons";
   return "both";
 }
-const REQUIRED_SERVICE_VERSION = "2.1.42";
+const REQUIRED_SERVICE_VERSION = "2.1.43";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
 const ECLIPSE_ACCOUNT_LINKING_SUPPORTED = false;
-const PLUGIN_BUILD = "2.1.66";
+const PLUGIN_BUILD = "2.1.67";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -178,11 +178,11 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.66");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.67");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.66/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "CA4E1E587FA068803A268CBEF7C6059C72ED6124ABA796146CB23DC65D2E77C2";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.67/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "1FF283E770ECCAB7E21749532097E5D55A66EFAE6AB18B43CACB8E16F47AA322";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -254,7 +254,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.66"
+        return marker.pluginVersion === "2.1.67"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -323,7 +323,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.66", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.67", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -616,7 +616,9 @@ let enginePlayAbortController = null;
 let enginePlayRequestId = null;
 let enginePlayRequestTrackId = null;
 let enginePlayAllowPaused = false;
-let lastPlayAttempt = { trackId: null, at: 0 };
+const MAX_ENGINE_PLAY_ATTEMPTS = 3;
+const ENGINE_PLAY_RETRY_BACKOFF_MS = [5000, 15000];
+let enginePlayRetryState = { trackId: null, attempts: 0, retryAfter: 0, exhaustionReported: false };
 let staleJocResumeRecovery = null;
 let lastMirroredPlaybackState = null;
 let clockOrderingInstanceId = null;
@@ -1269,6 +1271,9 @@ function handleNativePlayerPlay(onPlaybackChange) {
     pausedSelectionConfirmedTrackId = null;
     pausedSelectionUserPlayAuthorization = null;
     updatePausedSelectionUi();
+    if (typeof resetEnginePlayRetryState === "function") {
+      resetEnginePlayRetryState(String(getCurrentTrackId() ?? ""));
+    }
     setTidalPlaybackIntent(true);
     onPlaybackChange();
   } else {
@@ -1277,6 +1282,9 @@ function handleNativePlayerPlay(onPlaybackChange) {
     pausedSelectionConfirmedTrackId = null;
     pausedSelectionUserPlayAuthorization = null;
     updatePausedSelectionUi();
+    if (typeof resetEnginePlayRetryState === "function") {
+      resetEnginePlayRetryState(String(getCurrentTrackId() ?? ""));
+    }
     setTidalPlaybackIntent(true);
     const snapshot = getTidalPlaybackSnapshot();
     const requestedTrackId = Number(queueTrackId ?? snapshot?.trackId);
@@ -4356,6 +4364,21 @@ async function triggerEnginePlay(trackId, timePos = 0, meta = {}, options = {}) 
   const key = String(trackId);
   const allowPaused = options.allowPaused === true;
   if (enginePlayPending && enginePlayPendingTrackId === key) return enginePlayPending;
+  if (typeof canAttemptEnginePlay === "function"
+      && typeof noteEnginePlayAttempt === "function") {
+    if (!canAttemptEnginePlay(key) || !noteEnginePlayAttempt(key)) {
+      if (enginePlayRetryState.attempts >= MAX_ENGINE_PLAY_ATTEMPTS
+          && !enginePlayRetryState.exhaustionReported) {
+        enginePlayRetryState.exhaustionReported = true;
+        tracePlaybackEvent("engine-play-retries-exhausted", {
+          trackId: key,
+          attempts: enginePlayRetryState.attempts,
+          retryAfter: null,
+        });
+      }
+      return false;
+    }
+  }
 
   tracePlaybackEvent("engine-play-request", {
     requestedTrackId: key,
@@ -4473,7 +4496,6 @@ async function triggerEnginePlay(trackId, timePos = 0, meta = {}, options = {}) 
         acceptedGeneration: Number(data.generation) || null,
         allowPaused
       });
-      lastPlayAttempt = { trackId: key, at: Date.now() };
       currentFormatLabel = data.label || data.format || "Atmos";
       const latestTidal = getTidalPlaybackSnapshot();
       const sameSelectedTrack = String(latestTidal?.trackId ?? "") === key;
@@ -4533,10 +4555,31 @@ async function triggerEnginePlay(trackId, timePos = 0, meta = {}, options = {}) 
         return false;
       }
       updateBadgeUI(currentFormatLabel);
+      if (typeof resetEnginePlayRetryState === "function") resetEnginePlayRetryState(key);
       return true;
     } catch (e) {
       if (pluginDisposed || generation !== enginePlayGeneration || e?.name === "AbortError") return false;
       console.error("[Omniphony EX] Engine play dispatch failed:", e);
+      if (!allowPaused && typeof enginePlayRetryState !== "undefined"
+          && enginePlayRetryState.trackId === key
+          && enginePlayRetryState.attempts >= MAX_ENGINE_PLAY_ATTEMPTS) {
+        enginePlayRetryState.exhaustionReported = true;
+        tracePlaybackEvent("engine-play-retries-exhausted", {
+          trackId: key,
+          attempts: enginePlayRetryState.attempts,
+          reason: String(e?.message || "playback request failed").slice(0, 160),
+        });
+        console.error("[Omniphony EX] Playback retries exhausted. TIDAL is being returned to paused; press Play to retry.");
+        if (Number(currentStatusData?.trackId) === Number(key)
+            && currentStatusData?.paused === false) {
+          void sendEngineCommand("pause", {
+            trackId: Number(key),
+            playbackGeneration: currentStatusData.playbackGeneration,
+            requestId: currentStatusData.requestId,
+          });
+        }
+        setTidalPlaybackIntent(false);
+      }
       if (allowPaused) {
         // A failed diagnostics-only preparation must not immediately retry on
         // every status poll. Require an explicit re-arm or a new track.
@@ -4562,10 +4605,39 @@ async function triggerEnginePlay(trackId, timePos = 0, meta = {}, options = {}) 
   return task;
 }
 
+function resetEnginePlayRetryState(trackId = null) {
+  enginePlayRetryState = {
+    trackId: trackId === null ? null : String(trackId),
+    attempts: 0,
+    retryAfter: 0,
+    exhaustionReported: false,
+  };
+}
+
+function canAttemptEnginePlay(trackId, now = Date.now()) {
+  const key = String(trackId ?? "");
+  if (!key) return false;
+  if (enginePlayRetryState.trackId !== key) resetEnginePlayRetryState(key);
+  return enginePlayRetryState.attempts < MAX_ENGINE_PLAY_ATTEMPTS
+    && now >= enginePlayRetryState.retryAfter;
+}
+
+function noteEnginePlayAttempt(trackId, now = Date.now()) {
+  const key = String(trackId ?? "");
+  if (!key) return false;
+  if (enginePlayRetryState.trackId !== key) resetEnginePlayRetryState(key);
+  if (enginePlayRetryState.attempts >= MAX_ENGINE_PLAY_ATTEMPTS
+      || now < enginePlayRetryState.retryAfter) return false;
+  enginePlayRetryState.attempts += 1;
+  const backoffIndex = enginePlayRetryState.attempts - 1;
+  enginePlayRetryState.retryAfter = now
+    + (ENGINE_PLAY_RETRY_BACKOFF_MS[backoffIndex] ?? Number.POSITIVE_INFINITY);
+  return true;
+}
+
 function cancelPendingEnginePlay() {
   const requestId = enginePlayRequestId;
   if (!requestId) return false;
-  const requestTrackId = enginePlayRequestTrackId;
   enginePlayGeneration += 1;
   enginePlayAbortController?.abort();
   enginePlayAbortController = null;
@@ -4574,9 +4646,6 @@ function cancelPendingEnginePlay() {
   enginePlayRequestId = null;
   enginePlayRequestTrackId = null;
   enginePlayAllowPaused = false;
-  if (lastPlayAttempt.trackId === requestTrackId) {
-    lastPlayAttempt = { trackId: null, at: 0 };
-  }
   void requestWithTimeout(`${API_BASE}/cancel-play`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -5186,10 +5255,7 @@ function startSyncLoop() {
           selectedTrackId: mediaTrackId,
           engineTrackId,
         });
-        if ((!enginePlayPending || enginePlayPendingTrackId !== stalledTrackKey)
-            && (lastPlayAttempt.trackId !== stalledTrackKey
-              || now - lastPlayAttempt.at > 5000)) {
-          lastPlayAttempt = { trackId: stalledTrackKey, at: now };
+        if (!enginePlayPending || enginePlayPendingTrackId !== stalledTrackKey) {
           void triggerEnginePlay(mediaTrackId, tidal.position, {
             title: tidal.title,
             artist: tidal.artist,
@@ -5284,10 +5350,7 @@ function startSyncLoop() {
             }
             if (naturalEndHandoff
                 && engineTrackId !== Number(handoffAction.trackId)
-                && (!enginePlayPending || enginePlayPendingTrackId !== String(mediaTrackId))
-                && (lastPlayAttempt.trackId !== String(mediaTrackId)
-                  || Date.now() - lastPlayAttempt.at > 5000)) {
-              lastPlayAttempt = { trackId: String(mediaTrackId), at: Date.now() };
+                && (!enginePlayPending || enginePlayPendingTrackId !== String(mediaTrackId))) {
               tracePlaybackEvent("natural-end-handoff-play-request", {
                 sourceTrackId: naturalEndHandoff.sourceTrackId,
                 targetTrackId: mediaTrackId,
@@ -5308,12 +5371,9 @@ function startSyncLoop() {
 
       // TidaLuna PlayState is the playback authority. HTML media elements are
       // not required: current TIDAL builds can keep their player outside DOM.
-      // Retry a failed request even when it is the same selected track.
+      // Retry a failed request only within the bounded, per-track retry budget.
       if (tidalIsPlaying && engineTrackId !== mediaTrackId
-          && (!enginePlayPending || enginePlayPendingTrackId !== String(mediaTrackId))
-          && (lastPlayAttempt.trackId !== String(mediaTrackId)
-            || Date.now() - lastPlayAttempt.at > 5000)) {
-        lastPlayAttempt = { trackId: String(mediaTrackId), at: Date.now() };
+          && (!enginePlayPending || enginePlayPendingTrackId !== String(mediaTrackId))) {
         console.info(`[Omniphony EX] TIDAL PlayState selected ${mediaTrackId}; requesting the matching libmpv stream.`);
         void triggerEnginePlay(mediaTrackId, tidal.position, { title: tidal.title, artist: tidal.artist });
         return;
@@ -5324,10 +5384,7 @@ function startSyncLoop() {
       if (!tidalIsPlaying && mediaTrackId > 0
           && pausedSelectionConfirmedTrackId === String(mediaTrackId)
           && engineTrackId !== mediaTrackId
-          && (!enginePlayPending || enginePlayPendingTrackId !== String(mediaTrackId))
-          && (lastPlayAttempt.trackId !== String(mediaTrackId)
-            || Date.now() - lastPlayAttempt.at > 5000)) {
-        lastPlayAttempt = { trackId: String(mediaTrackId), at: Date.now() };
+          && (!enginePlayPending || enginePlayPendingTrackId !== String(mediaTrackId))) {
         console.info(`[Omniphony EX] Preparing paused TIDAL selection ${mediaTrackId} for route and stream diagnostics.`);
         void triggerEnginePlay(
           mediaTrackId,
@@ -6547,6 +6604,9 @@ function toggleSettingsPanel() {
     } else {
       pausedSelectionConfirmedTrackId = null;
       pausedSelectionUserPlayAuthorization = null;
+      if (typeof resetEnginePlayRetryState === "function") {
+        resetEnginePlayRetryState(String(getCurrentTrackId() ?? ""));
+      }
       prepareNextSelectionPaused = true;
       updatePausedSelectionUi();
     }
