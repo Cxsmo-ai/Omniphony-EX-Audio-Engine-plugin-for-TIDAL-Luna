@@ -107,6 +107,155 @@ def studio_process_environment() -> dict[str, str]:
     return environment
 
 
+class _JobBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", ctypes.wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.wintypes.DWORD),
+        ("SchedulingClass", ctypes.wintypes.DWORD),
+    ]
+
+
+class _JobIoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class _JobExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobBasicLimitInformation),
+        ("IoInfo", _JobIoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class WindowsOwnedProcessJob:
+    """Own a launched process tree so Studio children cannot outlive the service."""
+
+    _KILL_ON_JOB_CLOSE = 0x00002000
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+
+    def __init__(self):
+        if os.name != "nt":
+            raise OSError("Windows Job Objects are required for owned Studio startup")
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        self._kernel32.CreateJobObjectW.restype = ctypes.wintypes.HANDLE
+        self._kernel32.SetInformationJobObject.argtypes = [
+            ctypes.wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+            ctypes.wintypes.DWORD,
+        ]
+        self._kernel32.SetInformationJobObject.restype = ctypes.wintypes.BOOL
+        self._kernel32.AssignProcessToJobObject.argtypes = [
+            ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE,
+        ]
+        self._kernel32.AssignProcessToJobObject.restype = ctypes.wintypes.BOOL
+        self._kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+        self._kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+        self._handle = self._kernel32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = _JobExtendedLimitInformation()
+        limits.BasicLimitInformation.LimitFlags = self._KILL_ON_JOB_CLOSE
+        if not self._kernel32.SetInformationJobObject(
+            self._handle,
+            self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.close()
+            raise error
+
+    def assign(self, process: subprocess.Popen) -> None:
+        process_handle = ctypes.wintypes.HANDLE(int(process._handle))
+        if not self._kernel32.AssignProcessToJobObject(self._handle, process_handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self) -> None:
+        handle = self._handle
+        if not handle:
+            return
+        if not self._kernel32.CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._handle = None
+
+
+def _resume_suspended_process_primary_thread(pid: int) -> None:
+    """Resume the sole initial thread of a newly created suspended process."""
+    if os.name != "nt":
+        raise OSError("Windows thread control is required for owned Studio startup")
+    threads = psutil.Process(pid).threads()
+    if len(threads) != 1:
+        raise OSError(f"expected one suspended primary thread, found {len(threads)}")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenThread.argtypes = [
+        ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD,
+    ]
+    kernel32.OpenThread.restype = ctypes.wintypes.HANDLE
+    kernel32.ResumeThread.argtypes = [ctypes.wintypes.HANDLE]
+    kernel32.ResumeThread.restype = ctypes.wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+    kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+    thread_handle = kernel32.OpenThread(0x0002, False, int(threads[0].id))
+    if not thread_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        previous_suspend_count = kernel32.ResumeThread(thread_handle)
+        if previous_suspend_count != 1:
+            if previous_suspend_count == 0xFFFFFFFF:
+                raise ctypes.WinError(ctypes.get_last_error())
+            raise OSError(
+                f"expected primary thread suspend count 1, got {previous_suspend_count}"
+            )
+    finally:
+        kernel32.CloseHandle(thread_handle)
+
+
+def launch_process_in_windows_job(
+    args: list[str], *, cwd: str, env: dict[str, str],
+) -> tuple[subprocess.Popen, WindowsOwnedProcessJob]:
+    """Launch suspended, contain before execution, then resume the owned tree."""
+    job = WindowsOwnedProcessJob()
+    process = None
+    try:
+        process = subprocess.Popen(
+            args,
+            cwd=cwd,
+            env=env,
+            creationflags=0x00000004,  # CREATE_SUSPENDED
+        )
+        job.assign(process)
+        _resume_suspended_process_primary_thread(process.pid)
+        return process, job
+    except Exception:
+        try:
+            job.close()
+        except OSError as exc:
+            print(f"[-] Could not close failed Studio job handle: {type(exc).__name__}")
+        if process is not None and process.poll() is None:
+            try:
+                process.kill()
+                process.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[-] Could not reap failed Studio startup: {type(exc).__name__}")
+        raise
+
+
 SESSION_FILE = CONFIG_DIR / "tidal-session-oauth.json"
 TIDAL_TV_SESSION_FILE = CONFIG_DIR / "tidal-session-tv.json"
 PYTHON_TIDAL_SESSION_FILE = CONFIG_DIR / "tidal-session-pkce.json"
@@ -115,7 +264,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.43"
+SERVICE_VERSION = "2.1.44"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 SHUTDOWN_TOKEN = os.environ.get("OMNIFUSION_SHUTDOWN_TOKEN", "")
 if not re.fullmatch(r"[a-f0-9]{64}", SHUTDOWN_TOKEN):
@@ -1509,8 +1658,9 @@ class HeadlessAudioEngine:
         # Startup and first HTTP requests can call ensure_mpv concurrently.
         # Serialize engine creation independently from the IPC command lock.
         self.ensure_lock = threading.Lock()
-        self.studio_lock = threading.Lock()
+        self.studio_lock = threading.RLock()
         self.studio_proc: subprocess.Popen | None = None
+        self.studio_job: WindowsOwnedProcessJob | None = None
         self.playback_lock = threading.Lock()
         self.playback_generation_lock = threading.RLock()
         self.seek_sequence = 0
@@ -2150,16 +2300,14 @@ class HeadlessAudioEngine:
         initial = get_omniphony_route_status(self.proc.pid if self.proc else None)
         if not initial.get("checks", {}).get("studio"):
             with self.studio_lock:
-                if not self.studio_proc or self.studio_proc.poll() is not None:
-                    try:
-                        self.studio_proc = subprocess.Popen(
-                            [str(STUDIO_EXE), "--register", STUDIO_REGISTER_TARGET],
-                            cwd=str(STUDIO_EXE.parent),
-                            env=studio_process_environment(),
-                        )
-                    except OSError:
-                        self.studio_proc = None
-                        return {"ready": False, "checks": {"studioLaunch": False}}
+                if (
+                    self.studio_proc is not None
+                    and self.studio_proc.poll() is not None
+                ) or (self.studio_proc is None and self.studio_job is not None):
+                    if not self.stop_owned_omniphony_studio():
+                        return {"ready": False, "checks": {"studioCleanup": False}}
+                if not self.studio_proc and not self._start_owned_omniphony_studio():
+                    return {"ready": False, "checks": {"studioLaunch": False}}
 
         deadline = time.monotonic() + timeout
         status = {"ready": False, "checks": {}}
@@ -2192,59 +2340,120 @@ class HeadlessAudioEngine:
                                 and owned.poll() is None
                                 and owned.pid == int(status["studioPid"])
                             )
-                        if owns_stale_studio:
-                            restarted_stale_studio = True
-                            stopped = self.stop_owned_omniphony_studio()
-                            with self.studio_lock:
-                                still_owned_and_running = (
-                                    self.studio_proc is not None
-                                    and self.studio_proc.poll() is None
-                                )
-                            if not stopped and still_owned_and_running:
-                                time.sleep(0.2)
-                                continue
-                            with self.studio_lock:
-                                if not self.studio_proc or self.studio_proc.poll() is not None:
-                                    try:
-                                        self.studio_proc = subprocess.Popen(
-                                            [str(STUDIO_EXE), "--register", STUDIO_REGISTER_TARGET],
-                                            cwd=str(STUDIO_EXE.parent),
-                                            env=studio_process_environment(),
-                                        )
-                                    except OSError:
-                                        self.studio_proc = None
-                                        return {"ready": False, "checks": {"studioLaunch": False}}
+                            if owns_stale_studio:
+                                restarted_stale_studio = True
+                                if not self.stop_owned_omniphony_studio():
+                                    return {"ready": False, "checks": {"studioCleanup": False}}
+                                if not self._start_owned_omniphony_studio():
+                                    return {"ready": False, "checks": {"studioLaunch": False}}
                 except Exception:
                     pass
             time.sleep(0.2)
         return status
 
+    def _start_owned_omniphony_studio(self) -> bool:
+        """Launch one service-owned Studio process inside a kill-on-close job."""
+        with self.studio_lock:
+            if self.studio_proc is not None and self.studio_proc.poll() is None:
+                return True
+            if self.studio_proc is not None or self.studio_job is not None:
+                if not self.stop_owned_omniphony_studio():
+                    return False
+            try:
+                process, job = launch_process_in_windows_job(
+                    [str(STUDIO_EXE), "--register", STUDIO_REGISTER_TARGET],
+                    cwd=str(STUDIO_EXE.parent),
+                    env=studio_process_environment(),
+                )
+            except (OSError, psutil.Error, subprocess.SubprocessError) as exc:
+                self.studio_proc = None
+                self.studio_job = None
+                print(f"[-] Could not launch contained Omniphony Studio: {type(exc).__name__}")
+                return False
+            self.studio_proc = process
+            self.studio_job = job
+            try:
+                self._monitor_owned_omniphony_studio(process, job)
+            except RuntimeError as exc:
+                print(f"[-] Could not monitor contained Omniphony Studio: {type(exc).__name__}")
+                self.stop_owned_omniphony_studio()
+                return False
+            return True
+
+    def _monitor_owned_omniphony_studio(
+        self,
+        process: subprocess.Popen,
+        job: WindowsOwnedProcessJob,
+    ) -> None:
+        watcher = threading.Thread(
+            target=self._watch_owned_omniphony_studio,
+            args=(process, job),
+            name=f"omniphony-studio-watch-{process.pid}",
+            daemon=True,
+        )
+        watcher.start()
+
+    def _watch_owned_omniphony_studio(
+        self,
+        process: subprocess.Popen,
+        job: WindowsOwnedProcessJob,
+    ) -> None:
+        """Close this Studio tree's job immediately when its owned root exits."""
+        try:
+            process.wait()
+        except (OSError, ChildProcessError) as exc:
+            print(f"[-] Could not observe owned Omniphony Studio exit: {type(exc).__name__}")
+            return
+
+        with self.studio_lock:
+            # A stop/restart may have already released these references and
+            # installed a new Studio tree while this watcher was waking up.
+            if self.studio_proc is not process or self.studio_job is not job:
+                return
+            try:
+                job.close()
+            except OSError as exc:
+                # Keep both identities so the next lifecycle operation can
+                # retry cleanup; never adopt or kill a process by executable name.
+                print(f"[-] Could not close exited Studio process tree: {type(exc).__name__}")
+                return
+            self.studio_proc = None
+            self.studio_job = None
+
     def stop_owned_omniphony_studio(self) -> bool:
-        """Stop only the Studio process this service launched itself."""
+        """Close the job containing only the Studio tree launched by this service."""
         with self.studio_lock:
             process = self.studio_proc
-            if not process:
+            job = self.studio_job
+            if process is None and job is None:
                 return False
+            process_stopped = process is None
             try:
-                if process.poll() is not None:
-                    if self.studio_proc is process:
-                        self.studio_proc = None
-                    return False
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+                if job is not None:
+                    job.close()
+                    if self.studio_job is job:
+                        self.studio_job = None
+                if process is not None and process.poll() is None:
+                    if job is None:
+                        process.terminate()
                     try:
                         process.wait(timeout=3)
+                        process_stopped = True
                     except subprocess.TimeoutExpired:
-                        print("[-] Owned Omniphony Studio did not exit after kill; retaining its process handle")
-                        return False
-                if self.studio_proc is process:
-                    self.studio_proc = None
-                return True
+                        process.kill()
+                        try:
+                            process.wait(timeout=3)
+                            process_stopped = True
+                        except subprocess.TimeoutExpired:
+                            print("[-] Owned Omniphony Studio tree did not exit; retaining its process handle")
+                            return False
+                if process_stopped or (process is not None and process.poll() is not None):
+                    if self.studio_proc is process:
+                        self.studio_proc = None
+                    return True
+                return False
             except OSError as exc:
-                if process.poll() is not None and self.studio_proc is process:
+                if process is not None and process.poll() is not None and self.studio_proc is process:
                     self.studio_proc = None
                 print(f"[-] Could not stop owned Omniphony Studio process: {type(exc).__name__}")
                 return False

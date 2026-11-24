@@ -428,6 +428,7 @@ class ServiceLifecycleTests(unittest.TestCase):
             studio_config.parent.mkdir(parents=True)
             process = Mock(pid=5123)
             process.poll.return_value = None
+            job = Mock()
             route_states = [
                 {"ready": False, "checks": {"studio": False}},
                 {"ready": True, "checks": {"studio": True, "studioRendererConnected": True}},
@@ -435,7 +436,8 @@ class ServiceLifecycleTests(unittest.TestCase):
             with patch.object(service, "STUDIO_EXE", studio_exe), \
                     patch.object(service, "STUDIO_CONFIG_FILE", studio_config), \
                     patch.object(service, "get_omniphony_route_status", side_effect=route_states) as route_probe, \
-                    patch.object(service.subprocess, "Popen", return_value=process) as launch:
+                    patch.object(engine, "_monitor_owned_omniphony_studio") as monitor, \
+                    patch.object(service, "launch_process_in_windows_job", return_value=(process, job)) as launch:
                 route = engine.ensure_omniphony_route(timeout=0.5)
 
             self.assertTrue(route["ready"])
@@ -446,12 +448,215 @@ class ServiceLifecycleTests(unittest.TestCase):
                 env={**service.os.environ, "OMNIPHONY_CONFIG_DIR": str(studio_config.parent)},
             )
             self.assertEqual(route_probe.call_count, 2)
+            monitor.assert_called_once_with(process, job)
             self.assertTrue(engine.stop_owned_omniphony_studio())
 
-        process.terminate.assert_called_once_with()
+        job.close.assert_called_once_with()
+        process.terminate.assert_not_called()
         process.wait.assert_called_once_with(timeout=3)
         process.kill.assert_not_called()
         self.assertIsNone(engine.studio_proc)
+        self.assertIsNone(engine.studio_job)
+
+    def test_exited_owned_studio_job_is_closed_before_replacement_launch(self):
+        engine = service.HeadlessAudioEngine()
+        old_process = Mock(pid=5123)
+        old_process.poll.return_value = 0
+        old_job = Mock()
+        engine.studio_proc = old_process
+        engine.studio_job = old_job
+        new_process = Mock(pid=6123)
+        new_process.poll.return_value = None
+        new_job = Mock()
+        with TemporaryDirectory() as temp:
+            studio_exe = Path(temp) / "omniphony-studio-egui.exe"
+            studio_exe.touch()
+            studio_config = Path(temp) / "config" / "omniphony" / "config.yaml"
+            studio_config.parent.mkdir(parents=True)
+            route_states = [
+                {"ready": False, "checks": {"studio": False}},
+                {"ready": True, "checks": {"studio": True, "studioRendererConnected": True}},
+            ]
+            with patch.object(service, "STUDIO_EXE", studio_exe), \
+                    patch.object(service, "STUDIO_CONFIG_FILE", studio_config), \
+                    patch.object(service, "get_omniphony_route_status", side_effect=route_states), \
+                    patch.object(engine, "_monitor_owned_omniphony_studio"), \
+                    patch.object(
+                        service, "launch_process_in_windows_job",
+                        return_value=(new_process, new_job),
+                    ) as launch:
+                route = engine.ensure_omniphony_route(timeout=0.5)
+
+        self.assertTrue(route["ready"])
+        old_job.close.assert_called_once_with()
+        launch.assert_called_once()
+        self.assertIs(engine.studio_proc, new_process)
+        self.assertIs(engine.studio_job, new_job)
+        self.assertTrue(engine.stop_owned_omniphony_studio())
+        new_job.close.assert_called_once_with()
+
+    def test_owned_studio_exit_watcher_closes_only_its_matching_job(self):
+        engine = service.HeadlessAudioEngine()
+        exited_process = Mock(pid=5123)
+        exited_process.wait.return_value = 0
+        exited_job = Mock()
+        engine.studio_proc = exited_process
+        engine.studio_job = exited_job
+
+        engine._watch_owned_omniphony_studio(exited_process, exited_job)
+
+        exited_process.wait.assert_called_once_with()
+        exited_job.close.assert_called_once_with()
+        self.assertIsNone(engine.studio_proc)
+        self.assertIsNone(engine.studio_job)
+
+    def test_stale_studio_exit_watcher_does_not_close_replacement_job(self):
+        engine = service.HeadlessAudioEngine()
+        exited_process = Mock(pid=5123)
+        exited_process.wait.return_value = 0
+        exited_job = Mock()
+        replacement_process = Mock(pid=6123)
+        replacement_job = Mock()
+        engine.studio_proc = replacement_process
+        engine.studio_job = replacement_job
+
+        engine._watch_owned_omniphony_studio(exited_process, exited_job)
+
+        exited_job.close.assert_not_called()
+        replacement_job.close.assert_not_called()
+        self.assertIs(engine.studio_proc, replacement_process)
+        self.assertIs(engine.studio_job, replacement_job)
+
+    def test_stale_studio_exit_watcher_does_not_close_new_job_for_same_process(self):
+        engine = service.HeadlessAudioEngine()
+        process = Mock(pid=5123)
+        process.wait.return_value = 0
+        stale_job = Mock()
+        replacement_job = Mock()
+        engine.studio_proc = process
+        engine.studio_job = replacement_job
+
+        engine._watch_owned_omniphony_studio(process, stale_job)
+
+        stale_job.close.assert_not_called()
+        replacement_job.close.assert_not_called()
+        self.assertIs(engine.studio_proc, process)
+        self.assertIs(engine.studio_job, replacement_job)
+
+    def test_studio_exit_watcher_retains_identity_when_job_close_fails(self):
+        engine = service.HeadlessAudioEngine()
+        process = Mock(pid=5123)
+        process.wait.return_value = 0
+        job = Mock()
+        job.close.side_effect = OSError("test close failure")
+        engine.studio_proc = process
+        engine.studio_job = job
+
+        engine._watch_owned_omniphony_studio(process, job)
+
+        job.close.assert_called_once_with()
+        self.assertIs(engine.studio_proc, process)
+        self.assertIs(engine.studio_job, job)
+
+    @unittest.skipUnless(service.os.name == "nt", "Windows Job Objects are required")
+    def test_windows_job_close_terminates_owned_parent_and_child(self):
+        child_code = "import time; time.sleep(30)"
+        parent_code = (
+            "import subprocess,sys,time;"
+            f"subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+            "time.sleep(30)"
+        )
+        process, job = service.launch_process_in_windows_job(
+            [service.sys.executable, "-c", parent_code],
+            cwd=str(Path(__file__).resolve().parent),
+            env=service.os.environ.copy(),
+        )
+        child_identities = []
+        try:
+            deadline = service.time.monotonic() + 5
+            while service.time.monotonic() < deadline:
+                try:
+                    children = service.psutil.Process(process.pid).children(recursive=True)
+                except service.psutil.NoSuchProcess:
+                    children = []
+                if children:
+                    child_identities = [
+                        (child.pid, child.create_time()) for child in children
+                    ]
+                    break
+                service.time.sleep(0.05)
+            self.assertTrue(child_identities, "the contained parent did not spawn its child")
+        finally:
+            job.close()
+
+        process.wait(timeout=3)
+        remaining = []
+        for pid, create_time in child_identities:
+            try:
+                child = service.psutil.Process(pid)
+                if abs(child.create_time() - create_time) < 0.01:
+                    remaining.append(pid)
+            except service.psutil.NoSuchProcess:
+                continue
+        self.assertEqual(remaining, [], "a Studio-owned descendant outlived its job")
+
+    @unittest.skipUnless(service.os.name == "nt", "Windows Job Objects are required")
+    def test_windows_owned_studio_exit_watcher_reaps_child_immediately(self):
+        child_code = "import time; time.sleep(30)"
+        parent_code = (
+            "import subprocess,sys,time;"
+            f"subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+            "time.sleep(0.25)"
+        )
+        process, job = service.launch_process_in_windows_job(
+            [service.sys.executable, "-c", parent_code],
+            cwd=str(Path(__file__).resolve().parent),
+            env=service.os.environ.copy(),
+        )
+        engine = service.HeadlessAudioEngine()
+        engine.studio_proc = process
+        engine.studio_job = job
+        child_identities = []
+        watcher = threading.Thread(
+            target=engine._watch_owned_omniphony_studio,
+            args=(process, job),
+            daemon=True,
+        )
+        watcher.start()
+        try:
+            deadline = service.time.monotonic() + 5
+            while service.time.monotonic() < deadline:
+                try:
+                    children = service.psutil.Process(process.pid).children(recursive=True)
+                except service.psutil.NoSuchProcess:
+                    children = []
+                if children:
+                    child_identities = [
+                        (child.pid, child.create_time()) for child in children
+                    ]
+                    break
+                service.time.sleep(0.02)
+            self.assertTrue(child_identities, "the contained parent did not spawn its child")
+            watcher.join(timeout=5)
+            self.assertFalse(watcher.is_alive(), "the Studio exit watcher did not finish")
+            self.assertIsNone(engine.studio_proc)
+            self.assertIsNone(engine.studio_job)
+        finally:
+            if watcher.is_alive():
+                job.close()
+                watcher.join(timeout=3)
+            elif engine.studio_job is not None:
+                engine.stop_owned_omniphony_studio()
+
+        remaining = []
+        for pid, create_time in child_identities:
+            try:
+                child = service.psutil.Process(pid)
+                if abs(child.create_time() - create_time) < 0.01:
+                    remaining.append(pid)
+            except service.psutil.NoSuchProcess:
+                continue
+        self.assertEqual(remaining, [], "a child outlived the exited Studio process")
 
     def test_existing_user_started_studio_is_never_claimed_or_closed(self):
         engine = service.HeadlessAudioEngine()
@@ -480,6 +685,7 @@ class ServiceLifecycleTests(unittest.TestCase):
         old_process.poll.return_value = None
         new_process = Mock(pid=6123)
         new_process.poll.return_value = None
+        new_job = Mock()
         engine.studio_proc = old_process
 
         wait_started = threading.Event()
@@ -529,7 +735,11 @@ class ServiceLifecycleTests(unittest.TestCase):
             with patch.object(service, "STUDIO_EXE", studio_exe), \
                     patch.object(service, "STUDIO_CONFIG_FILE", studio_config), \
                     patch.object(service, "get_omniphony_route_status", side_effect=route_probe), \
-                    patch.object(service.subprocess, "Popen", return_value=new_process) as launch:
+                    patch.object(engine, "_monitor_owned_omniphony_studio"), \
+                    patch.object(
+                        service, "launch_process_in_windows_job",
+                        return_value=(new_process, new_job),
+                    ) as launch:
                 stopper = threading.Thread(target=stop_studio)
                 stopper.start()
                 self.assertTrue(wait_started.wait(timeout=1))
