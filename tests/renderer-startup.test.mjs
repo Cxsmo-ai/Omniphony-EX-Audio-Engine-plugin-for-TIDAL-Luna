@@ -7,7 +7,7 @@ import vm from "node:vm";
 const root = path.dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(path.join(root, "..", "omniphony.mjs"), "utf8").replace(/\r\n/g, "\n");
 const startupCode = source.match(
-  /function getConfiguredRuntimePaths\(\) \{[\s\S]*?(?=\nfunction onLoad\(\) \{)/,
+  /const SERVICE_STARTUP_STATE_KEY = Symbol\.for\([\s\S]*?(?=\nfunction onLoad\(\) \{)/,
 )?.[0];
 const nativeCode = source.match(
   /const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String\.raw`([\s\S]*?)`;/,

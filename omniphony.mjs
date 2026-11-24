@@ -44,7 +44,7 @@ function normalizeRealmaxSourceMode(value) {
 const REQUIRED_SERVICE_VERSION = "2.1.43";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
 const ECLIPSE_ACCOUNT_LINKING_SUPPORTED = true;
-const PLUGIN_BUILD = "2.1.71";
+const PLUGIN_BUILD = "2.1.72";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
