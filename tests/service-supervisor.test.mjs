@@ -22,7 +22,7 @@ const supervisorCodeTemplate = moduleSource.match(
 )?.[1];
 const supervisorCode = supervisorCodeTemplate?.replace(
   "${NATIVE_ECLIPSE_AUTH_MODULE_CODE}",
-  nativeAuthModuleCode,
+  () => nativeAuthModuleCode,
 );
 assert.ok(supervisorCode, "the native service supervisor is embedded in the plugin entrypoint");
 assert.doesNotMatch(supervisorCode, /new Function\s*\(/,
