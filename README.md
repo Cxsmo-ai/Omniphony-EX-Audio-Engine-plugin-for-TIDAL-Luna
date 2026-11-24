@@ -4,7 +4,7 @@
 
 <br />
 
-[![Plugin Version](https://img.shields.io/badge/Plugin-v2.1.75-00d2c4?style=for-the-badge&logo=tidal&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna)
+[![Plugin Version](https://img.shields.io/badge/Plugin-v2.1.76-00d2c4?style=for-the-badge&logo=tidal&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna)
 [![API Service](https://img.shields.io/badge/API_Service-v2.1.45-31d8ff?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases)
 [![Dolby Atmos](https://img.shields.io/badge/Dolby_Atmos-AC--4_IMS_%7C_E--AC--3_JOC-f5c400?style=for-the-badge)](docs/ARCHITECTURE.md)
 [![Hi-Res Audio](https://img.shields.io/badge/FLAC-24--bit_%2F_192_kHz-00ff88?style=for-the-badge)](docs/ARCHITECTURE.md)
@@ -239,7 +239,7 @@ omniphony-tidal-luna-plugin/
     └── vendor/                        # Bundled dependencies (tidalapi, mpegdash, psutil, requests)
 ```
 
-`pnpm run build` writes TidaLuna's generated `store.json` and plugin `.json`/`.mjs` pair to `dist/`. GitHub Actions validates that package, builds and verifies the API runtime archive, then publishes the dotted plugin asset names expected by TidaLuna's remote-store URL resolver. `tools/verify-luna-store.py` checks that every catalog entry has both artifacts and valid metadata.
+`pnpm run build` writes TidaLuna's `store.json` with extensionless plugin base names plus the `.json`/`.mjs` pair to `dist/`. TidaLuna appends those extensions when it fetches each plugin. GitHub Actions validates that URL contract, builds and verifies the API runtime archive, then publishes dotted plugin asset names for GitHub releases. Add the release store URL shown above in TIDAL Settings → Plugins → Plugin Store → Install from URL. `tools/verify-luna-store.py` checks the same catalog-to-asset resolution used by TidaLuna.
 
 For deep protocol details, loopback HTTP endpoints, and verification gates, see [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md).
 

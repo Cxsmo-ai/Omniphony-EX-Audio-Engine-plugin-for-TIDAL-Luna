@@ -16,7 +16,7 @@ class PrepareReleaseTests(unittest.TestCase):
             release = dist / "release"
             dist.mkdir()
             (dist / "store.json").write_text(
-                json.dumps({"name": "store", "plugins": ["Omniphony EX Audio Engine.mjs"]}),
+                json.dumps({"name": "store", "plugins": ["Omniphony EX Audio Engine"]}),
                 encoding="utf-8",
             )
             (dist / "Omniphony EX Audio Engine.mjs").write_text("module", encoding="utf-8")
@@ -43,7 +43,7 @@ class PrepareReleaseTests(unittest.TestCase):
             )
             self.assertEqual(
                 json.loads((release / "store.json").read_text(encoding="utf-8"))["plugins"],
-                ["Omniphony.EX.Audio.Engine.mjs"],
+                ["Omniphony.EX.Audio.Engine"],
             )
             self.assertTrue((release / "Omniphony.EX.Audio.Engine.mjs").is_file())
             self.assertTrue((release / "Omniphony.EX.Audio.Engine.json").is_file())
@@ -53,27 +53,27 @@ class PrepareReleaseTests(unittest.TestCase):
             )
             self.assertEqual(
                 json.loads((dist / "store.json").read_text(encoding="utf-8"))["plugins"],
-                ["Omniphony EX Audio Engine.mjs"],
+                ["Omniphony EX Audio Engine"],
             )
 
     def test_release_module_names_reject_paths(self):
         self.assertEqual(
-            release_asset_name("Omniphony EX Audio Engine.mjs"),
-            "Omniphony.EX.Audio.Engine.mjs",
+            release_asset_name("Omniphony EX Audio Engine"),
+            "Omniphony.EX.Audio.Engine",
         )
         with self.assertRaises(ValueError):
-            release_asset_name("../outside.mjs")
+            release_asset_name("../outside")
 
     def test_release_rejects_names_that_collide_after_normalization(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             dist = root / "dist"
             dist.mkdir()
-            modules = ["Foo Bar.mjs", "Foo.Bar.mjs"]
+            modules = ["Foo Bar", "Foo.Bar"]
             (dist / "store.json").write_text(json.dumps({"plugins": modules}), encoding="utf-8")
             for module in modules:
-                (dist / module).write_text("module", encoding="utf-8")
-                (dist / f"{module[:-4]}.json").write_text(
+                (dist / f"{module}.mjs").write_text("module", encoding="utf-8")
+                (dist / f"{module}.json").write_text(
                     json.dumps({"name": "Omniphony EX Audio Engine", "version": "1.0.0", "hash": "x"}),
                     encoding="utf-8",
                 )

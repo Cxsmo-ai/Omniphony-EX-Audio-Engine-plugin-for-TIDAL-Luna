@@ -19,13 +19,14 @@ const store = JSON.parse(readFileSync(resolve(distPath, "store.json"), "utf8"));
 assert.ok(Array.isArray(store.plugins) && store.plugins.length > 0,
   "built TidaLuna store catalog lists at least one plugin");
 const builtPluginEntries = store.plugins
-  .filter((name) => typeof name === "string" && name.endsWith(".mjs") && path.basename(name) === name)
-  .map((name) => {
-    const modulePath = resolve(distPath, name);
+  .filter((name) => typeof name === "string" && name.length > 0
+    && path.basename(name) === name && !/\.(mjs|json)$/i.test(name))
+  .map((pluginName) => {
+    const modulePath = resolve(distPath, `${pluginName}.mjs`);
     return {
-      name,
+      name: pluginName,
       moduleBytes: readFileSync(modulePath),
-      package: JSON.parse(readFileSync(modulePath.replace(/\.mjs$/, ".json"), "utf8")),
+      package: JSON.parse(readFileSync(resolve(distPath, `${pluginName}.json`), "utf8")),
     };
   });
 const builtPlugin = builtPluginEntries.find((entry) => entry.package.name === "Omniphony EX Audio Engine");

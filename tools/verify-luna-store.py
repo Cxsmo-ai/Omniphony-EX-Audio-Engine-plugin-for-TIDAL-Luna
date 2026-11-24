@@ -63,14 +63,16 @@ def main() -> int:
 
     expected_name = "Omniphony EX Audio Engine"
     verified: list[str] = []
-    for filename in plugins:
-        if not isinstance(filename, str) or not filename.endswith(".mjs"):
-            raise SystemExit(f"invalid plugin module entry: {filename!r}")
-        basename = filename[:-4]
-        module_path = dist / filename
-        package_path = dist / f"{basename}.json"
+    for plugin_name in plugins:
+        if (not isinstance(plugin_name, str) or not plugin_name
+                or Path(plugin_name).name != plugin_name
+                or plugin_name.lower().endswith((".mjs", ".json"))):
+            raise SystemExit(f"invalid TidaLuna plugin base name: {plugin_name!r}")
+        module_path = dist / f"{plugin_name}.mjs"
+        package_path = dist / f"{plugin_name}.json"
         if not module_path.is_file() or not package_path.is_file():
-            raise SystemExit(f"store entry {filename!r} is missing its .mjs/.json artifact pair")
+            raise SystemExit(f"store entry {plugin_name!r} is missing its URL-resolved .mjs/.json artifacts")
+        filename = module_path.name
         package = json.loads(package_path.read_text(encoding="utf-8"))
         if package.get("name") != expected_name:
             raise SystemExit(f"plugin metadata name mismatch: {package.get('name')!r}")
@@ -80,7 +82,7 @@ def main() -> int:
             raise SystemExit(f"plugin metadata for {filename!r} has an invalid version")
         if not module_path.stat().st_size:
             raise SystemExit(f"plugin module is empty: {module_path}")
-        verified.append(filename)
+        verified.append(plugin_name)
 
     print(f"TidaLuna store verified: {len(verified)} plugin(s), {', '.join(verified)}")
     return 0

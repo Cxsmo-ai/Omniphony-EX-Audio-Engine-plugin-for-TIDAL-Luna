@@ -13,11 +13,11 @@ REQUIRED_ROOT_RELEASE_FILES = ("LICENSE", "THIRD-PARTY-NOTICES.md")
 REQUIRED_DIST_RELEASE_FILES = ("OmniphonyEX-API-win-x64.tar.gz",)
 
 
-def release_asset_name(filename: str) -> str:
-    path = PurePosixPath(filename)
-    if path.name != filename or path.suffix != ".mjs" or not filename:
-        raise ValueError(f"invalid plugin module filename: {filename!r}")
-    return filename.replace(" ", ".")
+def release_asset_name(plugin_name: str) -> str:
+    path = PurePosixPath(plugin_name)
+    if path.name != plugin_name or not plugin_name or plugin_name.lower().endswith((".mjs", ".json")):
+        raise ValueError(f"invalid TidaLuna plugin base name: {plugin_name!r}")
+    return plugin_name.replace(" ", ".")
 
 
 def prepare_release(dist: Path, output: Path) -> list[str]:
@@ -36,18 +36,16 @@ def prepare_release(dist: Path, output: Path) -> list[str]:
 
     assets: list[tuple[str, Path]] = []
     release_plugins: list[str] = []
-    for filename in plugins:
-        if not isinstance(filename, str):
-            raise ValueError(f"invalid plugin module entry: {filename!r}")
-        asset = release_asset_name(filename)
-        basename = filename[:-4]
-        asset_basename = asset[:-4]
-        module = dist / filename
-        package = dist / f"{basename}.json"
+    for plugin_name in plugins:
+        if not isinstance(plugin_name, str):
+            raise ValueError(f"invalid TidaLuna plugin base name: {plugin_name!r}")
+        asset_basename = release_asset_name(plugin_name)
+        module = dist / f"{plugin_name}.mjs"
+        package = dist / f"{plugin_name}.json"
         if not module.is_file() or not package.is_file():
-            raise FileNotFoundError(f"store entry {filename!r} is missing its module/metadata pair")
-        assets.extend(((asset, module), (f"{asset_basename}.json", package)))
-        release_plugins.append(asset)
+            raise FileNotFoundError(f"store entry {plugin_name!r} is missing its URL-resolved module/metadata pair")
+        assets.extend(((f"{asset_basename}.mjs", module), (f"{asset_basename}.json", package)))
+        release_plugins.append(asset_basename)
 
     names = [name for name, _ in assets]
     if len(names) != len(set(names)):
@@ -76,8 +74,8 @@ def prepare_release(dist: Path, output: Path) -> list[str]:
         newline="\n",
     )
     return [
-        *release_plugins,
-        *(filename[:-4] + ".json" for filename in release_plugins),
+        *(f"{plugin_name}.mjs" for plugin_name in release_plugins),
+        *(f"{plugin_name}.json" for plugin_name in release_plugins),
         *REQUIRED_ROOT_RELEASE_FILES,
         *REQUIRED_DIST_RELEASE_FILES,
         "store.json",

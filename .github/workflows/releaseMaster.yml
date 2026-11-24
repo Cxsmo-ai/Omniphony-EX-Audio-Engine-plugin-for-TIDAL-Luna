@@ -21,18 +21,35 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out the commit being published
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
       - name: Download verified Luna store package
         uses: actions/download-artifact@v4
         with:
           name: omniphony-luna-release
           path: ./release
 
-      - name: Publish latest GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          target_commitish: ${{ github.sha }}
-          name: Latest Omniphony EX
-          prerelease: false
-          overwrite_files: true
-          files: ./release/*
+      - name: Publish versioned release and rolling store release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(jq -r '.version' ./release/store.json)"
+          version_tag="v${version}"
+          if gh release view "$version_tag" >/dev/null 2>&1; then
+            gh release edit "$version_tag" --title "Omniphony EX ${version}" --notes "TidaLuna Plugin Store package built from commit $GITHUB_SHA."
+          else
+            gh release create "$version_tag" --target "$GITHUB_SHA" --title "Omniphony EX ${version}" --notes "TidaLuna Plugin Store package built from commit $GITHUB_SHA."
+          fi
+          gh release upload "$version_tag" ./release/* --clobber
+
+          git tag --force latest "$GITHUB_SHA"
+          git push --force origin refs/tags/latest
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest --title "Latest Omniphony EX" --notes "Rolling TidaLuna Plugin Store package built from commit $GITHUB_SHA."
+          else
+            gh release create latest --title "Latest Omniphony EX" --notes "Rolling TidaLuna Plugin Store package built from commit $GITHUB_SHA."
+          fi
+          gh release upload latest ./release/* --clobber

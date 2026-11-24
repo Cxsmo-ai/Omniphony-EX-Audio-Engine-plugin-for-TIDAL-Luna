@@ -3,8 +3,8 @@
   "description": "RealMAX playback for TIDAL and enabled Eclipse account add-ons with AC-4 IMS, E-AC-3 JOC routing, FLAC quality selection, and native transport controls.",
   "type": "module",
   "author": "Pickymarker",
-  "version": "2.1.75",
+  "version": "2.1.76",
   "plugins": [
-    "omniphony.mjs"
+    "Omniphony EX Audio Engine"
   ]
 }

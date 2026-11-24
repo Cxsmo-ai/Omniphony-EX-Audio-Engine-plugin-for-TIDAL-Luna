@@ -22,15 +22,15 @@ export async function syncManifestHashes(root = process.cwd()) {
   if (names.size !== 1) throw new Error("repository plugin manifests identify different plugins");
 
   const candidates = [];
-  for (const filename of store.plugins) {
-    if (typeof filename !== "string" || path.basename(filename) !== filename || !filename.endsWith(".mjs")) {
-      throw new Error(`invalid built plugin module name: ${String(filename)}`);
+  for (const pluginName of store.plugins) {
+    if (typeof pluginName !== "string" || path.basename(pluginName) !== pluginName || !pluginName || /\.(mjs|json)$/i.test(pluginName)) {
+      throw new Error(`invalid TidaLuna plugin base name: ${String(pluginName)}`);
     }
-    const modulePath = path.join(distPath, filename);
-    const packagePath = modulePath.replace(/\.mjs$/i, ".json");
+    const modulePath = path.join(distPath, `${pluginName}.mjs`);
+    const packagePath = path.join(distPath, `${pluginName}.json`);
     const pluginPackage = JSON.parse(await readFile(packagePath, "utf8"));
     if (names.has(pluginPackage.name)) {
-      candidates.push({ filename, modulePath });
+      candidates.push({ filename: `${pluginName}.mjs`, modulePath });
     }
   }
   if (candidates.length !== 1) {

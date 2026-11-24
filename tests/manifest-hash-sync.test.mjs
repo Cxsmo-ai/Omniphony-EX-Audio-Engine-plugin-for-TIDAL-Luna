@@ -21,7 +21,7 @@ test("build synchronization pins repository manifests to the source module they 
     .update(sourceModuleBytes.toString("utf8").replace(/\r\n/g, "\n"), "utf8")
     .digest("hex")
     .toUpperCase();
-  await writeFile(path.join(dist, "store.json"), JSON.stringify({ plugins: [moduleName] }));
+  await writeFile(path.join(dist, "store.json"), JSON.stringify({ plugins: [pluginName] }));
   await writeFile(path.join(dist, moduleName), builtModuleBytes);
   await writeFile(path.join(dist, `${pluginName}.json`), JSON.stringify({ name: pluginName }));
   await writeFile(path.join(root, "omniphony.mjs"), sourceModuleBytes);

@@ -44,7 +44,7 @@ function normalizeRealmaxSourceMode(value) {
 const REQUIRED_SERVICE_VERSION = "2.1.45";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
 const ECLIPSE_ACCOUNT_LINKING_SUPPORTED = true;
-const PLUGIN_BUILD = "2.1.75";
+const PLUGIN_BUILD = "2.1.76";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -430,10 +430,10 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.75");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.76");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.75/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.76/OmniphonyEX-API-win-x64.tar.gz";
     const bundleSha256 = "B3601D5E1636DE1D14E639D49835B64725BD2000333A2B69E8A3F3DCF65EA45D";
     const readPersistedRuntimePaths = () => {
       try {
@@ -506,7 +506,7 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.75"
+        return marker.pluginVersion === "2.1.76"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -575,7 +575,7 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.75", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.76", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         let backup = null;
         try {
