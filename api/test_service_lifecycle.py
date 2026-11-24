@@ -391,11 +391,41 @@ class ServiceLifecycleTests(unittest.TestCase):
             standalone_renderer_absent=True,
         ))
 
+    def test_mpv_launch_uses_the_verified_omniphony_config(self):
+        engine = service.HeadlessAudioEngine()
+        process = Mock(pid=7123)
+        process.poll.return_value = None
+        with TemporaryDirectory() as temp:
+            config_file = Path(temp) / "omniphony" / "config.yaml"
+            config_file.parent.mkdir(parents=True)
+            mpv_dir = Path(temp) / "mpv"
+            mpv_exe = mpv_dir / "mpv.exe"
+            orender_dll = mpv_dir / "orender.dll"
+            bridge_paths = (Path(temp) / "dolby.dll", Path(temp) / "dts.dll", Path(temp) / "iamf.dll")
+            with patch.object(service, "STUDIO_CONFIG_FILE", config_file), \
+                    patch.object(service, "MPV_DIR", mpv_dir), \
+                    patch.object(service, "MPV_EXE", mpv_exe), \
+                    patch.object(service, "ORENDER_DLL", orender_dll), \
+                    patch.object(service, "ORENDER_BRIDGE_PATHS", bridge_paths), \
+                    patch.object(engine, "reap_orphaned_mpv"), \
+                    patch.object(engine, "connect_mpv_pipe", return_value=True), \
+                    patch.object(service.time, "sleep"), \
+                    patch.object(service.subprocess, "Popen", return_value=process) as launch:
+                engine.ensure_mpv()
+
+        args = launch.call_args.args[0]
+        env = launch.call_args.kwargs["env"]
+        self.assertIn(f"--ad-orender-config={config_file}", args)
+        self.assertEqual(env["OMNIPHONY_CONFIG_DIR"], str(config_file.parent))
+        self.assertEqual(engine.proc, process)
+
     def test_joc_route_start_tracks_and_closes_only_its_owned_studio(self):
         engine = service.HeadlessAudioEngine()
         with TemporaryDirectory() as temp:
             studio_exe = Path(temp) / "omniphony-studio-egui.exe"
             studio_exe.touch()
+            studio_config = Path(temp) / "config" / "omniphony" / "config.yaml"
+            studio_config.parent.mkdir(parents=True)
             process = Mock(pid=5123)
             process.poll.return_value = None
             route_states = [
@@ -403,6 +433,7 @@ class ServiceLifecycleTests(unittest.TestCase):
                 {"ready": True, "checks": {"studio": True, "studioRendererConnected": True}},
             ]
             with patch.object(service, "STUDIO_EXE", studio_exe), \
+                    patch.object(service, "STUDIO_CONFIG_FILE", studio_config), \
                     patch.object(service, "get_omniphony_route_status", side_effect=route_states) as route_probe, \
                     patch.object(service.subprocess, "Popen", return_value=process) as launch:
                 route = engine.ensure_omniphony_route(timeout=0.5)
@@ -412,6 +443,7 @@ class ServiceLifecycleTests(unittest.TestCase):
             launch.assert_called_once_with(
                 [str(studio_exe), "--register", service.STUDIO_REGISTER_TARGET],
                 cwd=str(studio_exe.parent),
+                env={**service.os.environ, "OMNIPHONY_CONFIG_DIR": str(studio_config.parent)},
             )
             self.assertEqual(route_probe.call_count, 2)
             self.assertTrue(engine.stop_owned_omniphony_studio())
@@ -492,7 +524,10 @@ class ServiceLifecycleTests(unittest.TestCase):
         with TemporaryDirectory() as temp:
             studio_exe = Path(temp) / "omniphony-studio-egui.exe"
             studio_exe.touch()
+            studio_config = Path(temp) / "config" / "omniphony" / "config.yaml"
+            studio_config.parent.mkdir(parents=True)
             with patch.object(service, "STUDIO_EXE", studio_exe), \
+                    patch.object(service, "STUDIO_CONFIG_FILE", studio_config), \
                     patch.object(service, "get_omniphony_route_status", side_effect=route_probe), \
                     patch.object(service.subprocess, "Popen", return_value=new_process) as launch:
                 stopper = threading.Thread(target=stop_studio)
@@ -516,6 +551,7 @@ class ServiceLifecycleTests(unittest.TestCase):
                 launch.assert_called_once_with(
                     [str(studio_exe), "--register", service.STUDIO_REGISTER_TARGET],
                     cwd=str(studio_exe.parent),
+                    env={**service.os.environ, "OMNIPHONY_CONFIG_DIR": str(studio_config.parent)},
                 )
 
         self.assertEqual(engine.studio_proc, new_process)

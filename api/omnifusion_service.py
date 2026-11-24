@@ -98,6 +98,15 @@ def stream_transport_label(proxy) -> str | None:
 CONFIG_DIR = DATA_DIR / "config"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 STUDIO_CONFIG_FILE = CONFIG_DIR / "omniphony" / "config.yaml"
+
+
+def studio_process_environment() -> dict[str, str]:
+    """Pass Studio the exact config directory whose route settings we verify."""
+    environment = os.environ.copy()
+    environment["OMNIPHONY_CONFIG_DIR"] = str(STUDIO_CONFIG_FILE.parent)
+    return environment
+
+
 SESSION_FILE = CONFIG_DIR / "tidal-session-oauth.json"
 TIDAL_TV_SESSION_FILE = CONFIG_DIR / "tidal-session-tv.json"
 PYTHON_TIDAL_SESSION_FILE = CONFIG_DIR / "tidal-session-pkce.json"
@@ -106,7 +115,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.42"
+SERVICE_VERSION = "2.1.43"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 SHUTDOWN_TOKEN = os.environ.get("OMNIFUSION_SHUTDOWN_TOKEN", "")
 if not re.fullmatch(r"[a-f0-9]{64}", SHUTDOWN_TOKEN):
@@ -2146,6 +2155,7 @@ class HeadlessAudioEngine:
                         self.studio_proc = subprocess.Popen(
                             [str(STUDIO_EXE), "--register", STUDIO_REGISTER_TARGET],
                             cwd=str(STUDIO_EXE.parent),
+                            env=studio_process_environment(),
                         )
                     except OSError:
                         self.studio_proc = None
@@ -2199,6 +2209,7 @@ class HeadlessAudioEngine:
                                         self.studio_proc = subprocess.Popen(
                                             [str(STUDIO_EXE), "--register", STUDIO_REGISTER_TARGET],
                                             cwd=str(STUDIO_EXE.parent),
+                                            env=studio_process_environment(),
                                         )
                                     except OSError:
                                         self.studio_proc = None
@@ -2395,6 +2406,7 @@ class HeadlessAudioEngine:
             "--no-osd-bar",
             f"--input-ipc-server={PIPE_PATH}",
             f"--ad={STRICT_RENDER_DECODER}",
+            f"--ad-orender-config={STUDIO_CONFIG_FILE}",
             f"--ad-orender-library={ORENDER_DLL}",
             "--ad-orender-bridge-path=" + ";".join(str(path) for path in ORENDER_BRIDGE_PATHS),
             "--ad-orender-osc",
@@ -2436,6 +2448,7 @@ class HeadlessAudioEngine:
                 cwd=str(MPV_DIR),
                 stdout=subprocess.DEVNULL,
                 stderr=stderr_target,
+                env=studio_process_environment(),
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             )
             self.mpv_instance_id = uuid.uuid4().hex
