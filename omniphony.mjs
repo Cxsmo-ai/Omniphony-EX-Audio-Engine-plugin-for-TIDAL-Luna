@@ -44,7 +44,7 @@ function normalizeRealmaxSourceMode(value) {
 const REQUIRED_SERVICE_VERSION = "2.1.43";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
 const ECLIPSE_ACCOUNT_LINKING_SUPPORTED = true;
-const PLUGIN_BUILD = "2.1.68";
+const PLUGIN_BUILD = "2.1.71";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -128,9 +128,8 @@ const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
     return { installed: false, restored: true };
   },
 };`;
-const NATIVE_ECLIPSE_AUTH_MODULE_ID = "OmniphonyEX/eclipse-auth.native.js";
 const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
-  async startLogin(serviceBase) {
+  async startLogin(serviceBase, serviceIdentity = null) {
     const crypto = require("crypto");
     const http = require("http");
     const { BrowserWindow, session } = require("electron");
@@ -145,9 +144,8 @@ const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
     if (globalThis.__omniphonyEclipseLogin) return { started: false, error: "login_in_progress" };
 
     const attemptId = crypto.randomBytes(16).toString("hex");
-    const serviceSupervisor = globalThis[Symbol.for("omniphony-ex.native-service-supervisor")];
-    const serviceToken = serviceSupervisor?.shutdownToken;
-    const serviceInstanceId = serviceSupervisor?.serviceInstanceId;
+    const serviceToken = serviceIdentity?.shutdownToken;
+    const serviceInstanceId = serviceIdentity?.serviceInstanceId;
     if (typeof serviceToken !== "string" || !serviceToken
       || typeof serviceInstanceId !== "string" || !serviceInstanceId) {
       return { started: false, error: "service_identity_unavailable" };
@@ -190,8 +188,10 @@ const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
     const loginState = {
       attemptId,
       windows: new Set(),
+      primaryWindow: null,
       authSession: null,
       finishing: false,
+      finishPromise: null,
       timer: null,
       finish: null,
     };
@@ -201,58 +201,69 @@ const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
       try {
         const url = new URL(value);
         return url.protocol === "debridmusic:" && url.hostname === "auth"
-          && url.pathname === "/callback" && !url.username && !url.password && !url.port;
+          && url.pathname === "/callback" && !url.username && !url.password && !url.port && !url.hash;
       } catch (_) { return false; }
     };
+    const allowedAuthHosts = new Set(["api.eclipsemusic.app", "discord.com"]);
     const allowedHttpsUrl = (value) => {
       try {
         const url = new URL(value);
-        return url.protocol === "https:" && !url.username && !url.password
-          && ["api.eclipsemusic.app", "discord.com", "discordapp.com", "discordapp.net"].includes(url.hostname.toLowerCase());
+        return url.protocol === "https:" && !url.username && !url.password && !url.port
+          && allowedAuthHosts.has(url.hostname.toLowerCase());
       } catch (_) { return false; }
     };
-    const clearLogin = () => {
+    const callbackSourceAllowed = (sourceWindow) => {
+      try {
+        const source = new URL(sourceWindow.webContents.getURL());
+        return allowedHttpsUrl(source.href) && allowedAuthHosts.has(source.hostname.toLowerCase());
+      } catch (_) { return false; }
+    };
+    const clearLogin = async () => {
       if (loginState.timer) clearTimeout(loginState.timer);
       for (const window of [...loginState.windows]) {
-        try { if (!window.isDestroyed()) window.close(); } catch (_) {}
+        try {
+          if (!window.isDestroyed()) {
+            if (typeof window.destroy === "function") window.destroy();
+            else window.close();
+          }
+        } catch (_) {}
       }
       loginState.windows.clear();
       if (loginState.authSession) {
-        Promise.resolve(loginState.authSession.clearStorageData()).catch(() => {});
-        if (typeof loginState.authSession.clearCache === "function") {
-          Promise.resolve(loginState.authSession.clearCache()).catch(() => {});
-        }
+        const cleanup = [Promise.resolve(loginState.authSession.clearStorageData()).catch(() => {})];
+        if (typeof loginState.authSession.clearCache === "function") cleanup.push(Promise.resolve(loginState.authSession.clearCache()).catch(() => {}));
+        await Promise.all(cleanup);
       }
       if (globalThis.__omniphonyEclipseLogin === loginState) delete globalThis.__omniphonyEclipseLogin;
     };
     loginState.finish = async (reason, callback) => {
-      if (loginState.finishing) return;
+      if (loginState.finishPromise) return await loginState.finishPromise;
       loginState.finishing = true;
-      try {
-        if (callback) {
-          const response = await postJson("/eclipse-auth/complete", {
-            token: callback.token,
-            userId: callback.userId,
-            email: callback.email,
-            attemptId,
-          });
-          if (response.connected !== true) throw new Error("Eclipse account verification failed");
-        } else if (reason) {
-          await postJson("/eclipse-auth/flow-status", { reason, attemptId }).catch(() => {});
+      loginState.finishPromise = (async () => {
+        try {
+          if (callback) {
+            const response = await postJson("/eclipse-auth/complete", {
+              token: callback.token,
+              userId: callback.userId,
+              email: callback.email,
+              attemptId,
+            });
+            if (response.connected !== true) throw new Error("Eclipse account verification failed");
+          } else if (reason) {
+            await postJson("/eclipse-auth/flow-status", { reason, attemptId }).catch(() => {});
+          }
+        } catch (_) {
+          await postJson("/eclipse-auth/flow-status", { reason: "oauth_cancelled", attemptId }).catch(() => {});
+        } finally {
+          await clearLogin();
         }
-      } catch (_) {
-        await postJson("/eclipse-auth/flow-status", { reason: "oauth_cancelled", attemptId }).catch(() => {});
-      } finally {
-        clearLogin();
-      }
+      })();
+      return await loginState.finishPromise;
     };
     const handleCallback = (value, sourceWindow, isMainFrame = true) => {
-      // The Android APK receives this exact custom-scheme callback through its
-      // manifest intent filter. In the desktop adapter the redirect can come
-      // from either provider or Eclipse's callback page, so trust only a main
-      // frame in this isolated, allowlisted login window and the exact URI.
       if (!callbackUrl(value) || loginState.finishing || !isMainFrame
-        || !sourceWindow?.webContents || !loginState.windows.has(sourceWindow)) return false;
+        || !sourceWindow?.webContents || !loginState.windows.has(sourceWindow)
+        || !callbackSourceAllowed(sourceWindow)) return false;
       let url;
       try { url = new URL(value); } catch (_) { return false; }
       const query = url.searchParams;
@@ -260,11 +271,15 @@ const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
         void loginState.finish("oauth_denied");
         return true;
       }
-      const token = query.get("token");
-      const userId = query.get("userId");
-      const email = query.get("email");
+      const singleValue = (name) => {
+        const values = query.getAll(name);
+        return values.length === 1 ? values[0] : null;
+      };
+      const token = singleValue("token");
+      const userId = singleValue("userId");
+      const email = singleValue("email");
       const validField = (field, max) => typeof field === "string" && field.length > 0
-        && field.length <= max && !/[\u0000-\u001f\u007f]/.test(field);
+        && field.trim().length > 0 && field.length <= max && !/[\u0000-\u001f\u007f]/.test(field);
       if (!validField(token, 8192) || !validField(userId, 512) || !validField(email, 512)) {
         void loginState.finish("callback_missing");
         return true;
@@ -282,6 +297,7 @@ const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
       webviewTag: false,
     };
     const createWindow = (url, parent) => {
+      if (loginState.windows.size >= 4) return null;
       const window = new BrowserWindow({
         parent: parent || undefined,
         width: 520,
@@ -294,6 +310,7 @@ const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
         webPreferences: { ...secureOptions },
       });
       loginState.windows.add(window);
+      if (!loginState.primaryWindow) loginState.primaryWindow = window;
       window.webContents.setWindowOpenHandler(({ url: destination }) => {
         if (allowedHttpsUrl(destination)) {
           createWindow(destination, window);
@@ -316,7 +333,11 @@ const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
         }
       });
       window.loadURL(url).catch(() => {
-        if (!loginState.finishing) void loginState.finish("oauth_denied");
+        if (window === loginState.primaryWindow && !loginState.finishing) void loginState.finish("oauth_denied");
+        else {
+          loginState.windows.delete(window);
+          try { if (!window.isDestroyed()) window.destroy(); } catch (_) {}
+        }
       });
       return window;
     };
@@ -332,18 +353,53 @@ const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
       return { started: true };
     } catch (_) {
       await postJson("/eclipse-auth/flow-status", { reason: "oauth_cancelled", attemptId }).catch(() => {});
-      clearLogin();
+      await clearLogin();
       return { started: false, error: "login_window_unavailable" };
     }
   },
   async closeLogin() {
     const loginState = globalThis.__omniphonyEclipseLogin;
-    if (loginState?.finish && !loginState.finishing) await loginState.finish("oauth_cancelled");
+    if (loginState?.finish) await loginState.finish("oauth_cancelled");
     return { closed: true };
   },
 };`;
+const NATIVE_ECLIPSE_AUTH_MODULE_CODE_JSON = JSON.stringify(NATIVE_ECLIPSE_AUTH_MODULE_CODE);
 const NATIVE_SERVICE_SUPERVISOR_MODULE_ID = "OmniphonyEX/service-supervisor.native.js";
-const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
+const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`const stateKey = "__omniphony-ex.native-service-supervisor";
+const shared = luna[stateKey] || (luna[stateKey] = {
+  startPromise: null,
+  child: null,
+  servicePid: null,
+  shutdownToken: null,
+  serviceInstanceId: null,
+});
+module.exports = {
+  async startEclipseLogin(serviceBase, requiredVersion, runtimeConfig = {}) {
+    if (typeof module.exports.ensureService === "function") {
+      const readiness = await module.exports.ensureService(requiredVersion, runtimeConfig);
+      if (readiness?.ready !== true) {
+        return { started: false, error: readiness?.reason || "service_unavailable" };
+      }
+    }
+    if (typeof shared?.shutdownToken !== "string" || !shared.shutdownToken
+      || typeof shared?.serviceInstanceId !== "string" || !shared.serviceInstanceId) {
+      return { started: false, error: "service_identity_unavailable" };
+    }
+    if (!shared.eclipseAuthModule) {
+      const authModule = { exports: {} };
+      const loadAuthModule = new Function("module", "exports", "require", ${NATIVE_ECLIPSE_AUTH_MODULE_CODE_JSON});
+      loadAuthModule(authModule, authModule.exports, require);
+      shared.eclipseAuthModule = authModule.exports;
+    }
+    return await shared.eclipseAuthModule.startLogin(serviceBase, {
+      shutdownToken: shared.shutdownToken,
+      serviceInstanceId: shared.serviceInstanceId,
+    });
+  },
+  async closeEclipseLogin() {
+    if (typeof shared?.eclipseAuthModule?.closeLogin !== "function") return { closed: true };
+    return await shared.eclipseAuthModule.closeLogin();
+  },
   async ensureService(requiredVersion, runtimeConfig = {}) {
     const fs = require("fs");
     const path = require("path");
@@ -351,7 +407,6 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const crypto = require("crypto");
     const { spawn, spawnSync } = require("child_process");
     const app = require("electron").app;
-    const stateKey = Symbol.for("omniphony-ex.native-service-supervisor");
     const resolveTidalOwnerPid = () => {
       if (typeof app.getAppMetrics !== "function") return null;
       try {
@@ -365,15 +420,6 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
       }
     };
     const tidalOwnerPid = resolveTidalOwnerPid();
-    const shared = globalThis[stateKey] ||
-      (globalThis[stateKey] = {
-        startPromise: null,
-        child: null,
-        servicePid: null,
-        shutdownToken: null,
-        serviceInstanceId: null,
-      });
-
     if (!app || typeof app.getPath !== "function") {
       return { ready: false, reason: "electron_user_data_unavailable" };
     }
@@ -979,6 +1025,25 @@ function isRadiantLyricsObserverGenerationCurrent(generation) {
 }
 
 const SERVICE_STARTUP_STATE_KEY = Symbol.for("omniphony-ex.service-startup-state");
+const SERVICE_SUPERVISOR_CHANNEL_ATTRIBUTE = "data-omniphony-service-supervisor-channel";
+
+function getSharedServiceSupervisorChannel(sharedState = null) {
+  const state = sharedState || globalThis[SERVICE_STARTUP_STATE_KEY];
+  let channel = state?.nativeChannel;
+  if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) {
+    try { channel = document.documentElement?.getAttribute(SERVICE_SUPERVISOR_CHANNEL_ATTRIBUTE) || null; }
+    catch (_) { channel = null; }
+  }
+  if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) return null;
+  if (state) state.nativeChannel = channel;
+  return channel;
+}
+
+function retainSharedServiceSupervisorChannel(channel, sharedState) {
+  sharedState.nativeChannel = channel;
+  try { document.documentElement?.setAttribute(SERVICE_SUPERVISOR_CHANNEL_ATTRIBUTE, channel); }
+  catch (_) {}
+}
 
 function getConfiguredRuntimePaths() {
   try {
@@ -1005,14 +1070,18 @@ async function ensureLocalOmniFusionService() {
     }
 
     try {
-      const channel = await ipc.invoke(
-        "__Luna.registerNative",
-        NATIVE_SERVICE_SUPERVISOR_MODULE_ID,
-        NATIVE_SERVICE_SUPERVISOR_MODULE_CODE,
-      );
+      let channel = getSharedServiceSupervisorChannel(sharedState);
+      if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) {
+        channel = await ipc.invoke(
+          "__Luna.registerNative",
+          NATIVE_SERVICE_SUPERVISOR_MODULE_ID,
+          NATIVE_SERVICE_SUPERVISOR_MODULE_CODE,
+        );
+      }
       if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) {
         throw new Error("TidaLuna did not return the native service-supervisor IPC channel");
       }
+      retainSharedServiceSupervisorChannel(channel, sharedState);
       const result = await ipc.invoke(
         channel,
         "ensureService",
@@ -1045,6 +1114,37 @@ async function ensureLocalOmniFusionService() {
     sharedState.starting = false;
     sharedState.promise = null;
   }
+}
+
+async function startEclipseLoginWithNativeSupervisor() {
+  const ipc = window?.__ipcRenderer;
+  if (typeof ipc?.invoke !== "function") throw new Error("TidaLuna native IPC is unavailable");
+  const sharedState = globalThis[SERVICE_STARTUP_STATE_KEY] ||
+    (globalThis[SERVICE_STARTUP_STATE_KEY] = { starting: false, promise: null });
+  let channel = getSharedServiceSupervisorChannel(sharedState);
+  if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) {
+    channel = await ipc.invoke(
+      "__Luna.registerNative",
+      NATIVE_SERVICE_SUPERVISOR_MODULE_ID,
+      NATIVE_SERVICE_SUPERVISOR_MODULE_CODE,
+    );
+    if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) {
+      throw new Error("TidaLuna did not return the native service-supervisor IPC channel");
+    }
+    retainSharedServiceSupervisorChannel(channel, sharedState);
+  }
+  if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) {
+    throw new Error("TidaLuna did not retain the native service-supervisor IPC channel");
+  }
+  const result = await ipc.invoke(
+    channel,
+    "startEclipseLogin",
+    API_BASE,
+    REQUIRED_SERVICE_VERSION,
+    getConfiguredRuntimePaths(),
+  );
+  if (result?.started !== true) throw new Error(result?.error || "Eclipse sign-in could not be opened");
+  return { ipc, channel };
 }
 
 function onLoad() {
@@ -7554,22 +7654,12 @@ function toggleSettingsPanel() {
     eclipseAuthStatus.textContent = "Opening Eclipse’s official Discord sign-in…";
     eclipseAuthStatus.style.color = "#aaa";
     try {
-      const ipc = window?.__ipcRenderer;
-      if (typeof ipc?.invoke !== "function") throw new Error("TidaLuna native IPC is unavailable");
-      if (!eclipseAuthNativeChannel) {
-        eclipseAuthNativeChannel = await ipc.invoke("__Luna.registerNative", NATIVE_ECLIPSE_AUTH_MODULE_ID, NATIVE_ECLIPSE_AUTH_MODULE_CODE);
-        if (typeof eclipseAuthNativeChannel !== "string" || !eclipseAuthNativeChannel.startsWith("__LunaNative.")) {
-          eclipseAuthNativeChannel = null;
-          throw new Error("TidaLuna did not create the Eclipse sign-in window handler");
-        }
-        unloads.add(() => {
-          const channel = eclipseAuthNativeChannel;
-          eclipseAuthNativeChannel = null;
-          if (channel) void ipc.invoke(channel, "closeLogin").catch(() => {});
-        });
-      }
-      const result = await ipc.invoke(eclipseAuthNativeChannel, "startLogin", API_BASE);
-      if (result?.started !== true) throw new Error(result?.error || "Eclipse sign-in could not be opened");
+      const { ipc, channel } = await startEclipseLoginWithNativeSupervisor();
+      eclipseAuthNativeChannel = channel;
+      unloads.add(() => {
+        eclipseAuthNativeChannel = null;
+        void ipc.invoke(channel, "closeEclipseLogin").catch(() => {});
+      });
       eclipseAuthStatus.textContent = "Sign in to Eclipse with Discord in the window that opened. The account will be verified before it is saved.";
       if (eclipseAuthStatusTimer) clearInterval(eclipseAuthStatusTimer);
       eclipseAuthStatusTimer = setInterval(updateEclipseAuthStatus, 2000);
@@ -7951,7 +8041,6 @@ export const Settings = () => {
   const [providerOrder, setProviderOrder] = React.useState([]);
   const [providerStatus, setProviderStatus] = React.useState("Loading TIDAL and Eclipse providers…");
   const [eclipseAccountStatus, setEclipseAccountStatus] = React.useState("Checking Eclipse account…");
-  const [eclipseNativeChannel, setEclipseNativeChannel] = React.useState(null);
   const providerOrderRef = React.useRef([]);
   const providerSaveQueue = React.useRef(Promise.resolve());
   const providerMutationSequence = React.useRef(0);
@@ -8039,16 +8128,7 @@ export const Settings = () => {
     eclipseAccountRequestRef.current++;
     eclipseAccountInFlightRef.current = false;
     try {
-      const ipc = window?.__ipcRenderer;
-      if (typeof ipc?.invoke !== "function") throw new Error("TidaLuna native IPC is unavailable");
-      let channel = eclipseNativeChannel;
-      if (!channel) {
-        channel = await ipc.invoke("__Luna.registerNative", NATIVE_ECLIPSE_AUTH_MODULE_ID, NATIVE_ECLIPSE_AUTH_MODULE_CODE);
-        if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) throw new Error("TidaLuna did not create the Eclipse sign-in handler");
-        setEclipseNativeChannel(channel);
-      }
-      const result = await ipc.invoke(channel, "startLogin", API_BASE);
-      if (result?.started !== true) throw new Error(result?.error || "Eclipse sign-in could not be opened");
+      await startEclipseLoginWithNativeSupervisor();
       setEclipseAccountStatus("Complete the official Eclipse Discord sign-in in the window that opened.");
       if (eclipseConnectPollRef.current) clearInterval(eclipseConnectPollRef.current);
       eclipseConnectPollRef.current = setInterval(async () => {
@@ -8072,7 +8152,7 @@ export const Settings = () => {
     } catch (error) {
       setEclipseAccountStatus(error?.message || "Could not open Eclipse sign-in.");
     }
-  }, [eclipseNativeChannel, refreshEclipseAccount]);
+  }, [refreshEclipseAccount]);
 
   React.useEffect(() => {
     void refreshEclipseAccount();

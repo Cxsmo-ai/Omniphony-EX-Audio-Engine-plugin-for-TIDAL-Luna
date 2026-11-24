@@ -76,8 +76,7 @@ const sandbox = {
   setTimeout,
   clearTimeout,
 };
-const serviceIdentityKey = Symbol.for("omniphony-ex.native-service-supervisor");
-sandbox[serviceIdentityKey] = { shutdownToken: "a".repeat(64), serviceInstanceId: "service-instance-test" };
+const serviceIdentity = { shutdownToken: "a".repeat(64), serviceInstanceId: "service-instance-test" };
 import crypto from "node:crypto";
 const awaitlessCrypto = crypto;
 vm.runInNewContext(moduleCode, sandbox);
@@ -87,13 +86,13 @@ const invalidOrigin = await handler.startLogin("http://example.com:8765");
 assert.deepEqual(JSON.parse(JSON.stringify(invalidOrigin)), { started: false, error: "invalid_service_origin" });
 assert.equal(requests.length, 0, "invalid local service origins do not receive credentials");
 
-sandbox[serviceIdentityKey] = { shutdownToken: null, serviceInstanceId: "service-instance-test" };
-const unavailableIdentity = await handler.startLogin("http://127.0.0.1:8765");
+const unavailableIdentity = await handler.startLogin("http://127.0.0.1:8765", {
+  shutdownToken: null,
+  serviceInstanceId: "service-instance-test",
+});
 assert.deepEqual(JSON.parse(JSON.stringify(unavailableIdentity)), { started: false, error: "service_identity_unavailable" });
 assert.equal(requests.length, 0, "auth credentials are never posted without the current service identity");
-sandbox[serviceIdentityKey] = { shutdownToken: "a".repeat(64), serviceInstanceId: "service-instance-test" };
-
-const start = await handler.startLogin("http://127.0.0.1:8765");
+const start = await handler.startLogin("http://127.0.0.1:8765/", serviceIdentity);
 assert.equal(start.started, true);
 assert.equal(windows.length, 1);
 assert.equal(windows[0].url, "https://api.eclipsemusic.app/api/auth/mobile/discord");

@@ -14,10 +14,19 @@ const testServiceVersion = "2.1.36";
 const runtimeBundleVersion = moduleSource.match(
   /const bundledRuntimeRoot = path\.join\(pluginRoot, "runtime-bundles", "([^"]+)"\);/,
 )?.[1];
-const supervisorCode = moduleSource.match(
+const nativeAuthModuleCode = moduleSource.match(
+  /const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String\.raw`([\s\S]*?)`;/,
+)?.[1];
+const supervisorCodeTemplate = moduleSource.match(
   /const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String\.raw`([\s\S]*?)`;/,
 )?.[1];
+const supervisorCode = supervisorCodeTemplate?.replace(
+  "${NATIVE_ECLIPSE_AUTH_MODULE_CODE_JSON}",
+  JSON.stringify(nativeAuthModuleCode),
+);
 assert.ok(supervisorCode, "the native service supervisor is embedded in the plugin entrypoint");
+assert.match(supervisorCode, /async startEclipseLogin\(serviceBase, requiredVersion, runtimeConfig = \{\}\)[\s\S]*?module\.exports\.ensureService\(requiredVersion, runtimeConfig\)/,
+  "Eclipse authentication ensures and uses the service identity in one native-module context");
 assert.ok(pluginVersion, "the plugin build version is declared in the canonical entrypoint");
 assert.ok(runtimeBundleVersion, "the separately versioned API runtime bundle is declared in the supervisor");
 assert.match(legacyBootstrapSource, /^\/\/ Compatibility entrypoint:[\s\S]*export \* from ["']\.\/omniphony\.mjs["'];?\s*$/,
@@ -29,6 +38,16 @@ assert.doesNotMatch(
   /path\.join\(path\.dirname\(studioExe\),\s*['"]orender\.exe['"]\)/,
   "in-process orender.dll playback must not require the standalone renderer executable",
 );
+assert.match(moduleSource, /async function startEclipseLoginWithNativeSupervisor\(\)[\s\S]*?ipc\.invoke\([\s\S]*?channel,[\s\S]*?"startEclipseLogin",[\s\S]*?API_BASE,[\s\S]*?REQUIRED_SERVICE_VERSION,[\s\S]*?getConfiguredRuntimePaths\(\)/,
+  "Eclipse sign-in and service startup are routed through one native supervisor call");
+assert.equal((moduleSource.match(/startEclipseLoginWithNativeSupervisor\(\)/g) || []).length, 3,
+  "both Eclipse account controls use the shared native supervisor login path");
+assert.doesNotMatch(moduleSource, /NATIVE_ECLIPSE_AUTH_MODULE_ID|"startLogin", API_BASE/,
+  "no stale renderer-side auth module registration can bypass the service-owning supervisor");
+assert.match(moduleSource, /getAttribute\(SERVICE_SUPERVISOR_CHANNEL_ATTRIBUTE\)/,
+  "plugin contexts recover the service-owning native channel from their shared TIDAL document");
+assert.match(moduleSource, /setAttribute\(SERVICE_SUPERVISOR_CHANNEL_ATTRIBUTE, channel\)/,
+  "the service-owning native channel is published without exposing its authentication token");
 
 function touch(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -151,8 +170,10 @@ function makeHarness({
     },
   };
   const module = { exports: {} };
+  const luna = { modules: {} };
   const sandbox = {
     module,
+    luna,
     process: { pid: processPid, env: {} },
     URL,
     setTimeout: (callback) => queueMicrotask(callback),
@@ -227,11 +248,52 @@ function makeHarness({
     children,
     syncCalls,
     loseSupervisorToken: () => {
-      vm.runInContext('globalThis[Symbol.for("omniphony-ex.native-service-supervisor")].shutdownToken = null', sandbox);
+      luna["__omniphony-ex.native-service-supervisor"].shutdownToken = null;
+    },
+    reRegisterSupervisor: () => {
+      const reloadedModule = { exports: {} };
+      const reloadedSandbox = { ...sandbox, module: reloadedModule };
+      vm.createContext(reloadedSandbox);
+      vm.runInContext(supervisorCode, reloadedSandbox, { filename: "service-supervisor.native.js" });
+      return {
+        ensure: () => reloadedModule.exports.ensureService(testServiceVersion, {}),
+        startEclipseLogin: (serviceBase) => reloadedModule.exports.startEclipseLogin(serviceBase, testServiceVersion, {}),
+      };
     },
     cleanup: () => fs.rmSync(userData, { recursive: true, force: true }),
     ensure: () => module.exports.ensureService(testServiceVersion, {}),
+    startEclipseLogin: (serviceBase) => module.exports.startEclipseLogin(serviceBase, testServiceVersion, {}),
   };
+}
+
+{
+  const harness = makeHarness({ healthResponses: [null] });
+  try {
+    const ready = await harness.ensure();
+    assert.equal(ready.ready, true);
+    const result = await harness.startEclipseLogin("https://127.0.0.1:8765/");
+    assert.equal(result.error, "invalid_service_origin",
+      "the supervisor passes its live service identity into the auth module before URL validation");
+    const reloaded = harness.reRegisterSupervisor();
+    assert.equal((await reloaded.ensure()).ready, true,
+      "native module re-registration shares the live service owner state through Luna's process-wide object");
+    assert.equal((await reloaded.startEclipseLogin("https://127.0.0.1:8765/")).error, "invalid_service_origin");
+    assert.equal(harness.spawned.length, 1, "re-registration reuses the exact owned service rather than duplicating it");
+  } finally {
+    harness.cleanup();
+  }
+}
+
+{
+  const harness = makeHarness({ healthResponses: [null] });
+  try {
+    const result = await harness.startEclipseLogin("https://127.0.0.1:8765/");
+    assert.equal(result.error, "invalid_service_origin");
+    assert.equal(harness.spawned.length, 1,
+      "the sign-in IPC call starts its own service before attempting authentication");
+  } finally {
+    harness.cleanup();
+  }
 }
 
 {
