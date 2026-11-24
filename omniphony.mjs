@@ -21,17 +21,18 @@ function eclipseAuthFailureMessage(reason) {
     unauthorized: "Eclipse rejected the sign-in token. Confirm the Discord flow completed, then try Connect again.",
     synthetic_account_rejected: "A saved test account was rejected. Connect again with your Eclipse account.",
     invalid_identity: "Eclipse did not return a verifiable account identity. Retry the sign-in.",
+    identity_mismatch: "Eclipse’s Discord callback and verified account did not match. Retry the sign-in.",
     session_cleanup_failed: "The invalid Eclipse session could not be removed from secure storage. Disconnect and retry.",
     account_not_verified: "Eclipse returned a token that could not be verified for this account.",
     verification_failed: "Eclipse account verification failed. Try again in a moment.",
     verification_unavailable: "Could not reach Eclipse to verify the account. Check your connection and retry.",
-    callback_missing: "Eclipse returned from Discord without the account token needed to finish sign-in. Retry; if this repeats, Eclipse must provide the supported account handoff.",
+    callback_missing: "Eclipse’s Android Discord flow returned without the required account fields. Retry the sign-in.",
     oauth_denied: "Eclipse or Discord did not complete the sign-in approval. Retry the Discord sign-in.",
     oauth_cancelled: "The Eclipse sign-in window was closed before authorization finished.",
     secure_storage_unavailable: "The verified account could not be saved with Windows secure storage.",
     account_changed: "The account changed during verification. Start sign-in again.",
     invalid_token: "Eclipse returned an invalid sign-in token. Start sign-in again.",
-    unsupported_account_integration: "Eclipse has not documented a supported third-party account sign-in flow. Account linking is disabled until one is available.",
+    unsupported_account_integration: "Eclipse account sign-in is unavailable in this plugin build.",
   };
   return messages[reason] || "Eclipse sign-in returned to the login page without completing. Try again; if it repeats, share the displayed status with support.";
 }
@@ -42,8 +43,8 @@ function normalizeRealmaxSourceMode(value) {
 }
 const REQUIRED_SERVICE_VERSION = "2.1.43";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const ECLIPSE_ACCOUNT_LINKING_SUPPORTED = false;
-const PLUGIN_BUILD = "2.1.67";
+const ECLIPSE_ACCOUNT_LINKING_SUPPORTED = true;
+const PLUGIN_BUILD = "2.1.68";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -129,10 +130,215 @@ const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
 };`;
 const NATIVE_ECLIPSE_AUTH_MODULE_ID = "OmniphonyEX/eclipse-auth.native.js";
 const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
-  async startLogin() {
-    return { started: false, error: "unsupported_account_integration" };
+  async startLogin(serviceBase) {
+    const crypto = require("crypto");
+    const http = require("http");
+    const { BrowserWindow, session } = require("electron");
+    let parsedBase;
+    try { parsedBase = new URL(String(serviceBase || "")); } catch (_) {
+      return { started: false, error: "invalid_service_origin" };
+    }
+    if (parsedBase.protocol !== "http:" || parsedBase.hostname !== "127.0.0.1"
+      || parsedBase.port !== "8765" || parsedBase.pathname !== "/" || parsedBase.search || parsedBase.hash) {
+      return { started: false, error: "invalid_service_origin" };
+    }
+    if (globalThis.__omniphonyEclipseLogin) return { started: false, error: "login_in_progress" };
+
+    const attemptId = crypto.randomBytes(16).toString("hex");
+    const serviceSupervisor = globalThis[Symbol.for("omniphony-ex.native-service-supervisor")];
+    const serviceToken = serviceSupervisor?.shutdownToken;
+    const serviceInstanceId = serviceSupervisor?.serviceInstanceId;
+    if (typeof serviceToken !== "string" || !serviceToken
+      || typeof serviceInstanceId !== "string" || !serviceInstanceId) {
+      return { started: false, error: "service_identity_unavailable" };
+    }
+    const postJson = (route, payload) => new Promise((resolve, reject) => {
+      const body = Buffer.from(JSON.stringify(payload), "utf8");
+      const request = http.request({
+        hostname: "127.0.0.1",
+        port: 8765,
+        method: "POST",
+        path: route,
+        headers: {
+          Origin: "http://127.0.0.1:8765",
+          Authorization: "Bearer " + serviceToken,
+          "X-Omniphony-Service-Instance": serviceInstanceId,
+          "Content-Type": "application/json",
+          "Content-Length": body.length,
+        },
+      }, (response) => {
+        let data = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => { data += chunk; });
+        response.on("end", () => {
+          let result = {};
+          try { result = data ? JSON.parse(data) : {}; } catch (_) {}
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            const error = new Error("Eclipse account service rejected the request");
+            error.statusCode = response.statusCode;
+            reject(error);
+            return;
+          }
+          resolve(result);
+        });
+      });
+      request.setTimeout(8000, () => request.destroy(new Error("Eclipse account service timed out")));
+      request.on("error", reject);
+      request.end(body);
+    });
+
+    const loginState = {
+      attemptId,
+      windows: new Set(),
+      authSession: null,
+      finishing: false,
+      timer: null,
+      finish: null,
+    };
+    globalThis.__omniphonyEclipseLogin = loginState;
+
+    const callbackUrl = (value) => {
+      try {
+        const url = new URL(value);
+        return url.protocol === "debridmusic:" && url.hostname === "auth"
+          && url.pathname === "/callback" && !url.username && !url.password && !url.port;
+      } catch (_) { return false; }
+    };
+    const allowedHttpsUrl = (value) => {
+      try {
+        const url = new URL(value);
+        return url.protocol === "https:" && !url.username && !url.password
+          && ["api.eclipsemusic.app", "discord.com", "discordapp.com", "discordapp.net"].includes(url.hostname.toLowerCase());
+      } catch (_) { return false; }
+    };
+    const clearLogin = () => {
+      if (loginState.timer) clearTimeout(loginState.timer);
+      for (const window of [...loginState.windows]) {
+        try { if (!window.isDestroyed()) window.close(); } catch (_) {}
+      }
+      loginState.windows.clear();
+      if (loginState.authSession) {
+        Promise.resolve(loginState.authSession.clearStorageData()).catch(() => {});
+        if (typeof loginState.authSession.clearCache === "function") {
+          Promise.resolve(loginState.authSession.clearCache()).catch(() => {});
+        }
+      }
+      if (globalThis.__omniphonyEclipseLogin === loginState) delete globalThis.__omniphonyEclipseLogin;
+    };
+    loginState.finish = async (reason, callback) => {
+      if (loginState.finishing) return;
+      loginState.finishing = true;
+      try {
+        if (callback) {
+          const response = await postJson("/eclipse-auth/complete", {
+            token: callback.token,
+            userId: callback.userId,
+            email: callback.email,
+            attemptId,
+          });
+          if (response.connected !== true) throw new Error("Eclipse account verification failed");
+        } else if (reason) {
+          await postJson("/eclipse-auth/flow-status", { reason, attemptId }).catch(() => {});
+        }
+      } catch (_) {
+        await postJson("/eclipse-auth/flow-status", { reason: "oauth_cancelled", attemptId }).catch(() => {});
+      } finally {
+        clearLogin();
+      }
+    };
+    const handleCallback = (value, sourceWindow, isMainFrame = true) => {
+      // The Android APK receives this exact custom-scheme callback through its
+      // manifest intent filter. In the desktop adapter the redirect can come
+      // from either provider or Eclipse's callback page, so trust only a main
+      // frame in this isolated, allowlisted login window and the exact URI.
+      if (!callbackUrl(value) || loginState.finishing || !isMainFrame
+        || !sourceWindow?.webContents || !loginState.windows.has(sourceWindow)) return false;
+      let url;
+      try { url = new URL(value); } catch (_) { return false; }
+      const query = url.searchParams;
+      if (query.has("error")) {
+        void loginState.finish("oauth_denied");
+        return true;
+      }
+      const token = query.get("token");
+      const userId = query.get("userId");
+      const email = query.get("email");
+      const validField = (field, max) => typeof field === "string" && field.length > 0
+        && field.length <= max && !/[\u0000-\u001f\u007f]/.test(field);
+      if (!validField(token, 8192) || !validField(userId, 512) || !validField(email, 512)) {
+        void loginState.finish("callback_missing");
+        return true;
+      }
+      void loginState.finish(null, { token, userId, email });
+      return true;
+    };
+    const secureOptions = {
+      partition: "temp:omniphony-eclipse-" + attemptId,
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      webviewTag: false,
+    };
+    const createWindow = (url, parent) => {
+      const window = new BrowserWindow({
+        parent: parent || undefined,
+        width: 520,
+        height: 760,
+        minWidth: 420,
+        minHeight: 560,
+        show: true,
+        autoHideMenuBar: true,
+        title: "Sign in to Eclipse with Discord",
+        webPreferences: { ...secureOptions },
+      });
+      loginState.windows.add(window);
+      window.webContents.setWindowOpenHandler(({ url: destination }) => {
+        if (allowedHttpsUrl(destination)) {
+          createWindow(destination, window);
+        }
+        return { action: "deny" };
+      });
+      const guardNavigation = (event, destination, _isInPlace, isMainFrame = true) => {
+        if (handleCallback(destination, window, event.isMainFrame !== false && isMainFrame !== false)) {
+          event.preventDefault();
+          return;
+        }
+        if (!allowedHttpsUrl(destination)) event.preventDefault();
+      };
+      window.webContents.on("will-navigate", guardNavigation);
+      window.webContents.on("will-redirect", guardNavigation);
+      window.on("closed", () => {
+        loginState.windows.delete(window);
+        if (loginState.windows.size === 0 && !loginState.finishing) {
+          void loginState.finish("oauth_cancelled");
+        }
+      });
+      window.loadURL(url).catch(() => {
+        if (!loginState.finishing) void loginState.finish("oauth_denied");
+      });
+      return window;
+    };
+
+    try {
+      loginState.authSession = session.fromPartition(secureOptions.partition, { cache: false });
+      const started = await postJson("/eclipse-auth/flow-status", { reason: "started", attemptId });
+      if (started.recorded !== true) throw new Error("Eclipse account service did not start the sign-in attempt");
+      createWindow("https://api.eclipsemusic.app/api/auth/mobile/discord");
+      loginState.timer = setTimeout(() => {
+        if (!loginState.finishing) void loginState.finish("oauth_cancelled");
+      }, 15 * 60 * 1000);
+      return { started: true };
+    } catch (_) {
+      await postJson("/eclipse-auth/flow-status", { reason: "oauth_cancelled", attemptId }).catch(() => {});
+      clearLogin();
+      return { started: false, error: "login_window_unavailable" };
+    }
   },
   async closeLogin() {
+    const loginState = globalThis.__omniphonyEclipseLogin;
+    if (loginState?.finish && !loginState.finishing) await loginState.finish("oauth_cancelled");
     return { closed: true };
   },
 };`;
@@ -178,11 +384,11 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.67");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.68");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.67/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "1FF283E770ECCAB7E21749532097E5D55A66EFAE6AB18B43CACB8E16F47AA322";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.68/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "D1ACD5BD3C90084BC227A10EE80C3FDA02F05365A3CA7E0A31402A2A892A9031";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -254,7 +460,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.67"
+        return marker.pluginVersion === "2.1.68"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -323,7 +529,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.67", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.68", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();

@@ -4370,7 +4370,7 @@ _ECLIPSE_AUTH_CACHE: dict[str, object] = {
 _ECLIPSE_AUTH_GENERATION = 0
 ECLIPSE_SESSION_FILE = CONFIG_DIR / "eclipse-session.json"
 ECLIPSE_AUTH_VERIFY_URL = "https://api.eclipsemusic.app/api/auth/mobile/verify"
-ECLIPSE_ACCOUNT_LINKING_SUPPORTED = False
+ECLIPSE_ACCOUNT_LINKING_SUPPORTED = True
 _ECLIPSE_ACCOUNT_STATUS: dict[str, object] = {"user": None, "checked_at": 0.0, "session_mtime": None}
 _ECLIPSE_LAST_LOGIN_ERROR: str | None = None
 _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID: str | None = None
@@ -4592,7 +4592,12 @@ def _verify_eclipse_account_token(token: str) -> tuple[bool, dict | None, str | 
     return True, user, replacement
 
 
-def _complete_eclipse_login(token: str, attempt_id: str | None = None) -> tuple[bool, dict | None, str | None]:
+def _complete_eclipse_login(
+    token: str,
+    attempt_id: str | None = None,
+    callback_user_id: str | None = None,
+    callback_email: str | None = None,
+) -> tuple[bool, dict | None, str | None]:
     global _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID, _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_STARTED_AT
     global _ECLIPSE_LAST_LOGIN_ERROR, _ECLIPSE_ACCOUNT_SESSION_GENERATION
     if not ECLIPSE_ACCOUNT_LINKING_SUPPORTED:
@@ -4608,6 +4613,14 @@ def _complete_eclipse_login(token: str, attempt_id: str | None = None) -> tuple[
     valid, user, replacement = _verify_eclipse_account_token(token)
     if not valid:
         return False, None, replacement
+    if callback_user_id is not None or callback_email is not None:
+        verified_user_id = user.get("id") or user.get("userId")
+        verified_email = user.get("email")
+        if (not isinstance(callback_user_id, str) or not isinstance(callback_email, str)
+                or not isinstance(verified_user_id, str) or not isinstance(verified_email, str)
+                or callback_user_id != verified_user_id
+                or callback_email.casefold() != verified_email.casefold()):
+            return False, None, "identity_mismatch"
     saved_token = replacement.strip() if isinstance(replacement, str) and replacement.strip() else token
     with _ECLIPSE_AUTH_LOCK:
         if _ECLIPSE_AUTH_GENERATION != auth_generation:
@@ -7562,6 +7575,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         if self.reject_untrusted_origin(require_origin=True):
             return
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in {"/eclipse-auth/complete", "/eclipse-auth/flow-status"}:
+            if not eclipse_native_request_authorized(self.headers):
+                return self.send_json({"error": "Eclipse sign-in request authorization failed"}, status=403)
         if parsed.path == "/shutdown":
             if not shutdown_request_authorized(self.headers):
                 return self.send_json({"error": "service shutdown authorization failed"}, status=403)
@@ -7594,15 +7610,26 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     "error": "unsupported_account_integration",
                 }, status=501)
             token = body.get("token")
+            callback_user_id = body.get("userId")
+            callback_email = body.get("email")
             attempt_id = body.get("attemptId")
             if not isinstance(token, str) or not token.strip():
                 return self.send_json({"connected": False, "error": "missing account token"}, status=400)
+            if (not isinstance(callback_user_id, str) or not callback_user_id.strip()
+                    or len(callback_user_id) > 512
+                    or any(ord(char) < 0x20 or ord(char) == 0x7F for char in callback_user_id)
+                    or not isinstance(callback_email, str) or not callback_email.strip()
+                    or len(callback_email) > 512
+                    or any(ord(char) < 0x20 or ord(char) == 0x7F for char in callback_email)):
+                return self.send_json({"connected": False, "error": "invalid callback identity"}, status=400)
             if not isinstance(attempt_id, str) or not re.fullmatch(r"[a-f0-9]{32}", attempt_id):
                 return self.send_json({"connected": False, "error": "invalid login attempt"}, status=400)
             with _ECLIPSE_AUTH_LOCK:
                 if _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID != attempt_id:
                     return self.send_json({"connected": False, "error": "stale_login_attempt"}, status=409)
-            connected, user, error = _complete_eclipse_login(token.strip(), attempt_id)
+            connected, user, error = _complete_eclipse_login(
+                token.strip(), attempt_id, callback_user_id.strip(), callback_email.strip()
+            )
             if not connected:
                 with _ECLIPSE_AUTH_LOCK:
                     if _ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID != attempt_id:
@@ -7610,7 +7637,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     _ECLIPSE_LAST_LOGIN_ERROR = error or "verification_failed"
                     _finalize_eclipse_login_attempt_locked(attempt_id)
             if not connected:
-                status = 401 if error in {"unauthorized", "synthetic_account_rejected", "account_not_verified", "invalid_token"} else 502
+                status = 401 if error in {
+                    "unauthorized", "synthetic_account_rejected", "account_not_verified",
+                    "invalid_token", "identity_mismatch",
+                } else 502
                 return self.send_json({"connected": False, "error": error}, status=status)
             return self.send_json({"connected": True, "user": user})
 
@@ -8690,6 +8720,11 @@ def shutdown_request_authorized(headers):
         and hmac.compare_digest(supplied_token, SHUTDOWN_TOKEN)
         and hmac.compare_digest(supplied_instance, SERVICE_INSTANCE_ID)
     )
+
+
+def eclipse_native_request_authorized(headers):
+    """Require the current native supervisor's per-launch service credential."""
+    return shutdown_request_authorized(headers)
 
 
 def _tidal_process_create_time(pid):

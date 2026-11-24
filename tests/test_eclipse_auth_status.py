@@ -1,9 +1,12 @@
 import io
 import json
+import socketserver
 import sys
+import threading
 import time
 from pathlib import Path
 import urllib.error
+import urllib.request
 from unittest.mock import patch
 import pytest
 
@@ -16,33 +19,105 @@ import omnifusion_service as service
 
 
 @pytest.fixture(autouse=True)
-def enable_experimental_auth_helpers_for_unit_tests(monkeypatch):
-    """Exercise dormant auth helpers explicitly; the shipped integration stays disabled."""
+def enable_experimental_auth_helpers_for_unit_tests(monkeypatch, tmp_path):
+    """Exercise the APK-backed flow while keeping each test off the user's session file."""
     monkeypatch.setattr(service, "ECLIPSE_ACCOUNT_LINKING_SUPPORTED", True)
+    monkeypatch.setattr(service, "ECLIPSE_SESSION_FILE", tmp_path / "eclipse-session.json")
 
 
-def test_undocumented_account_handoff_is_disabled_without_network(monkeypatch):
-    monkeypatch.setattr(service, "ECLIPSE_ACCOUNT_LINKING_SUPPORTED", False)
-    with patch.object(service, "_eclipse_authenticated_urlopen", side_effect=AssertionError("network call must be gated")), \
-            patch.object(service, "_verify_eclipse_account_token", side_effect=AssertionError("token verification must be gated")), \
-            patch.object(service, "_read_eclipse_session", side_effect=AssertionError("saved token must not be loaded")):
-        assert service.eclipse_account_status() == {
-            "connected": False,
-            "available": False,
-            "user": None,
-            "reason": "unsupported_account_integration",
-        }
-        assert service._get_eclipse_jwt() is None
-        assert service.eclipse_account_addons() == {
-            "connected": False,
-            "available": False,
-            "addons": [],
-            "order": [],
-            "reason": "unsupported_account_integration",
-        }
-        assert service._complete_eclipse_login("opaque-token", "a" * 32) == (
-            False, None, "unsupported_account_integration"
+def test_apk_backed_account_linking_is_enabled():
+    assert service.ECLIPSE_ACCOUNT_LINKING_SUPPORTED is True
+
+
+def test_apk_callback_identity_must_match_verified_token(monkeypatch):
+    attempt_id = "f" * 32
+    monkeypatch.setattr(service, "_ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID", attempt_id)
+    monkeypatch.setattr(service, "_ECLIPSE_ACTIVE_LOGIN_ATTEMPT_STARTED_AT", time.time())
+    with patch.object(
+        service,
+        "_verify_eclipse_account_token",
+        return_value=(True, {"id": "verified-user", "email": "user@example.com"}, None),
+    ), patch.object(service, "_write_eclipse_session") as save_session:
+        connected, user, error = service._complete_eclipse_login(
+            "verified-token", attempt_id, "different-user", "user@example.com"
         )
+    assert connected is False
+    assert user is None
+    assert error == "identity_mismatch"
+    save_session.assert_not_called()
+
+
+def test_apk_login_posts_require_current_native_service_credential(monkeypatch):
+    shutdown_token = "a" * 64
+    service_instance_id = "service-instance-test"
+    monkeypatch.setattr(service, "SHUTDOWN_TOKEN", shutdown_token)
+    monkeypatch.setattr(service, "SERVICE_INSTANCE_ID", service_instance_id)
+    monkeypatch.setattr(service, "_ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID", None)
+    monkeypatch.setattr(service, "_ECLIPSE_ACTIVE_LOGIN_ATTEMPT_STARTED_AT", 0.0)
+    monkeypatch.setattr(service, "_ECLIPSE_FINALIZED_LOGIN_ATTEMPTS", {})
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), service.RequestHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    attempt_id = "e" * 32
+
+    def post(route, body, extra_headers=None):
+        headers = {"Origin": base_url, "Content-Type": "application/json"}
+        headers.update(extra_headers or {})
+        request = urllib.request.Request(
+            base_url + route,
+            data=json.dumps(body).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read().decode("utf-8"))
+
+    headers = {
+        "Authorization": f"Bearer {shutdown_token}",
+        "X-Omniphony-Service-Instance": service_instance_id,
+    }
+    try:
+        flow_body = {"reason": "started", "attemptId": attempt_id}
+        completion_body = {
+            "token": "apk-returned-token",
+            "userId": "account-id",
+            "email": "listener@example.test",
+            "attemptId": attempt_id,
+        }
+        assert post("/eclipse-auth/flow-status", flow_body)[0] == 403
+        assert post("/eclipse-auth/flow-status", flow_body, {
+            **headers,
+            "Authorization": "Bearer " + "b" * 64,
+        })[0] == 403
+        assert post("/eclipse-auth/flow-status", flow_body, {
+            **headers,
+            "X-Omniphony-Service-Instance": "another-service",
+        })[0] == 403
+        assert service._ECLIPSE_ACTIVE_LOGIN_ATTEMPT_ID is None
+
+        assert post("/eclipse-auth/flow-status", flow_body, headers) == (200, {"recorded": True})
+        assert post("/eclipse-auth/complete", completion_body)[0] == 403
+        with patch.object(
+            service,
+            "_complete_eclipse_login",
+            return_value=(True, {"id": "account-id"}, None),
+        ) as complete_login:
+            status, result = post("/eclipse-auth/complete", completion_body, headers)
+        assert status == 200
+        assert result == {"connected": True, "user": {"id": "account-id"}}
+        complete_login.assert_called_once_with(
+            "apk-returned-token", attempt_id, "account-id", "listener@example.test"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
 
 
 def test_failed_login_status_is_visible_while_old_session_remains_connected():
