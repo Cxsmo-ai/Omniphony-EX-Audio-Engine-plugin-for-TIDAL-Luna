@@ -17,6 +17,7 @@ assert.match(moduleCode, /sandbox:\s*true/);
 
 const nativeRequests = [];
 let lastWindow;
+let nextAuthResponse = { statusCode: 200, body: '{"connected":true}' };
 class FakeWebContents extends EventEmitter {
   constructor() {
     super();
@@ -50,10 +51,10 @@ const electron = {
       request.end = () => {
         nativeRequests.push({ options, body: JSON.parse(body) });
         const response = new EventEmitter();
-        response.statusCode = 200;
+        response.statusCode = nextAuthResponse.statusCode;
         queueMicrotask(() => {
           request.emit("response", response);
-          response.emit("data", Buffer.from('{"connected":true}'));
+          response.emit("data", Buffer.from(nextAuthResponse.body));
           response.emit("end");
         });
       };
@@ -99,7 +100,20 @@ assert.deepEqual(nativeRequests[0].body, { token: "secret-test-eclipse-token" })
 assert.equal(lastWindow.destroyed, true, "the ephemeral login window closes after the token is verified");
 assert.equal(lastWindow.webContents.sessionCleared, true, "the temporary browser session is cleared after login");
 
+nextAuthResponse = { statusCode: 401, body: '{"connected":false,"error":"unauthorized"}' };
+await handler.startLogin("http://127.0.0.1:8765");
+const failedWindow = lastWindow;
+failedWindow.webContents.emit("will-redirect", { preventDefault() {} },
+  "https://eclipsemusic.app/sign-in?token=another-test-token");
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(failedWindow.destroyed, false, "the failed auth window remains available for diagnosis");
+assert.equal(failedWindow.title, "Eclipse sign-in failed: unauthorized", "the safe server error is visible instead of being erased by a login reload");
+assert.equal(failedWindow.url, "https://eclipsemusic.app/sign-in", "a failed verification does not silently reload the sign-in page");
+assert.deepEqual(nativeRequests[1].body, { token: "another-test-token" });
+await handler.closeLogin();
+
 const rejectedEndpoint = await handler.startLogin("https://example.invalid");
 assert.equal(rejectedEndpoint.started, false);
 assert.equal(rejectedEndpoint.error, "service_must_be_loopback");
-console.log("Eclipse Discord login uses an isolated browser session and sends only the callback token to the loopback verifier.");
+console.log("Eclipse Discord login uses an isolated browser session, preserves safe verification errors, and never logs callback tokens.");

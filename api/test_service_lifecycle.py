@@ -861,6 +861,15 @@ class ServiceLifecycleTests(unittest.TestCase):
             self.assertNotIn("token", result)
             self.assertEqual(auth_cache["jwt"], "private-account-token")
 
+    def test_public_eclipse_auth_status_exposes_only_safe_login_error_code(self):
+        with patch.object(service, "eclipse_account_status", return_value={"connected": False, "user": None}), \
+                patch.object(service, "_ECLIPSE_LAST_LOGIN_ERROR", "unauthorized"):
+            status = service.public_eclipse_auth_status()
+
+        self.assertEqual(status["lastLoginError"], "unauthorized")
+        self.assertNotIn("token", json.dumps(status).lower())
+        self.assertNotIn("jwt", json.dumps(status).lower())
+
     def test_eclipse_account_status_does_not_clear_newer_account_after_stale_401(self):
         with TemporaryDirectory() as temp:
             session_file = Path(temp) / "eclipse-session.json"

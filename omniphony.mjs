@@ -16,6 +16,18 @@
  */
 
 const API_BASE = "http://127.0.0.1:8765";
+function eclipseAuthFailureMessage(reason) {
+  const messages = {
+    unauthorized: "Eclipse rejected the sign-in token. Confirm the Discord flow completed, then try Connect again.",
+    account_not_verified: "Eclipse returned a token that could not be verified for this account.",
+    verification_failed: "Eclipse account verification failed. Try again in a moment.",
+    verification_unavailable: "Could not reach Eclipse to verify the account. Check your connection and retry.",
+    secure_storage_unavailable: "The verified account could not be saved with Windows secure storage.",
+    account_changed: "The account changed during verification. Start sign-in again.",
+    invalid_token: "Eclipse returned an invalid sign-in token. Start sign-in again.",
+  };
+  return messages[reason] || "Eclipse sign-in returned to the login page without completing. Try again; if it repeats, share the displayed status with support.";
+}
 function normalizeRealmaxSourceMode(value) {
   if (value === "tidal_api" || value === "tidal_only") return "tidal_api";
   if (value === "eclipse_addons" || value === "eclipse_only" || value === "amazon_only") return "eclipse_addons";
@@ -23,7 +35,7 @@ function normalizeRealmaxSourceMode(value) {
 }
 const REQUIRED_SERVICE_VERSION = "2.1.40";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
-const PLUGIN_BUILD = "2.1.63";
+const PLUGIN_BUILD = "2.1.64";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -154,8 +166,14 @@ const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
       request.on("response", (response) => {
         response.on("data", (chunk) => { responseBody += chunk.toString("utf8"); });
         response.on("end", () => {
-          if (response.statusCode < 200 || response.statusCode >= 300) return reject(new Error("eclipse_token_rejected"));
-          try { resolve(JSON.parse(responseBody)); } catch (_) { reject(new Error("invalid_service_response")); }
+          let result;
+          try { result = JSON.parse(responseBody); } catch (_) { return reject(new Error("invalid_service_response")); }
+          if (response.statusCode < 200 || response.statusCode >= 300 || result?.connected !== true) {
+            const code = typeof result?.error === "string" && /^[a-z_]{1,48}$/.test(result.error)
+              ? result.error : "verification_failed";
+            return reject(new Error(code));
+          }
+          resolve(result);
         });
       });
       request.on("error", () => reject(new Error("service_unavailable")));
@@ -177,10 +195,12 @@ const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
       void postToken(token).then((result) => {
         if (result?.connected === true) return cleanUp();
         state.busy = false;
-        if (!win.isDestroyed()) { win.setTitle("Eclipse sign-in was not accepted"); void win.loadURL("https://eclipsemusic.app/sign-in"); }
-      }).catch(() => {
+        if (!win.isDestroyed()) win.setTitle("Eclipse sign-in was not accepted");
+      }).catch((error) => {
         state.busy = false;
-        if (!win.isDestroyed()) { win.setTitle("Eclipse sign-in could not be verified"); void win.loadURL("https://eclipsemusic.app/sign-in"); }
+        const code = typeof error?.message === "string" && /^[a-z_]{1,48}$/.test(error.message)
+          ? error.message : "verification_failed";
+        if (!win.isDestroyed()) win.setTitle("Eclipse sign-in failed: " + code);
       });
     };
     win.webContents.on("will-redirect", handleNavigation);
@@ -249,11 +269,11 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.63");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.64");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.63/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "3B25072F36CCCC2E4E58C4806331BAE3BF99ABD9D81F61CE67BD8D29D39022F6";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.64/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "6A57DDF46A9C3BC2122D6BE59029F60969E5CB43A42DD9ADB402910D010C0E93";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -325,7 +345,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.63"
+        return marker.pluginVersion === "2.1.64"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -394,7 +414,7 @@ const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`module.exports = {
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.63", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.64", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         if (fs.existsSync(bundledRuntimeRoot)) {
           const backup = bundledRuntimeRoot + ".previous-" + Date.now();
@@ -7290,10 +7310,12 @@ function toggleSettingsPanel() {
         if (!eclipseAccountWasConnected) void refreshEclipseConnections();
         eclipseAccountWasConnected = true;
       } else {
-        eclipseAuthStatus.textContent = data?.reason === "verification_unavailable"
-          ? "Eclipse could not be reached. The saved account will be checked again automatically."
-          : "Not connected. Connect your Eclipse account to use account-gated add-ons.";
-        eclipseAuthStatus.style.color = data?.reason === "verification_unavailable" ? "#e4b363" : "#aaa";
+        eclipseAuthStatus.textContent = data?.lastLoginError
+          ? eclipseAuthFailureMessage(data.lastLoginError)
+          : data?.reason === "verification_unavailable"
+            ? "Eclipse could not be reached. The saved account will be checked again automatically."
+            : "Not connected. Connect your Eclipse account to use account-gated add-ons.";
+        eclipseAuthStatus.style.color = data?.lastLoginError || data?.reason === "verification_unavailable" ? "#e4b363" : "#aaa";
         eclipseConnectButton.textContent = "Connect Eclipse with Discord";
         eclipseConnectButton.disabled = false;
         eclipseDisconnectButton.style.display = "none";
@@ -7750,7 +7772,9 @@ export const Settings = () => {
       if (!statusResponse.ok) throw new Error(`status ${statusResponse.status}`);
       const status = await statusResponse.json();
       if (status?.connected !== true) {
-        setEclipseAccountStatus("Not connected. Connect with Discord to use this Eclipse account’s add-ons.");
+        setEclipseAccountStatus(status?.lastLoginError
+          ? eclipseAuthFailureMessage(status.lastLoginError)
+          : "Not connected. Connect with Discord to use this Eclipse account’s add-ons.");
         return;
       }
       const addonsResponse = await requestWithTimeout(`${API_BASE}/eclipse-auth/addons?refresh=1`, { cache: "no-store" }, 15000);

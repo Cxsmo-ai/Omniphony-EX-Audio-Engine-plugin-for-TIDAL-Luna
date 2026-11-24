@@ -4358,6 +4358,7 @@ _ECLIPSE_AUTH_GENERATION = 0
 ECLIPSE_SESSION_FILE = CONFIG_DIR / "eclipse-session.json"
 ECLIPSE_AUTH_VERIFY_URL = "https://api.eclipsemusic.app/api/auth/mobile/verify"
 _ECLIPSE_ACCOUNT_STATUS: dict[str, object] = {"user": None, "checked_at": 0.0, "session_mtime": None}
+_ECLIPSE_LAST_LOGIN_ERROR: str | None = None
 
 
 class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -4633,6 +4634,16 @@ def eclipse_account_status(force_refresh: bool = False) -> dict:
             "session_mtime": ECLIPSE_SESSION_FILE.stat().st_mtime,
         })
     return {"connected": True, "user": user}
+
+
+def public_eclipse_auth_status() -> dict:
+    """Expose account state plus a safe, transient sign-in failure code."""
+    status = eclipse_account_status()
+    with _ECLIPSE_AUTH_LOCK:
+        last_login_error = _ECLIPSE_LAST_LOGIN_ERROR
+    if last_login_error and status.get("connected") is not True:
+        status["lastLoginError"] = last_login_error
+    return status
 
 
 ECLIPSE_ACCOUNT_ADDONS_URL = "https://eclipsemusic.app/music/addons"
@@ -6897,7 +6908,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(public_login_flow())
 
         elif parsed.path == "/eclipse-auth/status":
-            self.send_json(eclipse_account_status())
+            self.send_json(public_eclipse_auth_status())
 
         elif parsed.path == "/eclipse-auth/addons":
             force_refresh = urllib.parse.parse_qs(parsed.query).get("refresh", [""])[0] == "1"
@@ -7328,10 +7339,13 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             return self.send_json({"error": f"invalid JSON request: {exc}"}, status=400)
 
         if parsed.path == "/eclipse-auth/complete":
+            global _ECLIPSE_LAST_LOGIN_ERROR
             token = body.get("token")
             if not isinstance(token, str):
                 return self.send_json({"connected": False, "error": "missing account token"}, status=400)
             connected, user, error = _complete_eclipse_login(token.strip())
+            with _ECLIPSE_AUTH_LOCK:
+                _ECLIPSE_LAST_LOGIN_ERROR = None if connected else error or "verification_failed"
             if not connected:
                 status = 401 if error in {"unauthorized", "account_not_verified", "invalid_token"} else 502
                 return self.send_json({"connected": False, "error": error}, status=status)
