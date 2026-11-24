@@ -49,12 +49,16 @@ const electron = {
       let body = "";
       request.write = (value) => { body += value; };
       request.end = () => {
-        nativeRequests.push({ options, body: JSON.parse(body) });
+        const parsedBody = JSON.parse(body);
+        nativeRequests.push({ options, body: parsedBody });
         const response = new EventEmitter();
-        response.statusCode = nextAuthResponse.statusCode;
+        response.statusCode = options.path === "/eclipse-auth/flow-status"
+          ? 200 : nextAuthResponse.statusCode;
+        const responseBody = options.path === "/eclipse-auth/flow-status"
+          ? '{"recorded":true}' : nextAuthResponse.body;
         queueMicrotask(() => {
           request.emit("response", response);
-          response.emit("data", Buffer.from(nextAuthResponse.body));
+          response.emit("data", Buffer.from(responseBody));
           response.emit("end");
         });
       };
@@ -67,12 +71,17 @@ vm.runInNewContext(moduleCode, {
   module: exported,
   require(name) {
     if (name === "electron") return electron;
-    if (name === "crypto") return { randomBytes: () => Buffer.alloc(12, 7) };
+    if (name === "crypto") {
+      let fill = 7;
+      return { randomBytes: (size) => Buffer.alloc(size, fill++) };
+    }
     throw new Error(`unexpected module: ${name}`);
   },
   URL,
   Buffer,
   setImmediate,
+  setTimeout,
+  clearTimeout,
   globalThis,
 });
 
@@ -83,6 +92,10 @@ assert.equal(started.existing, false);
 assert.equal(lastWindow.url, "https://eclipsemusic.app/sign-in");
 assert.equal(lastWindow.options.webPreferences.nodeIntegration, false);
 assert.match(lastWindow.options.webPreferences.partition, /^temp:omniphony-eclipse-auth-/);
+assert.equal(nativeRequests.length, 1);
+assert.equal(nativeRequests[0].options.path, "/eclipse-auth/flow-status");
+assert.equal(nativeRequests[0].body.reason, "started");
+assert.match(nativeRequests[0].body.attemptId, /^[a-f0-9]{32}$/);
 const reused = await handler.startLogin("http://127.0.0.1:8765");
 assert.equal(reused.started, true);
 assert.equal(reused.existing, true);
@@ -92,11 +105,12 @@ lastWindow.webContents.emit("will-redirect", { preventDefault() { prevented = tr
   "https://eclipsemusic.app/sign-in?token=secret-test-eclipse-token");
 assert.equal(prevented, true, "the first-party callback token is stopped before page navigation");
 await new Promise((resolve) => setImmediate(resolve));
-assert.equal(nativeRequests.length, 1);
-assert.equal(nativeRequests[0].options.hostname, "127.0.0.1");
-assert.equal(nativeRequests[0].options.path, "/eclipse-auth/complete");
-assert.equal(nativeRequests[0].options.headers.Origin, "http://127.0.0.1:8765");
-assert.deepEqual(nativeRequests[0].body, { token: "secret-test-eclipse-token" });
+assert.equal(nativeRequests.length, 2);
+assert.equal(nativeRequests[1].options.hostname, "127.0.0.1");
+assert.equal(nativeRequests[1].options.path, "/eclipse-auth/complete");
+assert.equal(nativeRequests[1].options.headers.Origin, "http://127.0.0.1:8765");
+assert.equal(nativeRequests[1].body.token, "secret-test-eclipse-token");
+assert.equal(nativeRequests[1].body.attemptId, nativeRequests[0].body.attemptId);
 assert.equal(lastWindow.destroyed, true, "the ephemeral login window closes after the token is verified");
 assert.equal(lastWindow.webContents.sessionCleared, true, "the temporary browser session is cleared after login");
 
@@ -110,7 +124,44 @@ await new Promise((resolve) => setImmediate(resolve));
 assert.equal(failedWindow.destroyed, false, "the failed auth window remains available for diagnosis");
 assert.equal(failedWindow.title, "Eclipse sign-in failed: unauthorized", "the safe server error is visible instead of being erased by a login reload");
 assert.equal(failedWindow.url, "https://eclipsemusic.app/sign-in", "a failed verification does not silently reload the sign-in page");
-assert.deepEqual(nativeRequests[1].body, { token: "another-test-token" });
+assert.equal(nativeRequests[3].body.token, "another-test-token");
+assert.match(nativeRequests[3].body.attemptId, /^[a-f0-9]{32}$/);
+await handler.closeLogin();
+
+await handler.startLogin("http://127.0.0.1:8765");
+const callbackWindow = lastWindow;
+let blockedHttpNavigation = false;
+callbackWindow.webContents.emit("will-redirect", { preventDefault() { blockedHttpNavigation = true; } },
+  "http://api.eclipsemusic.app/api/auth/mobile/discord/callback?state=web", false, true);
+assert.equal(blockedHttpNavigation, true, "non-HTTPS Eclipse navigation remains blocked");
+callbackWindow.webContents.emit("will-redirect", { preventDefault() {} },
+  "https://api.eclipsemusic.app/api/auth/mobile/discord/callback?state=web", false, false);
+callbackWindow.webContents.emit("did-navigate-in-page", {}, "https://eclipsemusic.app/sign-in", false);
+assert.equal(nativeRequests.length, 5, "blocked and subframe navigations cannot change login status");
+callbackWindow.webContents.emit("will-redirect", { preventDefault() {} },
+  "https://api.eclipsemusic.app/api/auth/mobile/discord/callback?state=web&code=authorization-code");
+callbackWindow.webContents.emit("did-navigate", {}, "https://eclipsemusic.app/sign-in");
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(nativeRequests.length, 6, "a callback that returns to sign-in without a token is reported to the service");
+assert.equal(nativeRequests[5].options.path, "/eclipse-auth/flow-status");
+assert.equal(nativeRequests[5].body.reason, "callback_missing");
+assert.equal(nativeRequests[5].body.attemptId, nativeRequests[4].body.attemptId);
+assert.equal(callbackWindow.title, "Eclipse returned without an account token");
+assert.equal(callbackWindow.destroyed, false, "the login window remains available for diagnosis");
+const firstAttemptId = nativeRequests[4].body.attemptId;
+callbackWindow.webContents.emit("will-navigate", { preventDefault() {} },
+  "https://api.eclipsemusic.app/configure/auth/discord");
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(nativeRequests[6].body.reason, "started", "retry starts a new correlated auth attempt in the same window");
+assert.notEqual(nativeRequests[6].body.attemptId, firstAttemptId);
+callbackWindow.webContents.emit("will-redirect", { preventDefault() {} },
+  "https://api.eclipsemusic.app/api/auth/mobile/discord/callback?state=web&code=retry-code");
+callbackWindow.webContents.emit("did-navigate", {}, "https://eclipsemusic.app/sign-in");
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(nativeRequests[7].body.reason, "callback_missing");
+assert.equal(nativeRequests[7].body.attemptId, nativeRequests[6].body.attemptId);
 await handler.closeLogin();
 
 const rejectedEndpoint = await handler.startLogin("https://example.invalid");
