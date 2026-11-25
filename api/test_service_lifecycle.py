@@ -1,6 +1,7 @@
 import json
 import io
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -135,12 +136,14 @@ class ServiceLifecycleTests(unittest.TestCase):
         handler.send_json = Mock()
 
         with patch.object(service, "TIDAL_OWNER_PID", 4567), \
-                patch.object(service, "TIDAL_OWNER_SOURCE", "verified_parent_fallback"):
+                patch.object(service, "TIDAL_OWNER_SOURCE", "verified_parent_fallback"), \
+                patch.object(service, "RUNTIME_BUNDLE_SHA256", "A" * 64):
             service.RequestHandler.do_GET(handler)
 
         payload = handler.send_json.call_args.args[0]
         self.assertEqual(payload["tidalOwnerPid"], 4567)
         self.assertEqual(payload["tidalOwnerSource"], "verified_parent_fallback")
+        self.assertEqual(payload["runtimeBundleSha256"], "A" * 64)
         self.assertEqual(payload["capabilities"], ["prepared-playback-v1", "playback-clock-v1"])
         self.assertNotIn("shutdownToken", payload)
 
@@ -955,6 +958,185 @@ class ServiceLifecycleTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 service._validate_account_manifest_url(value)
 
+    def test_eclipse_https_resolution_excludes_private_and_reserved_addresses(self):
+        unsafe = ("127.0.0.1", "224.0.0.1", "240.0.0.1", "0.0.0.0", "169.254.1.1", "::ffff:127.0.0.1")
+        for ip in unsafe:
+            answer = [(service.socket.AF_INET6 if ":" in ip else service.socket.AF_INET,
+                       service.socket.SOCK_STREAM, 6, "", (ip, 443))]
+            with patch.object(service.socket, "getaddrinfo", return_value=answer), self.subTest(ip=ip):
+                with self.assertRaises(OSError):
+                    service._public_https_addresses("addon.example", 443)
+        public_answer = [(service.socket.AF_INET, service.socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+        with patch.object(service.socket, "getaddrinfo", return_value=public_answer):
+            resolved = service._public_https_addresses("addon.example", 443)
+        self.assertEqual([item[-1][0] for item in resolved], ["93.184.216.34"])
+
+    def test_eclipse_dns_lookup_obeys_deadline_without_leaking_lookup_slots(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_dns(*_args, **_kwargs):
+            entered.set()
+            release.wait(1)
+            return []
+
+        try:
+            with patch.object(service.socket, "getaddrinfo", side_effect=slow_dns):
+                with self.assertRaises(TimeoutError):
+                    service._public_https_addresses("slow.example", 443, time.monotonic() + 0.03)
+                self.assertTrue(entered.is_set())
+        finally:
+            release.set()
+
+    def test_eclipse_response_reader_enforces_deadline_on_trickling_body(self):
+        class TricklingResponse:
+            fp = None
+
+            def read1(self, _size):
+                time.sleep(0.015)
+                return b"x"
+
+        with self.assertRaises(TimeoutError):
+            service._read_eclipse_response(TricklingResponse(), 1024, time.monotonic() + 0.035)
+
+    def test_eclipse_bounded_request_cancels_socket_and_recovers_worker_capacity(self):
+        request = service.urllib.request.Request("https://addon.example/manifest.json")
+        entered = threading.Event()
+        request_slots = threading.BoundedSemaphore(4)
+
+        def wait_for_cancel(req, timeout=None):
+            entered.set()
+            req._omni_cancel_state.cancelled.wait(1)
+            raise OSError("cancelled")
+
+        started = time.monotonic()
+        with patch.object(service, "_ECLIPSE_REQUEST_WORKER_SLOTS", request_slots), \
+             patch.object(service, "_eclipse_authenticated_urlopen", side_effect=wait_for_cancel):
+            with self.assertRaises(TimeoutError):
+                service._bounded_eclipse_response(request, 1024, started + 0.04, 1.0)
+            self.assertTrue(entered.is_set())
+            self.assertTrue(request._omni_cancel_state.cancelled.is_set())
+            for _ in range(4):
+                self.assertTrue(request_slots.acquire(timeout=0.5))
+            self.assertFalse(request_slots.acquire(blocking=False))
+            for _ in range(4):
+                request_slots.release()
+
+        left, right = service.socket.socketpair()
+        cancellation = service._EclipseRequestCancellation()
+        cancellation.register(left)
+        cancellation.cancel()
+        self.assertEqual(left.fileno(), -1)
+        right.close()
+
+    def test_eclipse_worker_start_failures_release_dns_and_http_slots(self):
+        fake_thread = Mock()
+        fake_thread.start.side_effect = RuntimeError("thread creation failed")
+        dns_slots = threading.BoundedSemaphore(4)
+        with patch.object(service, "_ECLIPSE_DNS_LOOKUP_SLOTS", dns_slots), \
+             patch.object(service.threading, "Thread", return_value=fake_thread):
+            with self.assertRaises(RuntimeError):
+                service._public_https_addresses("addon.example", 443, time.monotonic() + 1)
+        for _ in range(4):
+            self.assertTrue(dns_slots.acquire(blocking=False))
+        self.assertFalse(dns_slots.acquire(blocking=False))
+        for _ in range(4):
+            dns_slots.release()
+
+        fake_thread = Mock()
+        fake_thread.start.side_effect = RuntimeError("thread creation failed")
+        http_slots = threading.BoundedSemaphore(4)
+        with patch.object(service, "_ECLIPSE_REQUEST_WORKER_SLOTS", http_slots), \
+             patch.object(service.threading, "Thread", return_value=fake_thread):
+            with self.assertRaises(RuntimeError):
+                service._bounded_eclipse_response(
+                    service.urllib.request.Request("https://addon.example/manifest.json"),
+                    1024, time.monotonic() + 1, 1,
+                )
+        for _ in range(4):
+            self.assertTrue(http_slots.acquire(blocking=False))
+        self.assertFalse(http_slots.acquire(blocking=False))
+        for _ in range(4):
+            http_slots.release()
+
+    def test_eclipse_https_connection_pins_socket_to_checked_address_and_tls_host(self):
+        sockaddr = ("93.184.216.34", 443)
+        checked = [(service.socket.AF_INET, service.socket.SOCK_STREAM, 6, "", sockaddr)]
+        raw_socket = Mock()
+        tls_socket = Mock()
+        context = Mock()
+        context.wrap_socket.return_value = tls_socket
+        with patch.object(service, "_public_https_addresses", return_value=checked), \
+             patch.object(service.socket, "socket", return_value=raw_socket):
+            connection = service._PublicAddressHTTPSConnection(
+                "addon.example", 443, timeout=3, context=context
+            )
+            connection.connect()
+        raw_socket.connect.assert_called_once_with(sockaddr)
+        context.wrap_socket.assert_called_once_with(
+            raw_socket, server_hostname="addon.example", do_handshake_on_connect=False
+        )
+        tls_socket.settimeout.assert_called_once()
+        tls_socket.do_handshake.assert_called_once_with()
+        self.assertIs(connection.sock, tls_socket)
+
+    def test_eclipse_cancellation_interrupts_a_stalled_tls_handshake(self):
+        listener = service.socket.socket(service.socket.AF_INET, service.socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        client_hello_received = threading.Event()
+        server_sockets = []
+
+        def accept_and_hold():
+            server_socket, _ = listener.accept()
+            server_sockets.append(server_socket)
+            try:
+                if server_socket.recv(5):
+                    client_hello_received.set()
+                server_socket.recv(1)
+            except OSError:
+                pass
+
+        server = threading.Thread(target=accept_and_hold, daemon=True)
+        server.start()
+        request_slots = threading.BoundedSemaphore(4)
+        request = service.urllib.request.Request("https://addon.example/manifest.json")
+        try:
+            with patch.object(service, "_ECLIPSE_REQUEST_WORKER_SLOTS", request_slots), \
+                 patch.object(service, "_public_https_addresses", return_value=[(
+                     service.socket.AF_INET, service.socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)
+                 )]):
+                started = time.monotonic()
+                with self.assertRaises(TimeoutError):
+                    service._bounded_eclipse_response(request, 1024, started + 0.25, 1.0)
+                self.assertTrue(client_hello_received.is_set(), "TLS handshake did not reach ClientHello")
+                self.assertTrue(request._omni_cancel_state.cancelled.is_set())
+                for _ in range(4):
+                    self.assertTrue(request_slots.acquire(timeout=0.5))
+                self.assertFalse(request_slots.acquire(blocking=False))
+                for _ in range(4):
+                    request_slots.release()
+        finally:
+            listener.close()
+            for server_socket in server_sockets:
+                server_socket.close()
+
+    def test_eclipse_failed_tls_handshake_closes_wrapped_socket_without_cancel_state(self):
+        sockaddr = ("93.184.216.34", 443)
+        checked = [(service.socket.AF_INET, service.socket.SOCK_STREAM, 6, "", sockaddr)]
+        raw_socket = Mock()
+        tls_socket = Mock()
+        tls_socket.do_handshake.side_effect = service.ssl.SSLError("handshake failed")
+        context = Mock()
+        context.wrap_socket.return_value = tls_socket
+        with patch.object(service, "_public_https_addresses", return_value=checked), \
+             patch.object(service.socket, "socket", return_value=raw_socket):
+            connection = service._PublicAddressHTTPSConnection("addon.example", 443, timeout=3, context=context)
+            with self.assertRaises(service.ssl.SSLError):
+                connection.connect()
+        tls_socket.close.assert_called_once_with()
+
     def test_eclipse_authenticated_redirects_are_same_origin_only(self):
         handler = service._SameOriginRedirectHandler()
         request = service.urllib.request.Request("https://api.eclipsemusic.app/account", headers={
@@ -970,6 +1152,17 @@ class ServiceLifecycleTests(unittest.TestCase):
         self.assertIsNone(handler.redirect_request(
             request, None, 302, "Found", headers, "http://api.eclipsemusic.app/insecure"
         ))
+
+    def test_eclipse_same_origin_redirect_preserves_deadline_cancellation(self):
+        handler = service._SameOriginRedirectHandler()
+        request = service.urllib.request.Request("https://addon.example/first")
+        cancellation = service._EclipseRequestCancellation()
+        request._omni_cancel_state = cancellation
+        redirected = handler.redirect_request(
+            request, None, 302, "Found", {}, "https://addon.example/second"
+        )
+        self.assertIsNotNone(redirected)
+        self.assertIs(redirected._omni_cancel_state, cancellation)
 
     def test_eclipse_worker_base_preserves_tokenized_manifest_path(self):
         self.assertEqual(
@@ -1151,7 +1344,7 @@ class ServiceLifecycleTests(unittest.TestCase):
             auth_cache = {"jwt": "old-account-token", "addon_tokens": {}, "account_addons": {}, "manifest_cache": {}, "search_cache": {}, "stream_cache": {}}
             status = {"user": None, "checked_at": 0.0, "session_mtime": None}
 
-            def stale_unauthorized(_token):
+            def stale_unauthorized(_token, deadline=None):
                 with service._ECLIPSE_AUTH_LOCK:
                     service._ECLIPSE_AUTH_CACHE["jwt"] = "new-account-token"
                     service._invalidate_eclipse_account_cache(clear_jwt=False)
@@ -1609,10 +1802,20 @@ class ServiceLifecycleTests(unittest.TestCase):
             seen_requests.append(request)
             return io.BytesIO(json.dumps(payload).encode("utf-8"))
 
-        with patch.object(service, "_ECLIPSE_AUTH_CACHE", {"search_cache": {}, "stream_cache": {}, "addon_tokens": {}}), \
-                patch.object(service, "_get_eclipse_addon_access_token", return_value=access_token) as get_token, \
+        auth_cache = {"search_cache": {}, "stream_cache": {}, "addon_tokens": {}}
+        def token_request(addon_id):
+            auth_cache["addon_tokens"][addon_id] = {
+                "token": access_token,
+                "expires_at": time.time() + 300,
+                "accountGeneration": service._ECLIPSE_AUTH_GENERATION,
+            }
+            return access_token
+
+        with patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache), \
+                patch.object(service, "_get_eclipse_addon_access_token", side_effect=token_request) as get_token, \
                 patch.object(service, "_probe_direct_audio_bitrate", return_value=(1_411_200, "test")), \
                 patch.object(service, "_probe_direct_media_transport", return_value="DIRECT"), \
+                patch.object(service, "_eclipse_manifest_protection_status", return_value=False), \
                 patch.object(service, "_eclipse_authenticated_urlopen", side_effect=fake_urlopen):
             result = service.resolve_eclipse_addon(
                 manifest_url,

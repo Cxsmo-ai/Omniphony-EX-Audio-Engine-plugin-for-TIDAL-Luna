@@ -407,7 +407,7 @@ class PlaybackTransportTests(unittest.TestCase):
                 self.read_size = size
                 return bytes.fromhex("000000206674797069736f6d0000020069736f6d64627931")
 
-        with patch.object(service.urllib.request, "urlopen", return_value=Response()) as open_url:
+        with patch.object(service, "_eclipse_authenticated_urlopen", return_value=Response()) as open_url:
             result = service._probe_direct_media_transport("https://signed.example/opaque", {"Accept": "*/*"})
 
         self.assertEqual(result, "MP4")
@@ -428,7 +428,7 @@ class PlaybackTransportTests(unittest.TestCase):
             def read(self, _size):
                 return b"\x00\x00\x00\x18junkftypisom\x00\x00\x00\x00"
 
-        with patch.object(service.urllib.request, "urlopen", return_value=Response()):
+        with patch.object(service, "_eclipse_authenticated_urlopen", return_value=Response()):
             result = service._probe_direct_media_transport("https://signed.example/opaque", {})
 
         self.assertEqual(result, "DIRECT")
@@ -447,7 +447,7 @@ class PlaybackTransportTests(unittest.TestCase):
             def read(self, _size):
                 raise AssertionError("invalid range response must be rejected before reading")
 
-        with patch.object(service.urllib.request, "urlopen", return_value=Response()):
+        with patch.object(service, "_eclipse_authenticated_urlopen", return_value=Response()):
             result = service._probe_direct_media_transport("https://signed.example/opaque", {})
 
         self.assertEqual(result, "DIRECT")
@@ -458,7 +458,7 @@ class PlaybackTransportTests(unittest.TestCase):
             {"Content-Type": "audio/mp4", "Content-Range": "bytes 0-64/1000"},
             bytes.fromhex("000000206674797069736f6d0000020069736f6d64627931"),
         )
-        with patch.object(service.urllib.request, "urlopen", return_value=response):
+        with patch.object(service, "_eclipse_authenticated_urlopen", return_value=response):
             result = service._probe_direct_media_transport("https://signed.example/opaque", {})
 
         self.assertEqual(result, "DIRECT")
@@ -474,7 +474,7 @@ class PlaybackTransportTests(unittest.TestCase):
             },
             bytes.fromhex("000000206674797069736f6d0000020069736f6d64627931"),
         )
-        with patch.object(service.urllib.request, "urlopen", return_value=response):
+        with patch.object(service, "_eclipse_authenticated_urlopen", return_value=response):
             result = service._probe_direct_media_transport("https://signed.example/opaque", {})
 
         self.assertEqual(result, "DIRECT")
@@ -488,7 +488,7 @@ class PlaybackTransportTests(unittest.TestCase):
                     {"Content-Type": "audio/mp4", "Content-Range": content_range},
                     b"",
                 )
-                with patch.object(service.urllib.request, "urlopen", return_value=response):
+                with patch.object(service, "_eclipse_authenticated_urlopen", return_value=response):
                     result = service._probe_direct_media_transport("https://signed.example/opaque", {})
                 self.assertEqual(result, "DIRECT")
                 self.assertEqual(response.read_sizes, [])
@@ -502,7 +502,7 @@ class PlaybackTransportTests(unittest.TestCase):
             },
             bytes.fromhex("000000206674797069736f6d0000020069736f6d64627931"),
         )
-        with patch.object(service.urllib.request, "urlopen", return_value=response):
+        with patch.object(service, "_eclipse_authenticated_urlopen", return_value=response):
             result = service._probe_direct_media_transport("https://signed.example/opaque", {})
 
         self.assertEqual(result, "DIRECT")
@@ -514,7 +514,7 @@ class PlaybackTransportTests(unittest.TestCase):
             {"Content-Type": "audio/mp4", "Content-Length": str(len(body))},
             body,
         )
-        with patch.object(service.urllib.request, "urlopen", return_value=response):
+        with patch.object(service, "_eclipse_authenticated_urlopen", return_value=response):
             result = service._probe_direct_media_transport("https://signed.example/opaque", {})
 
         self.assertEqual(result, "MP4")
@@ -527,7 +527,7 @@ class PlaybackTransportTests(unittest.TestCase):
             {"Content-Type": "audio/mp4", "Content-Range": "bytes 0-23/1000"},
             extended,
         )
-        with patch.object(service.urllib.request, "urlopen", return_value=response):
+        with patch.object(service, "_eclipse_authenticated_urlopen", return_value=response):
             result = service._probe_direct_media_transport("https://signed.example/opaque", {})
         self.assertEqual(result, "MP4")
 
@@ -536,7 +536,7 @@ class PlaybackTransportTests(unittest.TestCase):
             {"Content-Type": "audio/mp4"},
             bytes.fromhex("000000086674797069736f6d00000200"),
         )
-        with patch.object(service.urllib.request, "urlopen", return_value=invalid):
+        with patch.object(service, "_eclipse_authenticated_urlopen", return_value=invalid):
             result = service._probe_direct_media_transport("https://signed.example/opaque", {})
         self.assertEqual(result, "DIRECT")
 
@@ -553,7 +553,7 @@ class PlaybackTransportTests(unittest.TestCase):
             def read(self, _size):
                 return b"not an MP4 response"
 
-        with patch.object(service.urllib.request, "urlopen", return_value=Response()):
+        with patch.object(service, "_eclipse_authenticated_urlopen", return_value=Response()):
             result = service._probe_direct_media_transport("https://signed.example/opaque", {})
 
         self.assertEqual(result, "DIRECT")

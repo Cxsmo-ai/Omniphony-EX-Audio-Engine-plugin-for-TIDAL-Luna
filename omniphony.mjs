@@ -44,7 +44,7 @@ function normalizeRealmaxSourceMode(value) {
 const REQUIRED_SERVICE_VERSION = "2.1.45";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
 const ECLIPSE_ACCOUNT_LINKING_SUPPORTED = true;
-const PLUGIN_BUILD = "2.1.76";
+const PLUGIN_BUILD = "2.1.78";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -363,7 +363,7 @@ const NATIVE_ECLIPSE_AUTH_MODULE_CODE = String.raw`module.exports = {
     return { closed: true };
   },
 };`;
-const NATIVE_SERVICE_SUPERVISOR_MODULE_ID = "OmniphonyEX/service-supervisor.native.js";
+const NATIVE_SERVICE_SUPERVISOR_MODULE_ID = `OmniphonyEX/service-supervisor.native.js.${PLUGIN_BUILD}`;
 const NATIVE_SERVICE_SUPERVISOR_MODULE_CODE = String.raw`const stateKey = "__omniphony-ex.native-service-supervisor";
 const shared = luna[stateKey] || (luna[stateKey] = {
   startPromise: null,
@@ -373,6 +373,108 @@ const shared = luna[stateKey] || (luna[stateKey] = {
   serviceInstanceId: null,
 });
 module.exports = {
+  async requestEclipseStreamInventory(serviceBase, requiredVersion, runtimeConfig = {}, input = {}) {
+    let base;
+    try { base = new URL(serviceBase); } catch (_) { return { ok: false, error: "invalid_service_endpoint" }; }
+    if (base.protocol !== "http:" || base.hostname !== "127.0.0.1" || base.port !== "8765"
+      || (base.pathname !== "/" && base.pathname !== "")) {
+      return { ok: false, error: "invalid_service_endpoint" };
+    }
+    if (!input || typeof input !== "object" || !/^eclipse:[0-9a-f]{20}$/.test(String(input.providerKey || ""))) {
+      return { ok: false, error: "invalid_provider_key" };
+    }
+    const bounded = (value, maximum) => {
+      if (value === undefined || value === null || value === "") return { value: "", valid: true };
+      if (typeof value !== "string" || value.trim().length > maximum
+        || /[\u0000-\u001f\u007f]/.test(value)) return { value: "", valid: false };
+      return { value: value.trim(), valid: true };
+    };
+    base.pathname = "/eclipse/streams";
+    base.search = "";
+    base.searchParams.set("providerKey", input.providerKey);
+    for (const [key, maximum] of [["trackId", 512], ["title", 256], ["artist", 256], ["isrc", 32]]) {
+      const boundedValue = bounded(input[key], maximum);
+      if (!boundedValue.valid) return { ok: false, error: "invalid_track_identity" };
+      if (boundedValue.value) base.searchParams.set(key, boundedValue.value);
+    }
+    if (!base.searchParams.has("trackId")
+      && !(base.searchParams.has("title") && base.searchParams.has("artist"))
+      && !base.searchParams.has("isrc")) {
+      return { ok: false, error: "track_identity_required" };
+    }
+    const timeoutMs = Number(input.timeoutMs ?? 120000);
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120000) {
+      return { ok: false, error: "invalid_inventory_deadline" };
+    }
+    const absoluteDeadline = Date.now() + timeoutMs;
+    let readinessTimer = null;
+    let readiness;
+    try {
+      readiness = await Promise.race([
+        module.exports.ensureService(requiredVersion, runtimeConfig),
+        new Promise((resolve) => {
+          readinessTimer = setTimeout(
+            () => resolve({ ready: false, reason: "inventory_deadline_exceeded" }),
+            Math.max(0, absoluteDeadline - Date.now()),
+          );
+        }),
+      ]);
+    } catch (_) {
+      return { ok: false, error: "service_unavailable" };
+    } finally {
+      if (readinessTimer) clearTimeout(readinessTimer);
+    }
+    const remainingMs = absoluteDeadline - Date.now();
+    if (remainingMs < 1) return { ok: false, error: "inventory_deadline_exceeded" };
+    if (readiness?.ready !== true) return { ok: false, error: readiness?.reason || "service_unavailable" };
+    if (typeof shared?.shutdownToken !== "string" || !shared.shutdownToken
+      || typeof shared?.serviceInstanceId !== "string" || !shared.serviceInstanceId) {
+      return { ok: false, error: "service_identity_unavailable" };
+    }
+    base.searchParams.set("timeoutMs", String(Math.min(120000, Math.floor(remainingMs))));
+    const http = require("http");
+    return await new Promise((resolve) => {
+      let settled = false;
+      let body = "";
+      let deadlineTimer = null;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+        resolve(value);
+      };
+      const request = http.get({
+        hostname: "127.0.0.1", port: 8765, path: base.pathname + base.search, timeout: remainingMs,
+        headers: {
+          Origin: "http://127.0.0.1:8765",
+          Authorization: "Bearer " + shared.shutdownToken,
+          "X-Omniphony-Service-Instance": shared.serviceInstanceId,
+          Accept: "application/json",
+        },
+      }, (response) => {
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > 2 * 1024 * 1024) request.destroy(new Error("inventory response too large"));
+        });
+        response.on("end", () => {
+          let parsed;
+          try { parsed = JSON.parse(body); } catch (_) { return finish({ ok: false, error: "invalid_inventory_response" }); }
+          finish(response.statusCode === 200
+            ? { ok: true, inventory: parsed }
+            : { ok: false, error: typeof parsed?.error === "string" ? parsed.error : "inventory_http_" + response.statusCode });
+        });
+        response.on("aborted", () => finish({ ok: false, error: "inventory_response_aborted" }));
+        response.on("error", () => finish({ ok: false, error: "inventory_response_failed" }));
+        response.on("close", () => {
+          if (response.complete === false) finish({ ok: false, error: "inventory_response_incomplete" });
+        });
+      });
+      request.on("error", () => finish({ ok: false, error: "inventory_request_failed" }));
+      request.on("timeout", () => request.destroy(new Error("inventory request timed out")));
+      deadlineTimer = setTimeout(() => request.destroy(new Error("inventory request deadline exceeded")), remainingMs);
+    });
+  },
   async startEclipseLogin(serviceBase, requiredVersion, runtimeConfig = {}) {
     if (typeof module.exports.ensureService === "function") {
       const readiness = await module.exports.ensureService(requiredVersion, runtimeConfig);
@@ -430,11 +532,11 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.76");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.78");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.76/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "B3601D5E1636DE1D14E639D49835B64725BD2000333A2B69E8A3F3DCF65EA45D";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.78/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "55DA3FDECA98D86DD090079374032DCDDDBB8EDB98E19A445CFB45BE6BEFBAE8";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -484,6 +586,7 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
     const hasApiBundle = (root) => [
       "runtime/python.exe",
       "omnifusion_service.py",
+      "eclipse_streams.py",
       "vendor/tidalapi/__init__.py",
       "oxideav/adapter-v0.1.71/ac4-to-wav.exe",
       "oxideav/adapter-v0.1.71/omnifusion_ac4_adapter.dll",
@@ -506,7 +609,7 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.76"
+        return marker.pluginVersion === "2.1.78"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -575,7 +678,7 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.76", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.78", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         let backup = null;
         try {
@@ -737,7 +840,9 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
           && Number(existing.tidalOwnerPid) === tidalOwnerPid;
         const ownerAlive = existing.tidalOwnerAlive === true;
         const nativeOwnsService = nativeSupervisorOwns(existing);
-        if (existing.version === requiredVersion && settingsMatch && ownerMatches && ownerAlive) {
+        if (existing.version === requiredVersion
+            && existing.runtimeBundleSha256 === bundleSha256
+            && settingsMatch && ownerMatches && ownerAlive) {
           if (!nativeOwnsService) {
             return { ready: false, reason: "service_identity_unavailable", servicePid: existing.servicePid || null };
           }
@@ -793,6 +898,7 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
             OMNIFUSION_DATA_DIR: dataRoot,
             OMNIFUSION_TIDAL_PID: tidalOwnerPid === null ? "" : String(tidalOwnerPid),
             OMNIFUSION_SHUTDOWN_TOKEN: shutdownToken,
+            OMNIFUSION_RUNTIME_SHA256: bundleSha256,
             OMNIFUSION_MPV_DIR: mpvDir,
             OMNIFUSION_STUDIO_EXE: studioExe,
             OMNIFUSION_OXIDE_DIR: path.join(apiRoot, "oxideav"),
@@ -830,7 +936,8 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
           if (!Number.isSafeInteger(Number(child.pid)) || Number(health.servicePid) !== Number(child.pid)) {
             return await failedStartup({ ready: false, reason: "spawned_service_identity_mismatch", servicePid: health.servicePid || null });
           }
-          if (health.version !== requiredVersion || Number(health.tidalOwnerPid) !== tidalOwnerPid
+          if (health.version !== requiredVersion || health.runtimeBundleSha256 !== bundleSha256
+              || Number(health.tidalOwnerPid) !== tidalOwnerPid
               || health.tidalOwnerAlive !== true
               || !samePath(health.pluginRoot, pluginRoot)
               || !samePath(health.dataRoot, dataRoot) || !samePath(health.mpvDirectory, mpvDir)
@@ -1036,7 +1143,7 @@ function isRadiantLyricsObserverGenerationCurrent(generation) {
   return Number(globalThis[key]) === generation;
 }
 
-const SERVICE_STARTUP_STATE_KEY = Symbol.for("omniphony-ex.service-startup-state");
+const SERVICE_STARTUP_STATE_KEY = Symbol.for(`omniphony-ex.service-startup-state.${PLUGIN_BUILD}`);
 const SERVICE_SUPERVISOR_CHANNEL_ATTRIBUTE = "data-omniphony-service-supervisor-channel";
 
 function getSharedServiceSupervisorChannel(sharedState = null) {
@@ -1157,6 +1264,37 @@ async function startEclipseLoginWithNativeSupervisor() {
   );
   if (result?.started !== true) throw new Error(result?.error || "Eclipse sign-in could not be opened");
   return { ipc, channel };
+}
+
+async function requestEclipseInventoryWithNativeSupervisor(input) {
+  const ipc = window?.__ipcRenderer;
+  if (typeof ipc?.invoke !== "function") throw new Error("TidaLuna native IPC is unavailable");
+  const sharedState = globalThis[SERVICE_STARTUP_STATE_KEY] ||
+    (globalThis[SERVICE_STARTUP_STATE_KEY] = { starting: false, promise: null });
+  let channel = getSharedServiceSupervisorChannel(sharedState);
+  if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) {
+    channel = await ipc.invoke(
+      "__Luna.registerNative",
+      NATIVE_SERVICE_SUPERVISOR_MODULE_ID,
+      NATIVE_SERVICE_SUPERVISOR_MODULE_CODE,
+    );
+    if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) {
+      throw new Error("TidaLuna did not return the native service-supervisor IPC channel");
+    }
+    retainSharedServiceSupervisorChannel(channel, sharedState);
+  }
+  const result = await ipc.invoke(
+    channel,
+    "requestEclipseStreamInventory",
+    API_BASE,
+    REQUIRED_SERVICE_VERSION,
+    getConfiguredRuntimePaths(),
+    input,
+  );
+  if (result?.ok !== true || !result.inventory || typeof result.inventory !== "object") {
+    throw new Error(result?.error || "Eclipse stream inventory request failed");
+  }
+  return result.inventory;
 }
 
 function onLoad() {
@@ -8053,6 +8191,13 @@ export const Settings = () => {
   const [providerOrder, setProviderOrder] = React.useState([]);
   const [providerStatus, setProviderStatus] = React.useState("Loading TIDAL and Eclipse providers…");
   const [eclipseAccountStatus, setEclipseAccountStatus] = React.useState("Checking Eclipse account…");
+  const [eclipseInventoryTrackId, setEclipseInventoryTrackId] = React.useState("");
+  const [eclipseInventoryTitle, setEclipseInventoryTitle] = React.useState("");
+  const [eclipseInventoryArtist, setEclipseInventoryArtist] = React.useState("");
+  const [eclipseInventoryIsrc, setEclipseInventoryIsrc] = React.useState("");
+  const [eclipseInventoryStatus, setEclipseInventoryStatus] = React.useState("Enter a provider track ID, or a title and artist, to inspect connected add-on qualities.");
+  const [eclipseInventoryBusy, setEclipseInventoryBusy] = React.useState(false);
+  const eclipseInventoryCancelRef = React.useRef(false);
   const providerOrderRef = React.useRef([]);
   const providerSaveQueue = React.useRef(Promise.resolve());
   const providerMutationSequence = React.useRef(0);
@@ -8092,6 +8237,143 @@ export const Settings = () => {
       if (refreshSequence === providerRefreshSequence.current) setProviderStatus(`Provider list unavailable: ${error?.message || "service error"}`);
     }
   }, []);
+
+  const inspectEclipseStreamInventory = React.useCallback(async () => {
+    if (eclipseInventoryBusy) {
+      eclipseInventoryCancelRef.current = true;
+      setEclipseInventoryStatus("Canceling after the current bounded request completes…");
+      return;
+    }
+    const trackId = eclipseInventoryTrackId.trim();
+    const title = eclipseInventoryTitle.trim();
+    const artist = eclipseInventoryArtist.trim();
+    const isrc = eclipseInventoryIsrc.trim();
+    if (!trackId && !(title && artist) && !isrc) {
+      setEclipseInventoryStatus("Enter a provider track ID, both title and artist, or an ISRC.");
+      return;
+    }
+    const providers = providerOrder
+      .map((key) => realmaxProviders.find((row) => row?.key === key))
+      .filter((row) => row && row.type !== "tidal_api" && row.available === true);
+    if (!providers.length) {
+      setEclipseInventoryStatus("No enabled Eclipse account add-ons are selected in RealMAX provider order.");
+      return;
+    }
+    if (trackId && providers.length !== 1) {
+      setEclipseInventoryStatus("Provider-local track IDs are ambiguous across multiple enabled add-ons. Enter the title and artist to search each add-on independently, or enable only one add-on for an ID lookup.");
+      return;
+    }
+    eclipseInventoryCancelRef.current = false;
+    const overallDeadline = Date.now() + 120000;
+    setEclipseInventoryBusy(true);
+    setEclipseInventoryStatus(`Inspecting declared quality options from ${providers.length} enabled Eclipse add-on${providers.length === 1 ? "" : "s"}…`);
+    const reports = [];
+    try {
+      for (const provider of providers) {
+        if (eclipseInventoryCancelRef.current) break;
+        const remainingMs = Math.floor(overallDeadline - Date.now());
+        if (remainingMs < 1000) {
+          reports.push("Stopped: the 120-second total inventory deadline was reached.");
+          break;
+        }
+        setEclipseInventoryStatus(`Inspecting ${provider.name} (${reports.length + 1}/${providers.length})…`);
+        try {
+          const inventory = await requestEclipseInventoryWithNativeSupervisor({
+            providerKey: provider.key,
+            ...(trackId ? { trackId } : { title, artist, ...(isrc ? { isrc } : {}) }),
+            timeoutMs: Math.min(120000, remainingMs),
+          });
+          const attempts = Array.isArray(inventory.attempts) ? inventory.attempts : [];
+          const streams = Array.isArray(inventory.streams) ? inventory.streams : [];
+          const qualityLines = attempts.map((attempt) => {
+            const quality = typeof attempt?.requestedQuality === "string"
+              ? attempt.requestedQuality
+              : attempt?.requestedQuality && typeof attempt.requestedQuality === "object"
+                ? JSON.stringify(attempt.requestedQuality)
+                : "default quality";
+            return `${quality}: ${attempt?.status || "unknown"}${attempt?.reason ? ` (${attempt.reason})` : ""}`;
+          });
+          const streamLines = streams.map((stream) => {
+            const quality = stream?.actualQuality || stream?.requestedQuality || "quality unreported";
+            const codec = [stream?.codec, stream?.container || stream?.format].filter(Boolean).join(" / ") || "codec/container unreported";
+            const protection = stream?.protection?.status || "protection unknown";
+            const systems = Array.isArray(stream?.protection?.systems) && stream.protection.systems.length
+              ? stream.protection.systems.join(", ")
+              : stream?.protection?.system;
+            const protectionDetails = [
+              systems,
+              stream?.protection?.encryptionScheme,
+              stream?.protection?.conflictingProtectionMetadata ? "conflicting protection metadata" : null,
+            ].filter(Boolean).join(" / ");
+            const audioDetails = [
+              stream?.bitrate != null && Number.isFinite(Number(stream.bitrate)) ? `${Math.round(Number(stream.bitrate) / 1000)} kb/s` : null,
+              stream?.sampleRate != null && Number.isFinite(Number(stream.sampleRate)) ? `${(Number(stream.sampleRate) / 1000).toFixed(Number(stream.sampleRate) % 1000 ? 1 : 0)} kHz` : null,
+              stream?.bitDepth != null && Number.isFinite(Number(stream.bitDepth)) ? `${stream.bitDepth}-bit` : null,
+              stream?.channels != null && Number.isFinite(Number(stream.channels)) ? `${stream.channels} ch` : null,
+              stream?.manifestType ? stream.manifestType.toUpperCase() : null,
+            ].filter(Boolean).join(" · ");
+            const requested = stream?.requestedQuality && stream.requestedQuality !== quality
+              ? `requested ${typeof stream.requestedQuality === "object" ? JSON.stringify(stream.requestedQuality) : stream.requestedQuality}`
+              : null;
+            const identity = stream?.trackIdentityStatus && stream.trackIdentityStatus !== "verified"
+              ? `track identity ${stream.trackIdentityStatus}`
+              : null;
+            const expiry = stream?.expiresAt != null && Number.isFinite(Number(stream.expiresAt))
+              ? (stream.expired ? "expired" : `expires ${new Date(Number(stream.expiresAt) * 1000).toLocaleTimeString()}`)
+              : null;
+            const referenceExpiry = stream?.referenceExpiresAt != null && Number.isFinite(Number(stream.referenceExpiresAt))
+              ? `reference expires ${new Date(Number(stream.referenceExpiresAt) * 1000).toLocaleTimeString()}`
+              : null;
+            const details = [
+              requested,
+              stream?.qualityMatch === true ? "quality selector confirmed" : null,
+              stream?.qualityMatchStatus === "mismatched" ? "returned selector differs from the requested quality" : null,
+              stream?.qualityMatchStatus === "ambiguous" ? "quality match is ambiguous" : null,
+              ...(Array.isArray(stream?.requestedQualities)
+                ? stream.requestedQualities
+                    .filter((item) => item?.qualityMatch === true)
+                    .map((item) => `selector confirmed for ${item.quality || "requested quality"}`)
+                : []),
+              audioDetails,
+              protectionDetails,
+              identity,
+              stream?.playbackCompatibility || null,
+              stream?.availability === "reference_unavailable" ? "native stream reference unavailable" : null,
+              stream?.urlAvailable && stream?.availability !== "reference_unavailable"
+                ? "media URL held in service" : stream?.extractAvailable ? "provider extraction descriptor" : null,
+              expiry,
+              referenceExpiry,
+            ].filter(Boolean).join(" · ");
+            const mediaVariantLines = (Array.isArray(stream?.mediaVariants) ? stream.mediaVariants : []).map((variant) => {
+              const variantDetails = [
+                variant?.name || variant?.id || variant?.kind,
+                variant?.codecs,
+                variant?.bandwidth != null ? `${Math.round(Number(variant.bandwidth) / 1000)} kb/s (${variant.bandwidthScope || "scope unknown"})` : null,
+                variant?.declaredBandwidth != null ? `${Math.round(Number(variant.declaredBandwidth) / 1000)} kb/s (${variant.bandwidthScope || "scope unknown"})` : null,
+                variant?.sampleRate != null ? `${(Number(variant.sampleRate) / 1000).toFixed(Number(variant.sampleRate) % 1000 ? 1 : 0)} kHz` : null,
+                variant?.channels != null ? `${variant.channels} ch` : null,
+                variant?.language || null,
+                variant?.protectionStatus || null,
+              ].filter(Boolean).join(" · ");
+              return variantDetails ? `  Audio representation: ${variantDetails}` : null;
+            }).filter(Boolean);
+            return `Stream: ${quality} · ${codec} · ${protection}${details ? `\n  ${details}` : ""}${mediaVariantLines.length ? `\n${mediaVariantLines.join("\n")}` : ""}`;
+          });
+          const completeness = inventory.complete === true
+            ? "Declared quality requests completed; provider-wide coverage is unverified."
+            : `Inventory incomplete: ${inventory.reason || "one or more requests were not verified"}.`;
+          reports.push(`${provider.name}: ${completeness}${qualityLines.length ? `\n${qualityLines.join("\n")}` : ""}${streamLines.length ? `\n${streamLines.join("\n")}` : "\nNo stream descriptor returned."}`);
+        } catch (error) {
+          reports.push(`${provider.name}: inventory request failed (${String(error?.message || "service error").slice(0, 180)}).`);
+        }
+        setEclipseInventoryStatus(`${reports.join("\n\n")}\n\n${eclipseInventoryCancelRef.current ? "Cancel requested; stopping before the next add-on." : "Working through selected add-ons…"}`);
+      }
+      const ending = eclipseInventoryCancelRef.current ? "Inventory canceled after the active request." : "Inventory inspection finished.";
+      setEclipseInventoryStatus(`${reports.join("\n\n")}\n\n${ending} HLS/DASH audio representations are listed when the bounded manifest inspection can read them. Provider parity is still unverified. Protected streams are reported as descriptors; this action does not play them.`);
+    } finally {
+      setEclipseInventoryBusy(false);
+    }
+  }, [eclipseInventoryBusy, eclipseInventoryTrackId, eclipseInventoryTitle, eclipseInventoryArtist, eclipseInventoryIsrc, providerOrder, realmaxProviders]);
 
   const refreshEclipseAccount = React.useCallback(async () => {
     if (eclipseAccountInFlightRef.current) return;
@@ -8250,6 +8532,35 @@ export const Settings = () => {
       disabled: !ECLIPSE_ACCOUNT_LINKING_SUPPORTED,
       onClick: connectEclipseAccount
     }, ECLIPSE_ACCOUNT_LINKING_SUPPORTED ? "Connect Eclipse with Discord" : "Eclipse account linking unavailable"),
+    React.createElement(LunaTextSetting, {
+      title: "Eclipse inventory track ID",
+      desc: "Optional provider-local track ID. Leave blank to search by title and artist.",
+      value: eclipseInventoryTrackId,
+      onChange: (event) => setEclipseInventoryTrackId(String(event?.target?.value || "")),
+    }),
+    React.createElement(LunaTextSetting, {
+      title: "Eclipse inventory title",
+      desc: "Track title used for add-on search when no provider track ID is entered.",
+      value: eclipseInventoryTitle,
+      onChange: (event) => setEclipseInventoryTitle(String(event?.target?.value || "")),
+    }),
+    React.createElement(LunaTextSetting, {
+      title: "Eclipse inventory artist",
+      desc: "Track artist used with the title when searching enabled add-ons.",
+      value: eclipseInventoryArtist,
+      onChange: (event) => setEclipseInventoryArtist(String(event?.target?.value || "")),
+    }),
+    React.createElement(LunaTextSetting, {
+      title: "Eclipse inventory ISRC",
+      desc: "Optional recording identifier used to resolve the same recording across add-ons.",
+      value: eclipseInventoryIsrc,
+      onChange: (event) => setEclipseInventoryIsrc(String(event?.target?.value || "")),
+    }),
+    React.createElement(LunaButtonSetting, {
+      title: "Eclipse Add-on Stream Inventory",
+      desc: eclipseInventoryStatus,
+      onClick: () => { void inspectEclipseStreamInventory(); },
+    }, eclipseInventoryBusy ? "Cancel inventory" : "Inspect connected Eclipse qualities"),
     React.createElement(
       LunaSelectSetting,
       {

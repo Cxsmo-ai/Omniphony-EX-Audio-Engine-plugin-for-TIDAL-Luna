@@ -7,20 +7,26 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
 import ctypes
 import ctypes.wintypes
 import datetime
+import email.utils
 import hashlib
 import hmac
+import http.client
 import http.server
+import ipaddress
 import json
 import math
 import msvcrt
 import os
+import queue
 import re
 import socket
 import shutil
 import socketserver
+import ssl
 import struct
 import subprocess
 import sys
@@ -39,6 +45,28 @@ if VENDOR_DIR.is_dir() and str(VENDOR_DIR) not in sys.path:
     sys.path.insert(0, str(VENDOR_DIR))
 import requests
 import psutil
+from eclipse_streams import (
+    MAX_STREAM_VARIANTS,
+    _bounded_integer,
+    flatten_stream_payload,
+    declared_addon_capabilities,
+    _normalize_stream,
+    normalize_stream,
+    quality_candidate_limit_exceeded,
+    quality_candidates,
+    quality_options_unsafe,
+    quality_selector_label_map,
+    build_stream_request_plan,
+    _renderer_duration,
+    _renderer_text,
+    stream_payload_has_malformed_items,
+    stream_payload_truncated,
+    stream_has_protection_indicators,
+    unclassified_select_settings,
+)
+
+MAX_ECLIPSE_STREAM_REQUESTS = 4096
+MAX_ECLIPSE_MEDIA_MANIFESTS_PER_INVENTORY = 64
 
 
 def configured_path(environment_name: str, fallback: Path) -> Path:
@@ -266,6 +294,9 @@ PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
 SERVICE_VERSION = "2.1.45"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
+RUNTIME_BUNDLE_SHA256 = os.environ.get("OMNIFUSION_RUNTIME_SHA256", "").strip().upper()
+if not re.fullmatch(r"[A-F0-9]{64}", RUNTIME_BUNDLE_SHA256):
+    RUNTIME_BUNDLE_SHA256 = ""
 SHUTDOWN_TOKEN = os.environ.get("OMNIFUSION_SHUTDOWN_TOKEN", "")
 if not re.fullmatch(r"[a-f0-9]{64}", SHUTDOWN_TOKEN):
     SHUTDOWN_TOKEN = ""
@@ -4591,6 +4622,9 @@ def seek_settle_timeout_seconds(proxy, position: float) -> float:
 
 
 _ECLIPSE_AUTH_LOCK = threading.RLock()
+_ECLIPSE_STREAM_DISCOVERY_SEMAPHORE = threading.BoundedSemaphore(2)
+_ECLIPSE_DNS_LOOKUP_SLOTS = threading.BoundedSemaphore(4)
+_ECLIPSE_REQUEST_WORKER_SLOTS = threading.BoundedSemaphore(4)
 _ECLIPSE_AUTH_CACHE: dict[str, object] = {
     "jwt": None,
     "addon_tokens": {},
@@ -4598,6 +4632,7 @@ _ECLIPSE_AUTH_CACHE: dict[str, object] = {
     "manifest_cache": {},
     "search_cache": {},
     "stream_cache": {},
+    "discovered_streams": {},
     "tido_manifest_url": None,
 }
 _ECLIPSE_AUTH_GENERATION = 0
@@ -4638,13 +4673,286 @@ class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
             return None
         if self._origin(req.full_url) != self._origin(newurl):
             return None
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        cancellation = getattr(req, "_omni_cancel_state", None)
+        if redirected is not None and isinstance(cancellation, _EclipseRequestCancellation):
+            redirected._omni_cancel_state = cancellation
+        return redirected
 
 
-def _eclipse_authenticated_urlopen(request, timeout: float):
-    """Open an authenticated HTTPS request without following cross-origin redirects."""
+class _EclipseRequestCancellation:
+    """Own sockets for one bounded request so its deadline can interrupt I/O."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sockets: set[socket.socket] = set()
+        self.cancelled = threading.Event()
+
+    def register(self, sock: socket.socket) -> None:
+        with self._lock:
+            if self.cancelled.is_set():
+                sock.close()
+                raise TimeoutError("Eclipse request was cancelled")
+            self._sockets.add(sock)
+
+    def replace(self, old_socket: socket.socket, new_socket: socket.socket) -> None:
+        with self._lock:
+            self._sockets.discard(old_socket)
+            if self.cancelled.is_set():
+                new_socket.close()
+                raise TimeoutError("Eclipse request was cancelled")
+            self._sockets.add(new_socket)
+
+    def discard(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._sockets.discard(sock)
+
+    def cancel(self) -> None:
+        self.cancelled.set()
+        with self._lock:
+            sockets, self._sockets = tuple(self._sockets), set()
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _public_https_addresses(
+    host: str,
+    port: int,
+    deadline: float | None = None,
+    cancellation: _EclipseRequestCancellation | None = None,
+) -> list[tuple[int, int, int, str, tuple]]:
+    """Resolve once and retain only globally routable socket destinations."""
+    if deadline is None:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    else:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not _ECLIPSE_DNS_LOOKUP_SLOTS.acquire(timeout=max(0, remaining)):
+            raise TimeoutError("Eclipse DNS resolution exceeded its request deadline")
+        result_queue: queue.Queue = queue.Queue(maxsize=1)
+
+        def resolve_in_background():
+            try:
+                result_queue.put((True, socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)))
+            except Exception as exc:
+                result_queue.put((False, exc))
+            finally:
+                _ECLIPSE_DNS_LOOKUP_SLOTS.release()
+
+        try:
+            worker = threading.Thread(target=resolve_in_background, name="Omniphony-Eclipse-DNS", daemon=True)
+            worker.start()
+        except Exception:
+            _ECLIPSE_DNS_LOOKUP_SLOTS.release()
+            raise
+        while True:
+            if cancellation is not None and cancellation.cancelled.is_set():
+                raise TimeoutError("Eclipse DNS request was cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Eclipse DNS resolution exceeded its request deadline")
+            try:
+                resolved, addresses = result_queue.get(timeout=min(remaining, 0.05))
+                break
+            except queue.Empty:
+                continue
+        if not resolved:
+            raise addresses
+    public = []
+    for family, socktype, protocol, canonname, sockaddr in addresses:
+        try:
+            address = ipaddress.ip_address(str(sockaddr[0]).split("%", 1)[0])
+        except ValueError:
+            continue
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        if (address.is_global and not address.is_multicast and not address.is_reserved
+                and not address.is_unspecified and not address.is_loopback
+                and not address.is_link_local and not address.is_private):
+            public.append((family, socktype, protocol, canonname, sockaddr))
+    if not public:
+        raise OSError("Eclipse HTTPS host did not resolve to a public address")
+    return public
+
+
+class _PublicAddressHTTPSConnection(http.client.HTTPSConnection):
+    """Connect only to a checked DNS answer while preserving TLS host checks."""
+
+    def connect(self):
+        if self._tunnel_host:
+            raise OSError("HTTPS proxy tunnels are disabled for Eclipse requests")
+        last_error = None
+        timeout = self.timeout if isinstance(self.timeout, (int, float)) else 8.0
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        cancellation = getattr(self, "_omni_cancel_state", None)
+        for family, socktype, protocol, _canonname, sockaddr in _public_https_addresses(
+            self.host, self.port or 443, deadline,
+            cancellation if isinstance(cancellation, _EclipseRequestCancellation) else None,
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            raw_socket = socket.socket(family, socktype, protocol)
+            try:
+                active_socket = raw_socket
+                if isinstance(cancellation, _EclipseRequestCancellation):
+                    cancellation.register(raw_socket)
+                raw_socket.settimeout(remaining)
+                raw_socket.connect(sockaddr)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Eclipse TLS connection exceeded its request deadline")
+                raw_socket.settimeout(remaining)
+                context = self._context or ssl.create_default_context()
+                wrapped_socket = context.wrap_socket(
+                    raw_socket, server_hostname=self.host, do_handshake_on_connect=False
+                )
+                if isinstance(cancellation, _EclipseRequestCancellation):
+                    cancellation.replace(raw_socket, wrapped_socket)
+                active_socket = wrapped_socket
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Eclipse TLS handshake exceeded its request deadline")
+                wrapped_socket.settimeout(remaining)
+                wrapped_socket.do_handshake()
+                self.sock = wrapped_socket
+                return
+            except OSError as exc:
+                last_error = exc
+                if isinstance(cancellation, _EclipseRequestCancellation):
+                    cancellation.discard(active_socket)
+                active_socket.close()
+            except Exception:
+                if isinstance(cancellation, _EclipseRequestCancellation):
+                    cancellation.discard(active_socket)
+                active_socket.close()
+                raise
+        if last_error:
+            raise last_error
+        raise OSError("Eclipse HTTPS host has no usable public address")
+
+
+class _PublicAddressHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        cancel_state = getattr(request, "_omni_cancel_state", None)
+        connection_type = _PublicAddressHTTPSConnection
+        if isinstance(cancel_state, _EclipseRequestCancellation):
+            class _CancelablePublicAddressHTTPSConnection(_PublicAddressHTTPSConnection):
+                _omni_cancel_state = cancel_state
+            connection_type = _CancelablePublicAddressHTTPSConnection
+        return self.do_open(
+            connection_type,
+            request,
+            context=self._context,
+        )
+
+
+def _eclipse_authenticated_urlopen(
+    request, timeout: float, *, expected_generation: int | None = None,
+):
+    """Open HTTPS with DNS-pinned public destinations and same-origin redirects."""
+    if expected_generation is not None:
+        with _ECLIPSE_AUTH_LOCK:
+            if _ECLIPSE_AUTH_GENERATION != expected_generation:
+                raise RuntimeError("Eclipse account changed before network dispatch")
     _validate_account_manifest_url(request.full_url)
-    return urllib.request.build_opener(_SameOriginRedirectHandler()).open(request, timeout=timeout)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _PublicAddressHTTPSHandler(context=ssl.create_default_context()),
+        _SameOriginRedirectHandler(),
+    )
+    return opener.open(request, timeout=timeout)
+
+
+def _read_eclipse_response(response, max_bytes: int, deadline: float) -> bytes:
+    """Read in chunks under one monotonic deadline, including slow trickle bodies."""
+    payload = bytearray()
+    while len(payload) <= max_bytes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Eclipse response exceeded its operation deadline")
+        file_object = getattr(response, "fp", None)
+        raw = getattr(file_object, "raw", None)
+        response_socket = getattr(raw, "_sock", None) or getattr(file_object, "_sock", None)
+        if response_socket is not None:
+            response_socket.settimeout(remaining)
+        reader = getattr(response, "read1", None) or response.read
+        chunk = reader(min(64 * 1024, max_bytes + 1 - len(payload)))
+        if not chunk:
+            break
+        payload.extend(chunk)
+    return bytes(payload)
+
+
+def _bounded_eclipse_response(
+    request, max_bytes: int, deadline: float, timeout: float,
+    expected_generation: int | None = None,
+    *, return_headers: bool = False,
+) -> bytes | tuple[bytes, dict[str, str]]:
+    """Bound total request time, including DNS, TLS, redirects and response headers.
+
+    urllib's socket timeout is an inactivity timeout and can be reset by a slow
+    peer between bytes. A small fixed worker pool lets the caller enforce the
+    absolute deadline without allowing stalled network operations to spawn
+    unbounded threads.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not _ECLIPSE_REQUEST_WORKER_SLOTS.acquire(timeout=max(0, remaining)):
+        raise TimeoutError("Eclipse request capacity or deadline exceeded")
+    result_queue: queue.Queue = queue.Queue(maxsize=1)
+    cancellation = _EclipseRequestCancellation()
+    request._omni_cancel_state = cancellation
+
+    def request_body():
+        try:
+            if expected_generation is not None:
+                with _ECLIPSE_AUTH_LOCK:
+                    if _ECLIPSE_AUTH_GENERATION != expected_generation:
+                        raise RuntimeError("Eclipse account changed before queued request dispatch")
+            request_timeout = min(timeout, max(0.05, deadline - time.monotonic()))
+            with _eclipse_authenticated_urlopen(request, timeout=request_timeout) as response:
+                body = _read_eclipse_response(response, max_bytes, deadline)
+                response_headers = {
+                    str(key).lower(): str(value)
+                    for key, value in response.headers.items()
+                } if return_headers else {}
+                result_queue.put((True, (body, response_headers)))
+        except Exception as exc:
+            if isinstance(exc, urllib.error.HTTPError):
+                exc.close()
+            result_queue.put((False, exc))
+        finally:
+            cancellation.cancel()
+            _ECLIPSE_REQUEST_WORKER_SLOTS.release()
+
+    try:
+        worker = threading.Thread(target=request_body, name="Omniphony-Eclipse-HTTP", daemon=True)
+        worker.start()
+    except Exception:
+        cancellation.cancel()
+        _ECLIPSE_REQUEST_WORKER_SLOTS.release()
+        raise
+    remaining = deadline - time.monotonic()
+    try:
+        if remaining <= 0:
+            raise queue.Empty
+        succeeded, result = result_queue.get(timeout=remaining)
+    except queue.Empty as exc:
+        cancellation.cancel()
+        raise TimeoutError("Eclipse request exceeded its absolute deadline") from exc
+    if not succeeded:
+        if isinstance(result, urllib.error.URLError) and isinstance(result.reason, TimeoutError):
+            raise TimeoutError("Eclipse TLS connection exceeded its request deadline") from result
+        raise result
+    if return_headers:
+        return result
+    return result[0]
 
 
 def _eclipse_session_file_mtime() -> float | None:
@@ -4793,7 +5101,7 @@ def _write_eclipse_session(token: str, user: dict | None = None) -> None:
     os.replace(temporary, ECLIPSE_SESSION_FILE)
 
 
-def _verify_eclipse_account_token(token: str) -> tuple[bool, dict | None, str | None]:
+def _verify_eclipse_account_token(token: str, deadline: float | None = None) -> tuple[bool, dict | None, str | None]:
     request = urllib.request.Request(
         ECLIPSE_AUTH_VERIFY_URL,
         headers={
@@ -4803,8 +5111,12 @@ def _verify_eclipse_account_token(token: str) -> tuple[bool, dict | None, str | 
         },
     )
     try:
-        with _eclipse_authenticated_urlopen(request, timeout=8.0) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        remaining = 8.0 if deadline is None else min(8.0, deadline - time.monotonic())
+        if remaining <= 0:
+            return False, None, "deadline_exceeded"
+        request_deadline = time.monotonic() + remaining
+        raw_payload = _bounded_eclipse_response(request, 1_000_000, request_deadline, remaining)
+        payload = json.loads(raw_payload.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return False, None, "unauthorized" if exc.code == 401 else "verification_failed"
     except (OSError, ValueError, json.JSONDecodeError):
@@ -4902,7 +5214,7 @@ def _invalidate_eclipse_account_cache(clear_jwt: bool = False) -> None:
     if clear_jwt:
         _ECLIPSE_AUTH_CACHE["jwt"] = None
         _ECLIPSE_ACCOUNT_STATUS.update({"user": None, "checked_at": 0.0, "session_mtime": None})
-    for key in ("addon_tokens", "account_addons", "search_cache", "stream_cache"):
+    for key in ("addon_tokens", "account_addons", "search_cache", "stream_cache", "discovered_streams", "addon_cooldowns"):
         cached = _ECLIPSE_AUTH_CACHE.get(key)
         if isinstance(cached, dict):
             cached.clear()
@@ -4929,7 +5241,7 @@ def _get_eclipse_jwt(force_refresh: bool = False) -> str | None:
         return None
 
 
-def eclipse_account_status(force_refresh: bool = False) -> dict:
+def eclipse_account_status(force_refresh: bool = False, deadline: float | None = None) -> dict:
     """Verify the local Eclipse session and return only non-secret account details."""
     if not ECLIPSE_ACCOUNT_LINKING_SUPPORTED:
         return {
@@ -4952,7 +5264,7 @@ def eclipse_account_status(force_refresh: bool = False) -> dict:
                 and time.time() - checked_at < 60):
             return {"connected": True, "user": cached_user}
         auth_generation = _ECLIPSE_AUTH_GENERATION
-    valid, user, replacement = _verify_eclipse_account_token(token)
+    valid, user, replacement = _verify_eclipse_account_token(token, deadline=deadline)
     with _ECLIPSE_AUTH_LOCK:
         if (_ECLIPSE_AUTH_GENERATION != auth_generation
                 or _ECLIPSE_AUTH_CACHE.get("jwt") != token):
@@ -4987,9 +5299,9 @@ def eclipse_account_status(force_refresh: bool = False) -> dict:
     return {"connected": True, "user": user}
 
 
-def _verified_eclipse_session_snapshot(force_refresh: bool = False) -> tuple[str, dict, int] | None:
+def _verified_eclipse_session_snapshot(force_refresh: bool = False, deadline: float | None = None) -> tuple[str, dict, int] | None:
     """Capture the credential, verified identity and generation for one account operation."""
-    status = eclipse_account_status(force_refresh=force_refresh)
+    status = eclipse_account_status(force_refresh=force_refresh, deadline=deadline)
     if status.get("connected") is not True:
         return None
     with _ECLIPSE_AUTH_LOCK:
@@ -5119,6 +5431,7 @@ def eclipse_account_addons(force_refresh: bool = False) -> dict:
         cached = cache.get("current") if isinstance(cache, dict) else None
         if (not force_refresh and isinstance(cached, dict)
                 and cached.get("token_key") == token_key
+                and cached.get("accountGeneration") == auth_generation
                 and now < float(cached.get("expires_at") or 0)):
             result = cached.get("result")
             if isinstance(result, dict):
@@ -5133,8 +5446,9 @@ def eclipse_account_addons(force_refresh: bool = False) -> dict:
         },
     )
     try:
+        request_deadline = time.monotonic() + 8.0
         with _eclipse_authenticated_urlopen(request, timeout=8.0) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = json.loads(_read_eclipse_response(response, 1_000_000, request_deadline).decode("utf-8"))
     except urllib.error.HTTPError as exc:
         reason = "unauthorized" if exc.code == 401 else "account_addons_unavailable"
         return {"connected": True, "available": False, "addons": [], "order": [], "reason": reason}
@@ -5191,6 +5505,7 @@ def eclipse_account_addons(force_refresh: bool = False) -> dict:
             cache.clear()
             cache["current"] = {
                 "token_key": token_key,
+                "accountGeneration": auth_generation,
                 "expires_at": time.time() + ECLIPSE_ACCOUNT_ADDONS_TTL_SECONDS,
                 "result": result,
             }
@@ -5316,9 +5631,9 @@ def _ordered_resolution_providers(settings: dict | None = None) -> tuple[list[st
     return order, records
 
 
-def _get_eclipse_addon_access_token(addon_id: str = "com.yourname.amazonmusic", force_refresh: bool = False) -> str | None:
+def _get_eclipse_addon_access_token(addon_id: str = "com.yourname.amazonmusic", force_refresh: bool = False, deadline: float | None = None) -> str | None:
     """Mint a short-lived X-Eclipse-Access token for an Eclipse addon."""
-    session = _verified_eclipse_session_snapshot(force_refresh=force_refresh)
+    session = _verified_eclipse_session_snapshot(force_refresh=force_refresh, deadline=deadline)
     if session is None:
         return None
     jwt_token, user, auth_generation = session
@@ -5336,12 +5651,14 @@ def _get_eclipse_addon_access_token(addon_id: str = "com.yourname.amazonmusic", 
             if isinstance(entry, dict):
                 token = entry.get("token")
                 expires_at = float(entry.get("expires_at") or 0)
-                if isinstance(token, str) and token and now < expires_at - 20:
+                entry_generation = entry.get("accountGeneration")
+                if (isinstance(token, str) and token and now < expires_at - 20
+                        and entry_generation == auth_generation):
                     return token
 
     for attempt in range(2):
         if attempt > 0:
-            refreshed = _verified_eclipse_session_snapshot(force_refresh=True)
+            refreshed = _verified_eclipse_session_snapshot(force_refresh=True, deadline=deadline)
             if refreshed is None:
                 return None
             refreshed_token, refreshed_user, refreshed_generation = refreshed
@@ -5360,8 +5677,11 @@ def _get_eclipse_addon_access_token(addon_id: str = "com.yourname.amazonmusic", 
             },
         )
         try:
-            with _eclipse_authenticated_urlopen(req, timeout=6) as resp:
-                raw_payload = resp.read(65537)
+            remaining = 6.0 if deadline is None else min(6.0, deadline - time.monotonic())
+            if remaining <= 0:
+                return None
+            token_deadline = time.monotonic() + remaining
+            raw_payload = _bounded_eclipse_response(req, 65536, token_deadline, remaining)
             if len(raw_payload) > 65536:
                 return None
             data = json.loads(raw_payload.decode("utf-8"))
@@ -5388,6 +5708,7 @@ def _get_eclipse_addon_access_token(addon_id: str = "com.yourname.amazonmusic", 
                     current_tokens[addon_id] = {
                         "token": addon_token,
                         "expires_at": time.time() + expires_in,
+                        "accountGeneration": auth_generation,
                     }
             return addon_token
         except urllib.error.HTTPError as exc:
@@ -5428,7 +5749,10 @@ def _eclipse_worker_url(addon_manifest_url: str, resource_path: str, params: dic
     base = _eclipse_worker_base_url(addon_manifest_url)
     manifest_query = urllib.parse.parse_qsl(urllib.parse.urlsplit(addon_manifest_url).query, keep_blank_values=True)
     resource_params = list((params or {}).items())
-    merged = manifest_query + resource_params
+    # Per-request values replace matching configured values; duplicate keys
+    # otherwise leave the addon's chosen quality ambiguous to query parsers.
+    override_keys = {str(key) for key, _ in resource_params}
+    merged = [(key, value) for key, value in manifest_query if key not in override_keys] + resource_params
     query = urllib.parse.urlencode(merged, doseq=True)
     result = f"{base}/{resource_path.lstrip('/')}" + (f"?{query}" if query else "")
     manifest_origin = _SameOriginRedirectHandler._origin(addon_manifest_url)
@@ -5438,7 +5762,7 @@ def _eclipse_worker_url(addon_manifest_url: str, resource_path: str, params: dic
     return result
 
 
-def _get_eclipse_manifest(addon_manifest_url: str, force_refresh: bool = False) -> dict | None:
+def _get_eclipse_manifest(addon_manifest_url: str, force_refresh: bool = False, timeout: float = 6.0) -> dict | None:
     """Fetch and briefly cache a public Eclipse addon manifest."""
     manifest_url = addon_manifest_url.strip()
     now = time.time()
@@ -5452,8 +5776,13 @@ def _get_eclipse_manifest(addon_manifest_url: str, force_refresh: bool = False) 
     try:
         manifest_url = _validate_account_manifest_url(manifest_url)
         req = urllib.request.Request(manifest_url, headers={"User-Agent": "OmniphonyEX/1.0 Eclipse addon client"})
-        with _eclipse_authenticated_urlopen(req, timeout=6.0) as response:
-            manifest = json.loads(response.read().decode("utf-8"))
+        request_deadline = time.monotonic() + max(0.1, float(timeout))
+        raw_manifest = _bounded_eclipse_response(
+            req, 1_000_000, request_deadline, max(0.1, float(timeout))
+        )
+        if len(raw_manifest) > 1_000_000:
+            return None
+        manifest = json.loads(raw_manifest.decode("utf-8"))
         if not isinstance(manifest, dict) or not isinstance(manifest.get("id"), str) or not manifest["id"].strip():
             return None
     except Exception as exc:
@@ -5478,14 +5807,23 @@ def is_main_tidal_api_authorized() -> bool:
     return False
 
 
-def _probe_direct_audio_bitrate(url: str, duration: float, headers: dict[str, str]) -> tuple[int | None, str | None]:
+def _probe_direct_audio_bitrate(
+    url: str, duration: float, headers: dict[str, str], *,
+    expected_generation: int | None = None,
+) -> tuple[int | None, str | None]:
     """Compute average bitrate from HTTP Content-Range total byte length and duration."""
     if not url or not duration or duration <= 0:
         return None, None
     try:
+        if expected_generation is not None:
+            with _ECLIPSE_AUTH_LOCK:
+                if _ECLIPSE_AUTH_GENERATION != expected_generation:
+                    return None, None
         probe_headers = {**headers, "Range": "bytes=0-0"}
         req = urllib.request.Request(url, headers=probe_headers)
-        with urllib.request.urlopen(req, timeout=4) as resp:
+        with _eclipse_authenticated_urlopen(
+            req, timeout=4, expected_generation=expected_generation,
+        ) as resp:
             content_range = resp.headers.get("Content-Range") or ""
             total_bytes = 0
             if "/" in content_range:
@@ -5505,14 +5843,369 @@ def _probe_direct_audio_bitrate(url: str, duration: float, headers: dict[str, st
     return None, None
 
 
-def _probe_direct_media_transport(url: str, headers: dict[str, str]) -> str:
+def _parse_hls_attribute_list(value: str) -> dict[str, str]:
+    """Parse the quoted-string aware attribute lists used by HLS master tags."""
+    parts = []
+    start = 0
+    quoted = False
+    for index, char in enumerate(value):
+        if char == '"':
+            quoted = not quoted
+        elif char == "," and not quoted:
+            parts.append(value[start:index])
+            start = index + 1
+    parts.append(value[start:])
+    result = {}
+    for part in parts:
+        key, separator, raw = part.partition("=")
+        if not separator:
+            continue
+        result[key.strip().upper()] = raw.strip().strip('"')
+    return result
+
+
+def _hls_stream_variant(attributes: dict, index: int) -> dict | None:
+    codecs = [item.strip() for item in attributes.get("CODECS", "").split(",") if item.strip()]
+    if not codecs and not attributes.get("BANDWIDTH"):
+        return None
+    resolution = attributes.get("RESOLUTION")
+    video_codec = any(re.match(r"^(?:avc|hev|hvc|vp0|vp9|av01|theora)", codec, re.I) for codec in codecs)
+    bandwidth = _bounded_integer(attributes.get("BANDWIDTH"), minimum=1, maximum=1_000_000_000)
+    average_bandwidth = _bounded_integer(attributes.get("AVERAGE-BANDWIDTH"), minimum=1, maximum=1_000_000_000)
+    clean_codecs = [_renderer_text(codec, 96) for codec in codecs[:16]]
+    clean_codecs = [codec for codec in clean_codecs if codec]
+    return {
+        "index": index,
+        "kind": "hls_variant",
+        "codecs": clean_codecs,
+        "declaredBandwidth": bandwidth,
+        "averageBandwidth": average_bandwidth,
+        "bandwidthScope": "aggregate" if video_codec or resolution else "rendition_unspecified_scope",
+        "resolution": _renderer_text(resolution, 32),
+        "audioGroup": _renderer_text(attributes.get("AUDIO"), 96),
+        "protectionStatus": "unknown",
+    }
+
+
+def _hls_audio_rendition(attributes: dict, index: int) -> dict:
+    channels = attributes.get("CHANNELS", "").split("/", 1)[0]
+    try:
+        channels_value = _bounded_integer(channels, minimum=1, maximum=64)
+    except Exception:
+        channels_value = None
+    return {
+        "index": index,
+        "kind": "hls_audio_rendition",
+        "name": _renderer_text(attributes.get("NAME"), 160),
+        "group": _renderer_text(attributes.get("GROUP-ID"), 96),
+        "language": _renderer_text(attributes.get("LANGUAGE"), 64),
+        "channels": channels_value,
+        "default": attributes.get("DEFAULT", "NO").upper() == "YES",
+        "autoselect": attributes.get("AUTOSELECT", "NO").upper() == "YES",
+        "protectionStatus": "unknown",
+    }
+
+
+def _validated_eclipse_manifest_headers(request_headers: dict | None) -> dict[str, str]:
+    """Return exactly the bounded, sanitized provider headers sent to a manifest."""
+    if not isinstance(request_headers, dict):
+        return {}
+    forbidden = {"host", "connection", "content-length", "transfer-encoding", "proxy-authorization"}
+    normalized: dict[str, tuple[str, str]] = {}
+    for key, value in list(request_headers.items())[:32]:
+        if (isinstance(key, str) and isinstance(value, str) and len(key) <= 96
+                and len(value) <= 4096 and not any(ord(ch) < 0x20 and ch not in "\t" for ch in key + value)
+                and key.casefold() not in forbidden):
+            normalized[key.casefold()] = (key, value)
+    return {key: value for key, value in normalized.values()}
+
+
+def _collect_dash_audio_variants(root, output: list[dict]) -> bool:
+    """Collect declared audio representations without surfacing their URLs."""
+    def local_name(element):
+        return element.tag.rsplit("}", 1)[-1]
+
+    def descendants(element, tag):
+        return [child for child in list(element) if local_name(child) == tag]
+
+    root_protected = any(local_name(child) == "ContentProtection" for child in list(root))
+    complete = True
+    for period_index, period in enumerate(descendants(root, "Period")):
+        period_protected = root_protected or any(
+            local_name(child) == "ContentProtection" for child in list(period)
+        )
+        for adaptation_index, adaptation in enumerate(descendants(period, "AdaptationSet")):
+            inherited_protection = period_protected or any(
+                local_name(child) == "ContentProtection" for child in list(adaptation)
+            )
+            representations = descendants(adaptation, "Representation")
+            for representation_index, representation in enumerate(representations):
+                if len(output) >= 256:
+                    raise ValueError("DASH audio representation count exceeded inspection bound")
+                mime = representation.get("mimeType") or adaptation.get("mimeType", "")
+                codecs = representation.get("codecs") or adaptation.get("codecs", "")
+                content_type = (representation.get("contentType") or adaptation.get("contentType") or "").lower()
+                codec_tokens = re.split(r"[,\s]+", codecs.strip()) if codecs else []
+                codec_audio = bool(re.search(r"(?:mp4a|ac-3|ec-3|ac-4|opus|flac|alac|mha[12])", codecs, re.I))
+                codec_video = any(re.match(r"(?:avc|hev|hvc|vp0|vp9|av01|theora)", token, re.I) for token in codec_tokens)
+                is_audio = content_type == "audio" or mime.lower().startswith("audio/") or codec_audio
+                is_video = content_type == "video" or mime.lower().startswith("video/") or codec_video
+                representation_protected = inherited_protection or any(
+                    local_name(child) == "ContentProtection" for child in list(representation)
+                )
+                if not is_audio:
+                    if not is_video:
+                        complete = False
+                        output.append({
+                            "index": len(output),
+                            "kind": "dash_unclassified_representation",
+                            "id": _renderer_text(representation.get("id"), 96),
+                            "periodIndex": period_index,
+                            "adaptationIndex": adaptation_index,
+                            "mimeType": _renderer_text(mime, 96),
+                            "codecs": _renderer_text(codecs, 160),
+                            "contentType": _renderer_text(content_type, 32),
+                            "classificationStatus": "unclassified",
+                            "protectionStatus": "protected" if representation_protected else "unknown",
+                        })
+                    continue
+                channel_configuration = next((child for child in representation.iter()
+                                              if local_name(child) == "AudioChannelConfiguration"), None)
+                if channel_configuration is None:
+                    channel_configuration = next((child for child in adaptation.iter()
+                                                  if local_name(child) == "AudioChannelConfiguration"), None)
+                channel_value = channel_configuration.get("value") if channel_configuration is not None else None
+                channel_scheme = channel_configuration.get("schemeIdUri") if channel_configuration is not None else None
+                channels_value = _bounded_integer(channel_value, minimum=1, maximum=64)
+                mixed_audio_video = is_audio and is_video
+                output.append({
+                    "index": len(output),
+                    "kind": "dash_mixed_representation" if mixed_audio_video else "dash_audio_representation",
+                    "id": _renderer_text(representation.get("id"), 96),
+                    "periodIndex": period_index,
+                    "adaptationIndex": adaptation_index,
+                    "bandwidth": _bounded_integer(representation.get("bandwidth"), minimum=1, maximum=1_000_000_000),
+                    "bandwidthScope": "aggregate_audiovisual" if mixed_audio_video else "audio_representation",
+                    "codecs": _renderer_text(codecs, 160),
+                    "mimeType": _renderer_text(mime, 96),
+                    "sampleRate": _bounded_integer(representation.get("audioSamplingRate") or adaptation.get("audioSamplingRate"), minimum=8_000, maximum=768_000),
+                    "channels": channels_value,
+                    "channelConfiguration": _renderer_text(channel_value, 64),
+                    "channelConfigurationScheme": _renderer_text(channel_scheme, 160),
+                    "language": _renderer_text(adaptation.get("lang"), 64),
+                    "classificationStatus": "mixed_audio_video" if mixed_audio_video else "audio",
+                    "protectionStatus": "protected" if representation_protected else "unknown",
+                })
+    return complete
+
+
+def _eclipse_manifest_protection_status(
+    url: str,
+    manifest_type: str | None = None,
+    *,
+    timeout: float = 8.0,
+    expected_generation: int | None = None,
+    request_headers: dict | None = None,
+    media_variants_out: list[dict] | None = None,
+    media_variants_complete_out: list[bool] | None = None,
+) -> bool | None:
+    """Inspect declared HLS/DASH protection without resolving keys or media segments.
+
+    Returns False for a signature-verified direct audio resource or after
+    validating a clear manifest graph. Protected, malformed, unreachable,
+    unsupported, or over-limit candidates remain unknown/protected so callers
+    can keep them descriptor-only.
+    """
+    if not isinstance(url, str):
+        return None
+    parsed = urllib.parse.urlsplit(url)
+    declared = str(manifest_type or "").strip().lower()
+    kind = "hls" if declared == "hls" or parsed.path.lower().endswith(".m3u8") else (
+        "dash" if declared == "dash" or parsed.path.lower().endswith(".mpd") else None
+    )
+    deadline = time.monotonic() + max(0.1, min(30.0, float(timeout)))
+
+    def report_variants_complete(value: bool) -> None:
+        if media_variants_complete_out is not None:
+            if media_variants_complete_out:
+                media_variants_complete_out[0] = value
+            else:
+                media_variants_complete_out.append(value)
+
+    private_headers = _validated_eclipse_manifest_headers(request_headers)
+
+    original_origin = _SameOriginRedirectHandler._origin(url)
+
+    def fetch_manifest(target: str, *, sniff: bool = False) -> tuple[bytes, dict[str, str]]:
+        target_origin = _SameOriginRedirectHandler._origin(target)
+        authorized_headers = private_headers if target_origin == original_origin else {}
+        request = urllib.request.Request(target, headers={
+            "User-Agent": "OmniphonyEX/1.0 Eclipse media manifest inspector",
+            "Accept": "application/vnd.apple.mpegurl, application/dash+xml, */*",
+            **authorized_headers,
+            **({"Range": "bytes=0-8191"} if sniff else {}),
+        })
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("media manifest inspection deadline exceeded")
+        result = _bounded_eclipse_response(
+            request, 1_000_000, deadline, min(8.0, remaining),
+            expected_generation=expected_generation,
+            return_headers=True,
+        )
+        body, response_headers = result
+        if len(body) > 1_000_000:
+            raise ValueError("media manifest exceeds the inspection size limit")
+        return body, response_headers
+
+    def detect_manifest_type(body: bytes, response_headers: dict[str, str]) -> str | None:
+        content_type = response_headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        text_prefix = body[:4096].decode("utf-8-sig", errors="replace").lstrip("\t\r\n ").lower()
+        if content_type in {
+            "application/vnd.apple.mpegurl", "application/x-mpegurl", "application/mpegurl",
+            "audio/mpegurl", "audio/x-mpegurl", "application/m3u",
+        } or text_prefix.startswith("#extm3u"):
+            return "hls"
+        if content_type in {"application/dash+xml", "application/xml", "text/xml"} or "<mpd" in text_prefix:
+            return "dash"
+        # For direct clear elementary/container formats, require a recognized
+        # payload signature in addition to the endpoint metadata. ISO-BMFF is
+        # intentionally left unknown here: a small prefix cannot establish
+        # that its later sample-encryption boxes are absent.
+        is_audio_signature = (
+            body.startswith((b"ID3", b"fLaC", b"OggS", b"RIFF"))
+            or len(body) >= 2 and body[:2] in {b"\x0b\x77", b"\xac\x40", b"\xac\x41"}
+            or len(body) >= 2 and body[0] == 0xFF and (body[1] & 0xF6) == 0xF0
+        )
+        if is_audio_signature and content_type in {
+            "audio/mpeg", "audio/mp3", "audio/mpeg3", "audio/x-mpeg-3",
+            "audio/flac", "audio/x-flac", "audio/aac", "audio/aacp", "audio/x-aac",
+            "audio/ogg", "audio/opus",
+            "audio/wav", "audio/x-wav", "audio/vnd.wave", "audio/vnd.dolby.dd-raw",
+            "audio/eac3", "audio/x-eac3", "audio/ac4", "application/octet-stream",
+            "application/x-flac",
+        }:
+            return "direct"
+        return None
+
+    try:
+        if kind is None:
+            body, response_headers = fetch_manifest(url, sniff=True)
+            kind = detect_manifest_type(body, response_headers)
+            if kind == "direct":
+                report_variants_complete(True)
+                return False
+            if kind is None:
+                report_variants_complete(False)
+                return None
+            # Sniffing is only for type detection; a Range response or server
+            # that ignores Range may be partial. Re-fetch the complete bounded
+            # manifest before making a protection decision.
+            first_body = None
+        else:
+            first_body = None
+        if kind == "dash":
+            raw_xml = first_body if first_body is not None else fetch_manifest(url)[0]
+            xml = raw_xml.decode("utf-8-sig", errors="replace") if isinstance(raw_xml, bytes) else raw_xml
+            root = ET.fromstring(xml)
+            if root.tag.rsplit("}", 1)[-1] != "MPD":
+                return None
+            protected = any(
+                element.tag.rsplit("}", 1)[-1] == "ContentProtection"
+                for element in root.iter()
+            )
+            if media_variants_out is not None:
+                complete = _collect_dash_audio_variants(root, media_variants_out)
+                report_variants_complete(complete)
+            else:
+                report_variants_complete(True)
+            return protected
+
+        pending = [url]
+        visited: set[str] = set()
+        any_protected = False
+        while pending:
+            current = pending.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            if len(visited) > 16:
+                return None
+            raw_text = first_body if first_body is not None and current == url else fetch_manifest(current)[0]
+            text = raw_text.decode("utf-8-sig", errors="replace") if isinstance(raw_text, bytes) else raw_text
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if not lines or lines[0] != "#EXTM3U":
+                return None
+            for line in lines:
+                if not line.startswith(("#EXT-X-KEY:", "#EXT-X-SESSION-KEY:")):
+                    continue
+                attributes = line.partition(":")[2]
+                method = re.search(r'(?:^|,)\s*METHOD\s*=\s*"?([^,"]+)', attributes, re.IGNORECASE)
+                if not method or method.group(1).strip().upper() != "NONE":
+                    any_protected = True
+            children = []
+            pending_variant_uri = False
+            pending_variant_attributes = None
+            for line in lines:
+                if line.startswith("#EXT-X-STREAM-INF:"):
+                    if pending_variant_uri:
+                        return None
+                    pending_variant_uri = True
+                    pending_variant_attributes = _parse_hls_attribute_list(line.partition(":")[2])
+                elif pending_variant_uri and not line.startswith("#"):
+                    children.append(line)
+                    if media_variants_out is not None:
+                        variant = _hls_stream_variant(pending_variant_attributes or {}, len(media_variants_out))
+                        if variant is None or len(media_variants_out) >= 256:
+                            return None
+                        media_variants_out.append(variant)
+                    pending_variant_uri = False
+                    pending_variant_attributes = None
+            if pending_variant_uri:
+                return None
+            for line in lines:
+                if not line.startswith("#EXT-X-MEDIA:"):
+                    continue
+                attributes = _parse_hls_attribute_list(line.partition(":")[2])
+                if attributes.get("TYPE", "").upper() != "AUDIO":
+                    continue
+                if media_variants_out is not None:
+                    if len(media_variants_out) >= 256:
+                        return None
+                    media_variants_out.append(_hls_audio_rendition(attributes, len(media_variants_out)))
+                if attributes.get("URI"):
+                    children.append(attributes["URI"])
+            if children:
+                for child in children:
+                    child_url = urllib.parse.urljoin(current, child)
+                    _validate_account_manifest_url(child_url)
+                    if child_url not in visited and child_url not in pending:
+                        pending.append(child_url)
+                        if len(pending) + len(visited) > 16:
+                            return None
+        report_variants_complete(True)
+        return any_protected
+    except Exception:
+        report_variants_complete(False)
+        return None
+
+
+def _probe_direct_media_transport(
+    url: str, headers: dict[str, str], *, expected_generation: int | None = None,
+) -> str:
     """Identify extensionless ISO-BMFF streams without downloading the media."""
     if not url:
         return "DIRECT"
     try:
+        if expected_generation is not None:
+            with _ECLIPSE_AUTH_LOCK:
+                if _ECLIPSE_AUTH_GENERATION != expected_generation:
+                    return "DIRECT"
         probe_headers = {**headers, "Range": "bytes=0-63"}
         req = urllib.request.Request(url, headers=probe_headers)
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with _eclipse_authenticated_urlopen(
+            req, timeout=5, expected_generation=expected_generation,
+        ) as resp:
             status = getattr(resp, "status", 200)
             content_range = resp.headers.get("Content-Range") or ""
             if status not in {200, 206}:
@@ -5599,6 +6292,738 @@ def _select_eclipse_search_track(tracks: list[dict], title: str, artist: str, re
     return max(matching, key=lambda row: row[1])[0] if matching else None
 
 
+def _finalize_stream_reference_inventory(
+    streams: list[dict], stream_store: dict, account_generation: int, completed_at: float,
+) -> bool:
+    """Verify returned handles and refresh TTL without exceeding provider expiry."""
+    references_complete = True
+    for descriptor in streams:
+        entry = stream_store.get(descriptor.get("streamRef"))
+        if not isinstance(entry, dict) or entry.get("accountGeneration") != account_generation:
+            descriptor["availability"] = "reference_unavailable"
+            descriptor["playbackCompatibility"] = "stream_reference_not_retained"
+            descriptor["streamRef"] = None
+            descriptor["referenceExpiresAt"] = None
+            references_complete = False
+            continue
+        provider_expiry = entry.get("expiresAt")
+        try:
+            provider_expiry = float(provider_expiry) if provider_expiry is not None else completed_at + 120.0
+        except (TypeError, ValueError, OverflowError):
+            provider_expiry = completed_at
+        entry["expires_at"] = min(completed_at + 120.0, provider_expiry)
+        descriptor["referenceExpiresAt"] = entry["expires_at"]
+        descriptor["expired"] = provider_expiry <= completed_at
+        if descriptor["expired"]:
+            descriptor["playbackCompatibility"] = "expired"
+    return references_complete
+
+
+def _discover_eclipse_addon_streams_impl(
+    addon_manifest_url: str,
+    *,
+    addon_id: str,
+    addon_name: str,
+    track_id: str = "",
+    title: str = "",
+    artist: str = "",
+    isrc: str = "",
+    duration: int | float = 0,
+    provider_key: str | None = None,
+    timeout_ms: int = 120_000,
+) -> dict:
+    """Enumerate declared addon quality options independently of local playback.
+
+    Raw media URLs and authenticated request headers remain inside the service.
+    The response is a metadata inventory and explicitly distinguishes incomplete
+    network results from a successfully returned stream descriptor.
+    """
+    try:
+        timeout_ms = max(1, min(120_000, int(timeout_ms)))
+    except (TypeError, ValueError, OverflowError):
+        timeout_ms = 120_000
+    discovery_deadline = time.monotonic() + timeout_ms / 1000.0
+    manifest_remaining = discovery_deadline - time.monotonic()
+    if manifest_remaining <= 0:
+        return {"complete": False, "reason": "discovery_deadline_exceeded", "streams": [], "attempts": []}
+    manifest = _get_eclipse_manifest(addon_manifest_url, timeout=min(6.0, manifest_remaining))
+    if time.monotonic() >= discovery_deadline:
+        return {"complete": False, "reason": "discovery_deadline_exceeded", "streams": [], "attempts": []}
+    if not isinstance(manifest, dict):
+        return {"complete": False, "reason": "manifest_unavailable", "streams": [], "attempts": []}
+    raw_manifest_id = manifest.get("id")
+    manifest_id = raw_manifest_id.strip() if isinstance(raw_manifest_id, str) else ""
+    requested_addon_id = addon_id.strip() if isinstance(addon_id, str) else ""
+    if (not manifest_id or len(manifest_id) > 256 or any(ord(char) < 0x20 for char in manifest_id)
+            or not requested_addon_id or len(requested_addon_id) > 256
+            or any(ord(char) < 0x20 for char in requested_addon_id)):
+        return {"complete": False, "reason": "manifest_identity_missing_or_invalid", "streams": [], "attempts": []}
+    if requested_addon_id != manifest_id:
+        return {"complete": False, "reason": "manifest_addon_identity_mismatch", "streams": [], "attempts": []}
+    normalized_id = requested_addon_id
+    normalized_name = str(addon_name or manifest.get("name") or normalized_id or "Eclipse add-on").strip()[:256]
+    capabilities = declared_addon_capabilities(manifest)
+    platform_blocked_profiles = (
+        [profile for profile in capabilities.get("playbackProfiles", []) if profile == "apple-fps-alac-v1"]
+        if normalized_id == "app.eclipsemusic.gravity" else []
+    )
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "X-Client-Platform": "web",
+        "Origin": "https://eclipsemusic.app",
+        "Referer": "https://eclipsemusic.app/",
+    }
+    if time.monotonic() >= discovery_deadline:
+        return {"complete": False, "reason": "discovery_deadline_exceeded", "streams": [], "attempts": []}
+    token = _get_eclipse_addon_access_token(normalized_id, deadline=discovery_deadline)
+    if time.monotonic() >= discovery_deadline:
+        return {"complete": False, "reason": "discovery_deadline_exceeded", "streams": [], "attempts": []}
+    # Access-token acquisition verifies the saved Eclipse session and may
+    # initialize or rotate it, incrementing _ECLIPSE_AUTH_GENERATION. Anchor
+    # this inventory afterward so the cold first request does not reject
+    # itself as an account change.
+    with _ECLIPSE_AUTH_LOCK:
+        account_generation = _ECLIPSE_AUTH_GENERATION
+        if token:
+            addon_tokens = _ECLIPSE_AUTH_CACHE.get("addon_tokens")
+            token_entry = addon_tokens.get(normalized_id) if isinstance(addon_tokens, dict) else None
+            token_generation = token_entry.get("accountGeneration") if isinstance(token_entry, dict) else None
+            if provider_key is not None and (
+                not isinstance(token_entry, dict)
+                or token_entry.get("token") != token
+                or not isinstance(token_generation, int)
+                or token_generation != account_generation
+            ):
+                return {"complete": False, "reason": "account_changed_during_discovery", "streams": [], "attempts": []}
+            if (isinstance(token_entry, dict) and token_entry.get("token") == token
+                    and isinstance(token_generation, int)):
+                if token_generation != account_generation:
+                    return {"complete": False, "reason": "account_changed_during_discovery", "streams": [], "attempts": []}
+        if provider_key is not None:
+            # Bind the supplied manifest and addon ID to the currently cached
+            # account connection. This prevents a provider record resolved for
+            # one account from being replayed with another account's fresh token.
+            # An addon access token is optional at the protocol boundary because
+            # some connected addons expose public resources; when one is present,
+            # it must have an exact current-generation cache binding. A missing
+            # token still requires a verified, current-generation account link.
+            account_cache = _ECLIPSE_AUTH_CACHE.get("account_addons")
+            cached_account = account_cache.get("current") if isinstance(account_cache, dict) else None
+            account_result = cached_account.get("result") if isinstance(cached_account, dict) else None
+            current_jwt = _ECLIPSE_AUTH_CACHE.get("jwt")
+            current_key = hashlib.sha256(current_jwt.encode("utf-8")).hexdigest() if isinstance(current_jwt, str) and current_jwt else None
+            connection_matches = (
+                isinstance(cached_account, dict)
+                and cached_account.get("token_key") == current_key
+                and cached_account.get("accountGeneration") == account_generation
+                and time.time() < float(cached_account.get("expires_at") or 0)
+                and isinstance(account_result, dict)
+                and any(
+                    isinstance(item, dict)
+                    and item.get("addonId") == normalized_id
+                    and item.get("manifestUrl") == addon_manifest_url
+                    and item.get("isEnabled") is True
+                    for item in account_result.get("addons", [])
+                )
+            )
+            if not connection_matches:
+                return {"complete": False, "reason": "connected_addon_changed", "streams": [], "attempts": []}
+        cooldowns = _ECLIPSE_AUTH_CACHE.setdefault("addon_cooldowns", {})
+        cooldown = cooldowns.get(normalized_id) if isinstance(cooldowns, dict) else None
+        if isinstance(cooldown, dict) and cooldown.get("accountGeneration") == account_generation:
+            retry_at = float(cooldown.get("retry_at") or 0)
+            if retry_at > time.time():
+                return {
+                    "complete": False,
+                    "reason": "upstream_rate_limited",
+                    "retryAfterSeconds": max(1, int(retry_at - time.time())),
+                    "streams": [], "attempts": [],
+                }
+            cooldowns.pop(normalized_id, None)
+    if token:
+        headers["X-Eclipse-Access"] = token
+
+    last_retry_after = None
+
+    def fetch_json(url: str, timeout: float = 6.0):
+        nonlocal token, last_retry_after
+        last_retry_after = None
+        for attempt in range(3):
+            remaining = discovery_deadline - time.monotonic()
+            if remaining <= 0:
+                return None, "discovery_deadline_exceeded"
+            with _ECLIPSE_AUTH_LOCK:
+                if _ECLIPSE_AUTH_GENERATION != account_generation:
+                    return None, "account_changed"
+            request = urllib.request.Request(url, headers=headers)
+            request_deadline = time.monotonic() + min(timeout, remaining)
+            try:
+                raw = _bounded_eclipse_response(
+                    request, 1_000_000, request_deadline, min(timeout, remaining),
+                    expected_generation=account_generation,
+                )
+                with _ECLIPSE_AUTH_LOCK:
+                    if _ECLIPSE_AUTH_GENERATION != account_generation:
+                        return None, "account_changed"
+                if len(raw) > 1_000_000:
+                    return None, "response_too_large"
+                parsed = json.loads(raw.decode("utf-8"))
+                return (parsed, None) if isinstance(parsed, (dict, list)) else (None, "invalid_response")
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429:
+                    retry_header = exc.headers.get("Retry-After") if exc.headers else None
+                    if isinstance(retry_header, str) and len(retry_header) <= 128:
+                        last_retry_after = retry_header.strip()
+                    try:
+                        cooldown_seconds = max(1.0, min(3600.0, float(last_retry_after)))
+                    except (TypeError, ValueError, OverflowError):
+                        try:
+                            retry_at = email.utils.parsedate_to_datetime(last_retry_after).timestamp()
+                            cooldown_seconds = max(1.0, min(3600.0, retry_at - time.time()))
+                        except (TypeError, ValueError, OverflowError, OSError):
+                            cooldown_seconds = 60.0
+                    last_retry_after = str(int(cooldown_seconds))
+                    with _ECLIPSE_AUTH_LOCK:
+                        current_cooldowns = _ECLIPSE_AUTH_CACHE.setdefault("addon_cooldowns", {})
+                        if (_ECLIPSE_AUTH_GENERATION == account_generation
+                                and isinstance(current_cooldowns, dict)):
+                            current_cooldowns[normalized_id] = {
+                                "accountGeneration": account_generation,
+                                "retry_at": time.time() + cooldown_seconds,
+                            }
+                if exc.code == 503 and attempt < 2:
+                    retry_header = exc.headers.get("Retry-After") if exc.headers else None
+                    try:
+                        retry_seconds = max(0.0, min(30.0, float(retry_header)))
+                    except (TypeError, ValueError, OverflowError):
+                        try:
+                            retry_at = email.utils.parsedate_to_datetime(retry_header).timestamp()
+                            retry_seconds = max(0.0, min(30.0, retry_at - time.time()))
+                        except (TypeError, ValueError, OverflowError, OSError):
+                            retry_seconds = 1.0
+                    last_retry_after = str(int(retry_seconds))
+                    if retry_seconds >= discovery_deadline - time.monotonic():
+                        return None, "discovery_deadline_exceeded"
+                    if retry_seconds > 0:
+                        time.sleep(retry_seconds)
+                    continue
+                if exc.code in (401, 403) and attempt == 0:
+                    refreshed = _get_eclipse_addon_access_token(
+                        normalized_id, force_refresh=True, deadline=discovery_deadline
+                    )
+                    if refreshed:
+                        with _ECLIPSE_AUTH_LOCK:
+                            if _ECLIPSE_AUTH_GENERATION != account_generation:
+                                return None, "account_changed"
+                        token = refreshed
+                        headers["X-Eclipse-Access"] = refreshed
+                        continue
+                return None, f"http_{exc.code}"
+            except TimeoutError:
+                return None, "discovery_deadline_exceeded"
+            except Exception as exc:
+                return None, type(exc).__name__.lower()
+        return None, "authorization_failed"
+
+    selected_track = None
+    lookup_errors = []
+    clean_track_id = str(track_id or "").strip()[:512]
+    if clean_track_id:
+        selected_track = {"id": clean_track_id}
+    elif title or isrc:
+        # Eclipse recommends exact ISRC resolution before fuzzy search.
+        if isrc and capabilities["resolveISRC"] is True:
+            isrc_endpoint = _eclipse_worker_url(addon_manifest_url, "resolve-isrc", {"isrc": isrc})
+            resolved, resolve_error = fetch_json(isrc_endpoint, timeout=6.0)
+            if resolve_error:
+                lookup_errors.append("resolve_isrc_" + resolve_error)
+                if resolve_error in {"http_401", "http_403", "http_429", "account_changed", "discovery_deadline_exceeded"}:
+                    return {"complete": False, "reason": "track_resolve_isrc_" + resolve_error, "streams": [], "attempts": []}
+            elif isinstance(resolved, dict):
+                item = resolved.get("item") if isinstance(resolved.get("item"), dict) else resolved
+                resolved_id = item.get("trackId") or item.get("id")
+                if resolved_id is not None:
+                    selected_track = {**item, "id": resolved_id}
+        if selected_track is None and capabilities["search"] is not False:
+            query = f"{title} {artist}".strip() if title else str(isrc)
+            payload, search_error = fetch_json(
+                _eclipse_worker_url(addon_manifest_url, "search", {"q": query}), timeout=7.0
+            )
+            if search_error:
+                lookup_errors.append("search_" + search_error)
+                if search_error in {"http_401", "http_403", "http_429", "account_changed", "discovery_deadline_exceeded"}:
+                    return {"complete": False, "reason": "track_search_" + search_error, "streams": [], "attempts": []}
+            else:
+                rows = payload.get("tracks") or payload.get("results") or [] if isinstance(payload, dict) else payload
+                selected_track = _select_eclipse_search_track(
+                    rows if isinstance(rows, list) else [], title, artist, "", isrc=isrc, duration=duration
+                )
+        if selected_track is None and capabilities["resolveIdentity"] is True:
+            duration_value = _renderer_duration(duration)
+            duration_ms = int(round(duration_value * 1000)) if duration_value is not None else None
+            params = {"isrc": isrc or "", "title": title or "", "artist": artist or ""}
+            if duration_ms is not None:
+                params["durationMs"] = str(duration_ms)
+            resolved, resolve_error = fetch_json(
+                _eclipse_worker_url(addon_manifest_url, "resolve", params), timeout=6.0
+            )
+            if resolve_error:
+                lookup_errors.append("resolve_" + resolve_error)
+                if resolve_error in {"http_401", "http_403", "http_429", "account_changed", "discovery_deadline_exceeded"}:
+                    return {"complete": False, "reason": "track_resolve_" + resolve_error, "streams": [], "attempts": []}
+            if not resolve_error and isinstance(resolved, dict):
+                item = resolved.get("item") if isinstance(resolved.get("item"), dict) else resolved
+                resolved_id = item.get("trackId") or item.get("id")
+                if resolved_id is not None:
+                    selected_track = {**item, "id": resolved_id}
+    if not isinstance(selected_track, dict) or selected_track.get("id") is None:
+        return {
+            "complete": False,
+            "reason": "track_not_found",
+            "trackLookupErrors": lookup_errors,
+            "streams": [], "attempts": [],
+        }
+
+    resolved_track_id = str(selected_track["id"]).strip()[:512]
+    quality_requests = quality_candidates(manifest) if capabilities["stream"] is not False else []
+    quality_labels_by_selector = quality_selector_label_map(manifest)
+    quality_limit_exceeded = quality_candidate_limit_exceeded(manifest)
+    quality_options_unsafe_flag = quality_options_unsafe(manifest)
+    stream_request_plan, protocol_request_truncated = build_stream_request_plan(
+        manifest, quality_requests, limit=MAX_ECLIPSE_STREAM_REQUESTS,
+        addon_id=normalized_id,
+    )
+    streams: list[dict] = []
+    attempts: list[dict] = []
+    incomplete = quality_options_unsafe_flag or not capabilities.get("capabilitiesComplete", True)
+    stream_identity_refs: dict[str, dict] = {}
+    stream_results_truncated = False
+    malformed_stream_candidates = False
+    media_variants_complete = True
+    media_manifest_inspection_count = 0
+    media_manifest_inspection_cache: dict[str, tuple[bool | None, list[dict], bool]] = {}
+
+    def retain_native_descriptor(descriptor: dict, native: dict) -> bool:
+        with _ECLIPSE_AUTH_LOCK:
+            if _ECLIPSE_AUTH_GENERATION != account_generation:
+                return False
+            stream_store = _ECLIPSE_AUTH_CACHE.setdefault("discovered_streams", {})
+            if not isinstance(stream_store, dict):
+                return False
+            if len(stream_store) > MAX_ECLIPSE_STREAM_REQUESTS:
+                for old_ref, entry in list(stream_store.items()):
+                    if not isinstance(entry, dict) or time.time() >= float(entry.get("expires_at") or 0):
+                        stream_store.pop(old_ref, None)
+            while len(stream_store) >= MAX_ECLIPSE_STREAM_REQUESTS:
+                oldest_ref = next(iter(stream_store), None)
+                if oldest_ref is None:
+                    break
+                stream_store.pop(oldest_ref, None)
+            raw_descriptor = native.get("descriptor") if isinstance(native, dict) else {}
+            if isinstance(raw_descriptor, dict):
+                raw_descriptor = {key: value for key, value in raw_descriptor.items() if key not in {"streams", "_parent"}}
+            stream_store[descriptor["streamRef"]] = {
+                "accountGeneration": account_generation,
+                "providerKey": provider_key,
+                "addonId": normalized_id,
+                "manifestHash": hashlib.sha256(addon_manifest_url.encode("utf-8")).hexdigest(),
+                "expiresAt": descriptor.get("expiresAt"),
+                "expires_at": min(
+                    time.time() + 120.0,
+                    float(descriptor["expiresAt"]) if descriptor.get("expiresAt") else time.time() + 120.0,
+                ),
+                "addonRequestHeaders": dict(headers),
+                "native": {
+                    "url": native.get("url"),
+                    "descriptor": raw_descriptor,
+                    "effectiveProtection": native.get("effectiveProtection"),
+                },
+                "descriptor": dict(descriptor),
+            }
+            return True
+
+    def add_stream(normalized: tuple[dict, dict], requested_quality: object, request_settings: dict) -> bool:
+        nonlocal stream_results_truncated, media_variants_complete, media_manifest_inspection_count
+        descriptor, native = normalized
+        evidence = {
+            "quality": descriptor.get("requestedQuality"),
+            "settings": descriptor.get("requestSettings") or {},
+            "qualityMatch": descriptor.get("qualityMatch"),
+            "qualityMatchStatus": descriptor.get("qualityMatchStatus", "unreported"),
+        }
+        descriptor["requestedQualities"] = [evidence]
+        raw_descriptor = native.get("descriptor") if isinstance(native.get("descriptor"), dict) else {}
+        raw_descriptor = {key: value for key, value in raw_descriptor.items() if key not in {"streams", "_parent"}}
+        native = {
+            "url": native.get("url"),
+            "descriptor": raw_descriptor,
+            "effectiveProtection": native.get("effectiveProtection"),
+        }
+        native_json = json.dumps(native, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        identity = hashlib.sha256(native_json.encode("utf-8")).hexdigest()
+        existing = stream_identity_refs.get(identity)
+        if existing is not None:
+            if evidence not in existing["requestedQualities"]:
+                existing["requestedQualities"].append(evidence)
+            existing["qualityMatch"] = (
+                existing["requestedQualities"][0].get("qualityMatch")
+                if len(existing["requestedQualities"]) == 1 else None
+            )
+            existing["qualityMatchStatus"] = (
+                existing["requestedQualities"][0].get("qualityMatchStatus", "unreported")
+                if len(existing["requestedQualities"]) == 1 else "ambiguous"
+            )
+            with _ECLIPSE_AUTH_LOCK:
+                store = _ECLIPSE_AUTH_CACHE.get("discovered_streams")
+                entry = store.get(existing["streamRef"]) if isinstance(store, dict) else None
+                if isinstance(entry, dict):
+                    entry["descriptor"] = dict(existing)
+                else:
+                    if not retain_native_descriptor(descriptor, native):
+                        return False
+                    existing["streamRef"] = descriptor["streamRef"]
+                    existing["availability"] = "returned"
+                    existing["playbackCompatibility"] = descriptor.get("playbackCompatibility")
+                    rebound = store.get(existing["streamRef"]) if isinstance(store, dict) else None
+                    if isinstance(rebound, dict):
+                        rebound["descriptor"] = dict(existing)
+            return True
+        if len(streams) >= MAX_STREAM_VARIANTS:
+            stream_results_truncated = True
+            return True
+        manifest_type_value = descriptor.get("manifestType")
+        manifest_type = str(manifest_type_value).lower() if isinstance(manifest_type_value, str) and manifest_type_value else None
+        manifest_url = native.get("url")
+        media_path = urllib.parse.urlsplit(manifest_url).path.lower() if isinstance(manifest_url, str) else ""
+        media_suffix = os.path.splitext(media_path)[1]
+        known_direct_suffixes = {
+            ".mp3", ".flac", ".aac", ".aiff", ".aif", ".ogg", ".opus", ".wav",
+            ".wave", ".ac3", ".eac3", ".ec3", ".ac4", ".m4a", ".mp2", ".mpa",
+        }
+        inspect_adaptive = (
+            manifest_type in {"hls", "dash"}
+            or not media_suffix
+            or media_suffix not in known_direct_suffixes
+        )
+        if descriptor.get("urlAvailable") is True and isinstance(manifest_url, str) and inspect_adaptive:
+            raw_headers = {}
+            for key in ("headers", "httpHeaders", "requestHeaders"):
+                if isinstance(raw_descriptor.get(key), dict):
+                    raw_headers = raw_descriptor[key]
+                    break
+            canonical_headers = {
+                str(key).casefold(): value
+                for key, value in _validated_eclipse_manifest_headers(raw_headers).items()
+            }
+            inspection_context = json.dumps({
+                "url": manifest_url,
+                "manifestType": manifest_type,
+                "headers": canonical_headers,
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            manifest_key = hashlib.sha256(inspection_context.encode("utf-8")).hexdigest()
+            cached_inspection = media_manifest_inspection_cache.get(manifest_key)
+            if cached_inspection is None:
+                if media_manifest_inspection_count >= MAX_ECLIPSE_MEDIA_MANIFESTS_PER_INVENTORY:
+                    media_variants_complete = False
+                    descriptor["mediaVariants"] = []
+                    descriptor["mediaVariantsInspectionComplete"] = False
+                    descriptor["manifestProtectionStatus"] = "unknown"
+                else:
+                    media_manifest_inspection_count += 1
+                    remaining = discovery_deadline - time.monotonic()
+                    variants = []
+                    variants_complete_result = []
+                    manifest_protected = None
+                    if remaining > 0.05:
+                        manifest_protected = _eclipse_manifest_protection_status(
+                            manifest_url, manifest_type,
+                            timeout=min(8.0, remaining),
+                            expected_generation=account_generation,
+                            request_headers=raw_headers,
+                            media_variants_out=variants,
+                            media_variants_complete_out=variants_complete_result,
+                        )
+                    variants_parse_complete = (
+                        variants_complete_result[0] if variants_complete_result
+                        else manifest_protected is not None
+                    )
+                    media_manifest_inspection_cache[manifest_key] = (
+                        manifest_protected, variants, variants_parse_complete,
+                    )
+                    cached_inspection = media_manifest_inspection_cache[manifest_key]
+            if cached_inspection is not None:
+                manifest_protected, variants, variants_parse_complete = cached_inspection
+                safe_variants = [dict(item) for item in variants]
+                parent_protection = descriptor.get("protection")
+                if isinstance(parent_protection, dict) and parent_protection.get("status") == "protected":
+                    for item in safe_variants:
+                        item["protectionStatus"] = "protected"
+                        item["protectionSystems"] = list(parent_protection.get("systems") or [])
+                descriptor["mediaVariants"] = safe_variants
+                descriptor["mediaVariantsInspectionComplete"] = manifest_protected is not None and variants_parse_complete
+                descriptor["manifestProtectionStatus"] = (
+                    "protected" if manifest_protected is True
+                    else "no_protection_signal_found" if manifest_protected is False
+                    else "unknown"
+                )
+                if manifest_protected is None or not variants_parse_complete:
+                    media_variants_complete = False
+        if not retain_native_descriptor(descriptor, native):
+            return False
+        stream_identity_refs[identity] = descriptor
+        streams.append(descriptor)
+        return True
+
+    # A search streamURL is a real addon response and may be the addon's default
+    # quality. Keep it as an independent descriptor; it does not stand in for
+    # any explicitly declared quality option.
+    direct = selected_track.get("streamURL") or selected_track.get("streamUrl")
+    if isinstance(direct, str) and direct:
+        normalized = _normalize_stream(
+            {**selected_track, "url": direct}, addon_id=normalized_id, addon_name=normalized_name,
+            track_id=resolved_track_id, requested_quality=None, request_settings={}, source="search",
+        )
+        if normalized:
+            if not add_stream(normalized, None, {}):
+                return {"complete": False, "reason": "account_changed_during_discovery", "streams": [], "attempts": []}
+        else:
+            malformed_stream_candidates = True
+            incomplete = True
+    elif direct:
+        malformed_stream_candidates = True
+        incomplete = True
+
+    for candidate in stream_request_plan:
+        remaining = discovery_deadline - time.monotonic()
+        if remaining <= 0.05:
+            incomplete = True
+            attempts.append({
+                "requestedQuality": candidate.get("requestedQuality"),
+                "qualityKey": candidate.get("qualityKey"),
+                "negotiation": candidate.get("negotiation") or {},
+                "status": "not_attempted",
+                "availability": "unknown",
+                "reason": "discovery_deadline_exceeded",
+            })
+            continue
+        params = dict(candidate.get("settings") or {})
+        quality_keys = candidate.get("qualityKey")
+        quality_keys = quality_keys if isinstance(quality_keys, list) else [quality_keys]
+        quality_selector_values = [
+            params[key] for key in quality_keys
+            if isinstance(key, str) and key in params and isinstance(params[key], str)
+        ]
+        stream_url = _eclipse_worker_url(
+            addon_manifest_url, f"stream/{urllib.parse.quote(resolved_track_id, safe='')}", params
+        )
+        payload, error = fetch_json(stream_url, timeout=min(8.0, max(0.1, remaining)))
+        attempt = {
+            "requestedQuality": candidate.get("requestedQuality"),
+            "qualityKey": candidate.get("qualityKey"),
+            "negotiation": candidate.get("negotiation") or {},
+            "status": "failed" if error else "no_stream_returned",
+            "reason": error,
+        }
+        if error:
+            incomplete = True
+            if error in {"http_401", "http_403", "http_429", "response_too_large"}:
+                attempt["availability"] = "unknown"
+            attempts.append(attempt)
+            if error in {"http_401", "http_403", "http_429"}:
+                if error == "http_429" and last_retry_after is not None:
+                    try:
+                        attempt["retryAfterSeconds"] = max(1, min(3600, int(float(last_retry_after))))
+                    except (ValueError, OverflowError):
+                        attempt["retryAfterSeconds"] = 60
+                for pending in stream_request_plan[len(attempts):]:
+                    attempts.append({
+                        "requestedQuality": pending.get("requestedQuality"),
+                        "qualityKey": pending.get("qualityKey"),
+                        "negotiation": pending.get("negotiation") or {},
+                        "status": "not_attempted",
+                        "availability": "unknown",
+                        "reason": "stopped_after_upstream_authorization_or_rate_limit",
+                    })
+                break
+            continue
+        normalized_any = False
+        if stream_payload_truncated(payload):
+            stream_results_truncated = True
+            incomplete = True
+        if stream_payload_has_malformed_items(payload):
+            malformed_stream_candidates = True
+            incomplete = True
+        for item in flatten_stream_payload(payload):
+            parent = item.pop("_parent", None)
+            normalized = _normalize_stream(
+                item,
+                addon_id=normalized_id,
+                addon_name=normalized_name,
+                track_id=resolved_track_id,
+                requested_quality=candidate.get("requestedQuality"),
+                request_settings=candidate.get("publicSettings") or {},
+                quality_selector_values=quality_selector_values,
+                quality_selector_labels=quality_labels_by_selector,
+                parent=parent,
+            )
+            if normalized:
+                if not add_stream(normalized, candidate.get("requestedQuality"), params):
+                    return {"complete": False, "reason": "account_changed_during_discovery", "streams": [], "attempts": []}
+                normalized_any = True
+            else:
+                malformed_stream_candidates = True
+                incomplete = True
+        if normalized_any:
+            attempt["status"] = "returned"
+            attempt["reason"] = None
+            attempt["availability"] = "returned"
+        elif (
+            isinstance(payload, list) and payload
+            or isinstance(payload, dict) and (
+                "streams" in payload and (
+                    not isinstance(payload.get("streams"), list) or bool(payload.get("streams"))
+                )
+                or "streams" not in payload and bool(payload)
+            )
+        ):
+            attempt["status"] = "invalid_stream_descriptors"
+            attempt["reason"] = "no_valid_stream_descriptor"
+            attempt["availability"] = "unknown"
+            malformed_stream_candidates = True
+            incomplete = True
+        attempts.append(attempt)
+    with _ECLIPSE_AUTH_LOCK:
+        if _ECLIPSE_AUTH_GENERATION != account_generation:
+            return {"complete": False, "reason": "account_changed_during_discovery", "streams": [], "attempts": []}
+        # Start the local opaque-reference TTL when discovery completes, not
+        # when an early stream is found. Provider expiry remains authoritative.
+        completed_at = time.time()
+        stream_store = _ECLIPSE_AUTH_CACHE.get("discovered_streams")
+        native_references_complete = _finalize_stream_reference_inventory(
+            streams,
+            stream_store if isinstance(stream_store, dict) else {},
+            account_generation,
+            completed_at,
+        )
+    enumeration_complete = (
+        not incomplete and not quality_limit_exceeded and not protocol_request_truncated
+        and not stream_results_truncated and media_variants_complete
+        and not platform_blocked_profiles and native_references_complete
+    )
+    return {
+        "complete": enumeration_complete,
+        "completeScope": "declared quality options and supported playback-negotiation requests plus inspected HLS/DASH audio representations; provider-wide and account-hidden coverage is unknown",
+        "providerCoverageStatus": "unknown",
+        "completeness": {
+            "manifestSettingsComplete": (
+                isinstance(manifest.get("settings"), list)
+                and not unclassified_select_settings(manifest)
+            ),
+            "addonCapabilitiesComplete": capabilities.get("capabilitiesComplete", True),
+            "malformedAddonCapabilityFields": capabilities.get("malformedCapabilityFields", []),
+            "unclassifiedSelectSettings": unclassified_select_settings(manifest),
+            "qualityRequestsComplete": (
+                not incomplete and not quality_limit_exceeded
+                and not protocol_request_truncated and not stream_results_truncated
+                and not malformed_stream_candidates
+            ),
+            "qualityEnumerationTruncated": quality_limit_exceeded,
+            "protocolRequestEnumerationTruncated": protocol_request_truncated,
+            "qualityOptionsUnsafe": quality_options_unsafe_flag,
+            "streamResultsTruncated": stream_results_truncated,
+            "malformedStreamCandidates": malformed_stream_candidates,
+            "nativeReferencesComplete": native_references_complete,
+            "mediaVariantsComplete": media_variants_complete,
+            "paginationComplete": None,
+            "coverage": "declared_addon_quality_options_playback_profiles_returned_descriptors_and_inspected_adaptive_audio_representations",
+            "providerExhaustivenessVerified": False,
+            "platformBlockedProfiles": platform_blocked_profiles,
+            "providerParityVerified": False,
+        },
+        "reason": (
+            None if enumeration_complete else
+            "quality_option_product_exceeds_discovery_limit" if quality_limit_exceeded else
+            "playback_negotiation_matrix_exceeds_discovery_limit" if protocol_request_truncated else
+            "adaptive_manifest_rendition_inspection_incomplete" if not media_variants_complete else
+            "protected_playback_profile_requires_unavailable_fairplay" if platform_blocked_profiles else
+            "native_stream_reference_retention_incomplete" if not native_references_complete else
+            "unsafe_quality_option_metadata_omitted" if quality_options_unsafe_flag else
+            "one_or_more_quality_requests_unverified"
+        ),
+        "trackId": _renderer_text(resolved_track_id, 256),
+        "track": {
+            "title": _renderer_text(selected_track.get("title") or selected_track.get("name") or title, 512),
+            "artist": _renderer_text(selected_track.get("artist") or selected_track.get("artistName") or artist, 512),
+            "isrc": _renderer_text(selected_track.get("isrc") or isrc, 64),
+            "duration": _renderer_duration(selected_track.get("duration") or duration),
+        },
+        "addonCapabilities": capabilities,
+        "qualityOptions": [
+            {key: value for key, value in option.items() if key != "settings"}
+            for option in quality_requests
+        ],
+        "streams": streams,
+        "attempts": attempts,
+        "settingsSource": "manifest_quality_options; Eclipse account-specific settings are not exposed by the account addon connection response",
+        "urlPolicy": "media URLs and authorization headers are not serialized to the renderer",
+    }
+
+
+def discover_eclipse_addon_streams(addon_manifest_url: str, *, timeout_ms: int = 120_000, **kwargs) -> dict:
+    """Run at most two authenticated addon discoveries concurrently."""
+    if not _ECLIPSE_STREAM_DISCOVERY_SEMAPHORE.acquire(blocking=False):
+        return {"complete": False, "reason": "discovery_capacity_reached", "streams": [], "attempts": []}
+    try:
+        return _discover_eclipse_addon_streams_impl(addon_manifest_url, timeout_ms=timeout_ms, **kwargs)
+    finally:
+        _ECLIPSE_STREAM_DISCOVERY_SEMAPHORE.release()
+
+
+def get_discovered_eclipse_stream(stream_ref: str, provider_key: str) -> dict | None:
+    """Look up an opaque native-only descriptor after checking auth/provider scope."""
+    if not isinstance(stream_ref, str) or not re.fullmatch(r"[A-Za-z0-9_-]{24,64}", stream_ref):
+        return None
+    if not isinstance(provider_key, str) or not re.fullmatch(r"eclipse:[0-9a-f]{20}", provider_key):
+        return None
+    with _ECLIPSE_AUTH_LOCK:
+        store = _ECLIPSE_AUTH_CACHE.get("discovered_streams")
+        entry = store.get(stream_ref) if isinstance(store, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("providerKey") != provider_key:
+            return None
+        if (entry.get("accountGeneration") != _ECLIPSE_AUTH_GENERATION
+                or time.time() >= float(entry.get("expires_at") or 0)):
+            store.pop(stream_ref, None)
+            return None
+        native_entry = dict(entry)
+    provider_order, addon_providers = _ordered_resolution_providers(load_settings())
+    provider = addon_providers.get(provider_key)
+    if provider_key not in provider_order or not isinstance(provider, dict):
+        with _ECLIPSE_AUTH_LOCK:
+            store = _ECLIPSE_AUTH_CACHE.get("discovered_streams")
+            if isinstance(store, dict):
+                store.pop(stream_ref, None)
+        return None
+    manifest_url = provider.get("manifestUrl")
+    if (not isinstance(manifest_url, str)
+            or hashlib.sha256(manifest_url.encode("utf-8")).hexdigest() != native_entry.get("manifestHash")):
+        return None
+    with _ECLIPSE_AUTH_LOCK:
+        store = _ECLIPSE_AUTH_CACHE.get("discovered_streams")
+        current_entry = store.get(stream_ref) if isinstance(store, dict) else None
+        if (not isinstance(current_entry, dict)
+                or current_entry.get("providerKey") != provider_key
+                or current_entry.get("accountGeneration") != _ECLIPSE_AUTH_GENERATION
+                or current_entry.get("accountGeneration") != native_entry.get("accountGeneration")
+                or time.time() >= float(current_entry.get("expires_at") or 0)
+                or current_entry.get("manifestHash") != native_entry.get("manifestHash")):
+            return None
+        return copy.deepcopy(current_entry)
+
+
 def _tidal_alternate_track_matches(original, candidate) -> bool:
     """Accept only the same recording when expanding TIDAL album editions."""
     if getattr(candidate, "id", None) == getattr(original, "id", None):
@@ -5644,6 +7069,14 @@ def resolve_tido_eclipse_addon(
     try:
         base = _eclipse_worker_base_url(addon_manifest_url)
         addon_token = _get_eclipse_addon_access_token("com.yourname.tidal.hifi")
+        with _ECLIPSE_AUTH_LOCK:
+            account_generation = _ECLIPSE_AUTH_GENERATION
+            if addon_token:
+                token_cache = _ECLIPSE_AUTH_CACHE.get("addon_tokens")
+                token_entry = token_cache.get("com.yourname.tidal.hifi") if isinstance(token_cache, dict) else None
+                if (not isinstance(token_entry, dict) or token_entry.get("token") != addon_token
+                        or token_entry.get("accountGeneration") != account_generation):
+                    return None
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
@@ -5656,14 +7089,32 @@ def resolve_tido_eclipse_addon(
 
         def _fetch_json(url: str, timeout: float = 6.0) -> dict | list | None:
             for attempt in range(2):
+                with _ECLIPSE_AUTH_LOCK:
+                    if _ECLIPSE_AUTH_GENERATION != account_generation:
+                        return None
                 req = urllib.request.Request(url, headers=headers)
                 try:
-                    with _eclipse_authenticated_urlopen(req, timeout=timeout) as resp:
-                        return json.loads(resp.read().decode("utf-8"))
+                    request_deadline = time.monotonic() + timeout
+                    raw = _bounded_eclipse_response(
+                        req, 1_000_000, request_deadline, timeout,
+                        expected_generation=account_generation,
+                    )
+                    with _ECLIPSE_AUTH_LOCK:
+                        if _ECLIPSE_AUTH_GENERATION != account_generation:
+                            return None
+                    return json.loads(raw.decode("utf-8"))
                 except urllib.error.HTTPError as exc:
                     if exc.code in (401, 403) and attempt == 0:
                         refreshed = _get_eclipse_addon_access_token("com.yourname.tidal.hifi", force_refresh=True)
                         if refreshed:
+                            with _ECLIPSE_AUTH_LOCK:
+                                if _ECLIPSE_AUTH_GENERATION != account_generation:
+                                    return None
+                                token_cache = _ECLIPSE_AUTH_CACHE.get("addon_tokens")
+                                token_entry = token_cache.get("com.yourname.tidal.hifi") if isinstance(token_cache, dict) else None
+                                if (not isinstance(token_entry, dict) or token_entry.get("token") != refreshed
+                                        or token_entry.get("accountGeneration") != account_generation):
+                                    return None
                             headers["X-Eclipse-Access"] = refreshed
                             continue
                     return None
@@ -5688,14 +7139,21 @@ def resolve_tido_eclipse_addon(
             cached_tracks = None
             if isinstance(search_cache, dict):
                 entry = search_cache.get(lookup_key)
-                if isinstance(entry, dict) and now < float(entry.get("expires_at") or 0):
+                if (isinstance(entry, dict) and entry.get("accountGeneration") == account_generation
+                        and now < float(entry.get("expires_at") or 0)):
                     cached_tracks = entry.get("tracks")
             if not isinstance(cached_tracks, list):
                 query = f"{title} {artist}".strip()
                 s_res = _fetch_json(_eclipse_worker_url(addon_manifest_url, "search", {"q": query}), timeout=5.0)
                 cached_tracks = s_res.get("tracks", []) if isinstance(s_res, dict) else (s_res if isinstance(s_res, list) else [])
                 if isinstance(search_cache, dict) and isinstance(cached_tracks, list):
-                    search_cache[lookup_key] = {"tracks": cached_tracks, "expires_at": now + 600.0}
+                    with _ECLIPSE_AUTH_LOCK:
+                        if _ECLIPSE_AUTH_GENERATION != account_generation:
+                            return None
+                        search_cache[lookup_key] = {
+                            "tracks": cached_tracks, "expires_at": now + 600.0,
+                            "accountGeneration": account_generation,
+                        }
             if isinstance(cached_tracks, list):
                 norm_title = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
                 for item in cached_tracks:
@@ -5716,21 +7174,35 @@ def resolve_tido_eclipse_addon(
             s_data = _fetch_json(stream_url, timeout=8.0)
             if not isinstance(s_data, dict) or not s_data.get("url"):
                 continue
+            with _ECLIPSE_AUTH_LOCK:
+                if _ECLIPSE_AUTH_GENERATION != account_generation:
+                    return None
+            if stream_has_protection_indicators(s_data):
+                continue
 
             raw_codec = str(s_data.get("codec") or "").strip().lower()
             tier = str(s_data.get("tier") or "").strip().upper()
             quality_label = str(s_data.get("quality") or s_data.get("format") or "").strip()
-            sample_rate = int(s_data.get("sampleRate") or (48000 if "eac3" in raw_codec or "ec-3" in raw_codec else 44100))
+            sample_rate_raw = s_data.get("sampleRate")
+            if sample_rate_raw is None:
+                sample_rate = 48000 if "eac3" in raw_codec or "ec-3" in raw_codec else 44100
+            else:
+                sample_rate = _bounded_integer(sample_rate_raw, minimum=8_000, maximum=768_000)
+                if sample_rate is None:
+                    continue
             bit_depth_raw = s_data.get("bitDepth")
-            bit_depth = int(bit_depth_raw) if isinstance(bit_depth_raw, (int, float)) and int(bit_depth_raw) > 0 else None
+            bit_depth = None if bit_depth_raw is None else _bounded_integer(bit_depth_raw, minimum=1, maximum=64)
+            if bit_depth_raw is not None and bit_depth is None:
+                continue
 
-            is_atmos = (
-                tier == "EAC3_JOC"
-                or "eac3" in raw_codec
-                or "ec-3" in raw_codec
-                or "joc" in raw_codec
-                or "atmos" in quality_label.lower()
-            )
+            is_atmos = tier == "EAC3_JOC" or raw_codec in {
+                "eac3_joc", "e-ac-3 joc", "eac3-joc", "ec-3 joc",
+            }
+            is_flac = raw_codec in {"flac", "audio/flac"} or tier in {"FLAC", "FLAC_HIRES"}
+            if not is_atmos and not is_flac:
+                # An Atmos label or generic E-AC-3 codec does not prove JOC;
+                # unknown codecs must not be relabelled as lossless FLAC.
+                continue
             is_hires = not is_atmos and (tier == "FLAC_HIRES" or sample_rate > 48000 or (bit_depth is not None and bit_depth > 16))
 
             if is_atmos:
@@ -5744,10 +7216,19 @@ def resolve_tido_eclipse_addon(
                 continue
 
             media_url = str(s_data["url"])
-            if ".mpd" in media_url.lower():
+            manifest_type = s_data.get("manifest") if isinstance(s_data.get("manifest"), str) else None
+            manifest_protection = _eclipse_manifest_protection_status(
+                media_url, manifest_type, expected_generation=account_generation
+            )
+            if manifest_protection is not False:
+                continue
+            if str(manifest_type or "").lower() == "dash" or ".mpd" in media_url.lower():
                 req_mpd = urllib.request.Request(media_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req_mpd, timeout=8.0) as mpd_resp:
-                    manifest_xml = mpd_resp.read().decode("utf-8-sig")
+                mpd_deadline = time.monotonic() + 8.0
+                manifest_xml = _bounded_eclipse_response(
+                    req_mpd, 4_000_000, mpd_deadline, 8.0,
+                    expected_generation=account_generation,
+                ).decode("utf-8-sig")
                 if dash_manifest_contains_content_protection(manifest_xml):
                     continue
                 dash = get_tidal_dash_audio_metadata(manifest_xml=manifest_xml)
@@ -5758,6 +7239,9 @@ def resolve_tido_eclipse_addon(
 
                 if is_atmos:
                     evidence = verify_eac3_joc_manifest(validated_xml)
+                    with _ECLIPSE_AUTH_LOCK:
+                        if _ECLIPSE_AUTH_GENERATION != account_generation:
+                            return None
                     return {
                         "format": "EAC3_JOC",
                         "codec": "eac3_joc",
@@ -5781,6 +7265,9 @@ def resolve_tido_eclipse_addon(
                     }
                 else:
                     label = "Hi-Res FLAC" if stream_fmt == "HI_RES_LOSSLESS" else "Lossless FLAC"
+                    with _ECLIPSE_AUTH_LOCK:
+                        if _ECLIPSE_AUTH_GENERATION != account_generation:
+                            return None
                     return {
                         "format": stream_fmt,
                         "codec": "flac",
@@ -5804,7 +7291,17 @@ def resolve_tido_eclipse_addon(
                         "requestSession": requests.Session(),
                     }
             else:
-                probed_br, br_basis = _probe_direct_audio_bitrate(media_url, float(duration or 0), headers)
+                media_probe_headers = {
+                    "User-Agent": headers["User-Agent"],
+                    "Accept": "*/*",
+                }
+                probed_br, br_basis = _probe_direct_audio_bitrate(
+                    media_url, float(duration or 0), media_probe_headers,
+                    expected_generation=account_generation,
+                )
+                with _ECLIPSE_AUTH_LOCK:
+                    if _ECLIPSE_AUTH_GENERATION != account_generation:
+                        return None
                 return {
                     "format": stream_fmt,
                     "codec": "eac3_joc" if is_atmos else "flac",
@@ -5850,6 +7347,14 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
         )
         provider_label = "AMAZON" if is_amazon else re.sub(r"[\[\]\r\n]+", " ", normalized_addon_name or normalized_addon_id or "ECLIPSE").strip()[:64]
         addon_token = _get_eclipse_addon_access_token(normalized_addon_id) if normalized_addon_id else None
+        with _ECLIPSE_AUTH_LOCK:
+            account_generation = _ECLIPSE_AUTH_GENERATION
+            if addon_token:
+                token_cache = _ECLIPSE_AUTH_CACHE.get("addon_tokens")
+                token_entry = token_cache.get(normalized_addon_id) if isinstance(token_cache, dict) else None
+                if (not isinstance(token_entry, dict) or token_entry.get("token") != addon_token
+                        or token_entry.get("accountGeneration") != account_generation):
+                    return None
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
@@ -5862,17 +7367,35 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
 
         def _fetch_json(url: str, timeout: float = 5.0) -> dict | list | None:
             for attempt in range(2):
+                with _ECLIPSE_AUTH_LOCK:
+                    if _ECLIPSE_AUTH_GENERATION != account_generation:
+                        return None
                 req = urllib.request.Request(url, headers=headers)
                 try:
-                    with _eclipse_authenticated_urlopen(req, timeout=timeout) as resp:
-                        return json.loads(resp.read().decode("utf-8"))
+                    request_deadline = time.monotonic() + timeout
+                    raw = _bounded_eclipse_response(
+                        req, 1_000_000, request_deadline, timeout,
+                        expected_generation=account_generation,
+                    )
+                    with _ECLIPSE_AUTH_LOCK:
+                        if _ECLIPSE_AUTH_GENERATION != account_generation:
+                            return None
+                    return json.loads(raw.decode("utf-8"))
                 except urllib.error.HTTPError as exc:
                     if exc.code == 415 and is_gravity_addon:
-                        print("[-] Eclipse/Gravity requires compatible protected playback (HTTP 415)")
+                        print("[-] Eclipse/Gravity rejected the stream request (HTTP 415); cause unverified")
                         return None
                     if exc.code in (401, 403) and attempt == 0:
                         refreshed = _get_eclipse_addon_access_token(normalized_addon_id, force_refresh=True) if normalized_addon_id else None
                         if refreshed:
+                            with _ECLIPSE_AUTH_LOCK:
+                                if _ECLIPSE_AUTH_GENERATION != account_generation:
+                                    return None
+                                token_cache = _ECLIPSE_AUTH_CACHE.get("addon_tokens")
+                                token_entry = token_cache.get(normalized_addon_id) if isinstance(token_cache, dict) else None
+                                if (not isinstance(token_entry, dict) or token_entry.get("token") != refreshed
+                                        or token_entry.get("accountGeneration") != account_generation):
+                                    return None
                             headers["X-Eclipse-Access"] = refreshed
                             continue
                     return None
@@ -5889,14 +7412,20 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
         matched_track_meta: dict = {}
         if explicit_track_id:
             track_id = str(explicit_track_id).strip()
+            # Bind cached identity metadata to this addon's exact lookup key.
+            # Track IDs are provider-local and routinely collide across addons.
             if isinstance(search_cache, dict):
-                for entry in search_cache.values():
-                    if isinstance(entry, dict) and entry.get("track_id") == track_id and isinstance(entry.get("meta"), dict):
-                        matched_track_meta = entry["meta"]
-                        break
+                entry = search_cache.get(lookup_key)
+                if (isinstance(entry, dict) and entry.get("accountGeneration") == account_generation
+                        and entry.get("track_id") == track_id
+                        and now < float(entry.get("expires_at") or 0)
+                        and isinstance(entry.get("meta"), dict)):
+                    matched_track_meta = entry["meta"]
         else:
             cached_lookup = search_cache.get(lookup_key) if isinstance(search_cache, dict) else None
-            if isinstance(cached_lookup, dict) and now < float(cached_lookup.get("expires_at") or 0):
+            if (isinstance(cached_lookup, dict)
+                    and cached_lookup.get("accountGeneration") == account_generation
+                    and now < float(cached_lookup.get("expires_at") or 0)):
                 track_id = cached_lookup.get("track_id")
                 matched_track_meta = cached_lookup.get("meta") or {}
 
@@ -5941,11 +7470,15 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
                     matched_track_meta = item
 
         if track_id and isinstance(search_cache, dict):
-            search_cache[lookup_key] = {
-                "track_id": track_id,
-                "meta": matched_track_meta,
-                "expires_at": now + 600.0,
-            }
+            with _ECLIPSE_AUTH_LOCK:
+                if _ECLIPSE_AUTH_GENERATION != account_generation:
+                    return None
+                search_cache[lookup_key] = {
+                    "track_id": track_id,
+                    "meta": matched_track_meta,
+                    "expires_at": now + 600.0,
+                    "accountGeneration": account_generation,
+                }
 
         # 4. Spec 3: Stream Resolution -> GET /stream/{id}?quality={quality}
         target_id = track_id or isrc
@@ -5962,83 +7495,87 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
         s_data = None
         if isinstance(stream_cache, dict):
             cached_s = stream_cache.get(stream_cache_key)
-            if isinstance(cached_s, dict) and now < float(cached_s.get("expires_at") or 0):
+            if (isinstance(cached_s, dict)
+                    and cached_s.get("accountGeneration") == account_generation
+                    and now < float(cached_s.get("expires_at") or 0)):
                 s_data = cached_s.get("data")
 
         if not isinstance(s_data, dict):
             stream_url = _eclipse_worker_url(addon_manifest_url, f"stream/{urllib.parse.quote(str(target_id))}", {"quality": quality_param})
             s_data = _fetch_json(stream_url, timeout=6.0)
             if isinstance(s_data, dict) and isinstance(stream_cache, dict):
-                stream_cache[stream_cache_key] = {
-                    "data": s_data,
-                    "expires_at": now + 120.0,
-                }
-                # If Atmos_EC-3 fell back to FLAC on the server, it is identical to the Max FLAC response
-                codec_check = str(s_data.get("codec") or s_data.get("format") or "").lower()
-                if quality_param == "Atmos_EC-3" and "flac" in codec_check and "atmos" not in codec_check:
-                    stream_cache[f"{base}|{target_id}|Max"] = {
+                with _ECLIPSE_AUTH_LOCK:
+                    if _ECLIPSE_AUTH_GENERATION != account_generation:
+                        return None
+                    stream_cache[stream_cache_key] = {
                         "data": s_data,
                         "expires_at": now + 120.0,
+                        "accountGeneration": account_generation,
                     }
 
         if not isinstance(s_data, dict):
             return None
 
-        if is_gravity_addon and (
-            s_data.get("encrypted") is True
-            or bool(s_data.get("drm"))
-            or any(s_data.get(key) for key in ("keySystem", "licenseUrl", "licenseURL", "drmSystem"))
-        ):
+        with _ECLIPSE_AUTH_LOCK:
+            if _ECLIPSE_AUTH_GENERATION != account_generation:
+                return None
+
+        if stream_has_protection_indicators(s_data):
             return None
 
         # If LOSSLESS was explicitly requested and Max returned >48kHz/24-bit, request 16-bit/44.1kHz Lossless specifically
         if requested_fmt == "LOSSLESS":
-            sr_check = int(s_data.get("sampleRate") or 44100)
-            bd_check = int(s_data.get("bitDepth") or 16)
-            if sr_check > 48000 or bd_check > 16:
+            sr_check = _bounded_integer(s_data.get("sampleRate"), minimum=8_000, maximum=768_000)
+            bd_check = _bounded_integer(s_data.get("bitDepth"), minimum=1, maximum=64)
+            if (sr_check is not None and sr_check > 48000) or (bd_check is not None and bd_check > 16):
                 lossless_url = _eclipse_worker_url(addon_manifest_url, f"stream/{urllib.parse.quote(str(target_id))}", {"quality": "Lossless"})
                 lossless_data = _fetch_json(lossless_url, timeout=6.0)
                 if isinstance(lossless_data, dict):
                     s_data = lossless_data
+                with _ECLIPSE_AUTH_LOCK:
+                    if _ECLIPSE_AUTH_GENERATION != account_generation:
+                        return None
 
-        if is_gravity_addon and (
-            s_data.get("encrypted") is True
-            or bool(s_data.get("drm"))
-            or any(s_data.get(key) for key in ("keySystem", "licenseUrl", "licenseURL", "drmSystem"))
-        ):
+        if stream_has_protection_indicators(s_data):
             return None
 
         streams = s_data.get("streams") if isinstance(s_data.get("streams"), list) else [s_data]
         for s in streams:
             if not isinstance(s, dict) or not s.get("url"):
                 continue
-            if is_gravity_addon and (
-                s.get("encrypted") is True
-                or bool(s.get("drm"))
-                or any(s.get(key) for key in ("keySystem", "licenseUrl", "licenseURL", "drmSystem"))
-            ):
+            if stream_has_protection_indicators(s, parent=s_data):
                 continue
-            raw_codec = str(s.get("codec") or s.get("format") or "flac").strip().lower()
+            raw_codec = str(s.get("codec") or s.get("format") or "").strip().lower()
             codec_token = str(s.get("codec") or "").strip().lower()
             quality_label = str(s.get("quality") or s.get("format") or "").strip()
+            tier = str(s.get("tier") or "").strip().upper()
+            is_explicit_joc = codec_token in {"eac3_joc", "e-ac-3 joc", "eac3-joc", "ec-3 joc"} or tier == "EAC3_JOC"
+            is_flac = codec_token in {"flac", "audio/flac"} or tier in {"FLAC", "FLAC_HIRES"}
             if is_gravity_addon:
-                if codec_token not in {"eac3_joc", "flac"}:
+                if not is_explicit_joc and not is_flac:
                     continue
-                if requested_fmt == "EAC3_JOC" and codec_token != "eac3_joc":
+                if requested_fmt == "EAC3_JOC" and not is_explicit_joc:
                     continue
-                if requested_fmt in {"HI_RES_LOSSLESS", "LOSSLESS"} and codec_token != "flac":
+                if requested_fmt in {"HI_RES_LOSSLESS", "LOSSLESS"} and not is_flac:
                     continue
-            sample_rate = int(s.get("sampleRate") or 48000 if "ec-3" in raw_codec or "eac3" in raw_codec else int(s.get("sampleRate") or 44100))
-            is_atmos = codec_token == "eac3_joc" if is_gravity_addon else (
-                "ec-3" in raw_codec
-                or "eac3" in raw_codec
-                or "joc" in raw_codec
-                or "atmos" in quality_label.lower()
-                or "atmos" in str(s.get("format") or "").lower()
+            elif not is_explicit_joc and not is_flac:
+                # Playback remains limited to explicitly supported codecs;
+                # the separate inventory preserves all other addon formats.
+                continue
+            sample_rate_raw = s.get("sampleRate")
+            sample_rate = None if sample_rate_raw is None else _bounded_integer(
+                sample_rate_raw, minimum=8_000, maximum=768_000
             )
+            if sample_rate_raw is not None and sample_rate is None:
+                continue
+            is_atmos = is_explicit_joc
             bit_depth_raw = s.get("bitDepth")
-            bit_depth = int(bit_depth_raw) if isinstance(bit_depth_raw, (int, float)) and int(bit_depth_raw) > 0 else (None if is_atmos else (24 if sample_rate > 48000 else 16))
-            is_hires = not is_atmos and (sample_rate > 48000 or (bit_depth is not None and bit_depth > 16))
+            bit_depth = None if bit_depth_raw is None else _bounded_integer(
+                bit_depth_raw, minimum=1, maximum=64
+            )
+            if bit_depth_raw is not None and bit_depth is None:
+                continue
+            is_hires = is_flac and ((sample_rate is not None and sample_rate > 48000) or (bit_depth is not None and bit_depth > 16))
 
             if is_atmos:
                 stream_fmt = "EAC3_JOC"
@@ -6050,12 +7587,42 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
             if requested_fmt and stream_fmt != requested_fmt:
                 continue
 
-            duration = float(s.get("duration") or matched_track_meta.get("duration") or 0)
-            probed_bitrate, bitrate_basis = _probe_direct_audio_bitrate(s["url"], duration, headers)
-            detected_transport = _probe_direct_media_transport(s["url"], headers)
-            explicit_bitrate = s.get("bitrate")
-            if isinstance(explicit_bitrate, (int, float)) and explicit_bitrate > 0:
-                source_bitrate = int(explicit_bitrate)
+            duration_raw = s.get("duration") or matched_track_meta.get("duration") or 0
+            try:
+                duration = float(duration_raw)
+            except (TypeError, ValueError, OverflowError):
+                duration = 0.0
+            if not math.isfinite(duration) or duration < 0:
+                duration = 0.0
+            manifest_protection = _eclipse_manifest_protection_status(
+                s["url"], s.get("manifest") if isinstance(s.get("manifest"), str) else None,
+                expected_generation=account_generation,
+            )
+            if manifest_protection is not False:
+                continue
+            # Addon access tokens are scoped to the addon's own origin. Never
+            # forward them to a CDN URL supplied by an untrusted response.
+            media_probe_headers = {
+                "User-Agent": headers["User-Agent"],
+                "Accept": "*/*",
+            }
+            probed_bitrate, bitrate_basis = _probe_direct_audio_bitrate(
+                s["url"], duration, media_probe_headers,
+                expected_generation=account_generation,
+            )
+            detected_transport = _probe_direct_media_transport(
+                s["url"], media_probe_headers,
+                expected_generation=account_generation,
+            )
+            with _ECLIPSE_AUTH_LOCK:
+                if _ECLIPSE_AUTH_GENERATION != account_generation:
+                    return None
+            explicit_bitrate_raw = s.get("bitrate")
+            explicit_bitrate = None if explicit_bitrate_raw is None else _bounded_integer(
+                explicit_bitrate_raw, minimum=1, maximum=100_000_000
+            )
+            if explicit_bitrate is not None:
+                source_bitrate = explicit_bitrate
                 source_bitrate_basis = "Addon reported"
             elif probed_bitrate:
                 source_bitrate = probed_bitrate
@@ -6064,29 +7631,34 @@ def resolve_eclipse_addon(addon_manifest_url: str, isrc: str, requested_fmt: str
                 source_bitrate = 768000
                 source_bitrate_basis = "Estimated E-AC-3 JOC"
             else:
-                channels_est = int(s.get("channels") or 2)
-                depth_est = bit_depth or 16
-                source_bitrate = int(sample_rate * depth_est * channels_est * 0.65)
-                source_bitrate_basis = "Estimated FLAC"
+                channels_est = _bounded_integer(s.get("channels"), minimum=1, maximum=64)
+                source_bitrate = (
+                    int(sample_rate * bit_depth * channels_est * 0.65)
+                    if sample_rate is not None and bit_depth is not None
+                    and channels_est is not None
+                    else None
+                )
+                source_bitrate_basis = "Estimated FLAC" if source_bitrate is not None else None
 
             if is_atmos:
                 human_label = "[AMAZON] Dolby Atmos (E-AC-3 JOC)" if is_amazon else f"[{provider_label}] Dolby Atmos (E-AC-3 JOC)"
                 norm_codec = "eac3_joc"
                 source_codec = "EAC3_JOC"
                 source_audio_mode = "DOLBY_ATMOS"
-                channels = int(s.get("channels") or 6)
+                channels = int(s["channels"]) if isinstance(s.get("channels"), (int, float)) and s["channels"] > 0 else None
             elif is_hires:
-                human_label = f"[{provider_label}] Hi-Res FLAC ({bit_depth}-bit/{sample_rate / 1000:g}kHz)"
+                detail = "/".join(([f"{bit_depth}-bit"] if bit_depth else []) + ([f"{sample_rate / 1000:g}kHz"] if sample_rate else []))
+                human_label = f"[{provider_label}] Hi-Res FLAC ({detail})" if detail else f"[{provider_label}] Hi-Res FLAC"
                 norm_codec = "flac"
                 source_codec = "FLAC"
                 source_audio_mode = "STEREO"
-                channels = int(s.get("channels") or 2)
+                channels = int(s["channels"]) if isinstance(s.get("channels"), (int, float)) and s["channels"] > 0 else None
             else:
                 human_label = f"[{provider_label}] Lossless FLAC"
                 norm_codec = "flac"
                 source_codec = "FLAC"
                 source_audio_mode = "STEREO"
-                channels = int(s.get("channels") or 2)
+                channels = int(s["channels"]) if isinstance(s.get("channels"), (int, float)) and s["channels"] > 0 else None
 
             return {
                 "format": stream_fmt,
@@ -7387,6 +8959,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 "status": "ok",
                 "service": "OmniFusion Standalone Audio Engine",
                 "version": SERVICE_VERSION,
+                "runtimeBundleSha256": RUNTIME_BUNDLE_SHA256,
                 "serviceInstanceId": SERVICE_INSTANCE_ID,
                 "servicePid": os.getpid(),
                 "tidalOwnerPid": TIDAL_OWNER_PID,
@@ -7429,6 +9002,55 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json(provider_config)
             except Exception as exc:
                 self.send_json({"error": f"provider list unavailable ({type(exc).__name__})"}, status=502)
+
+        elif parsed.path == "/eclipse/streams":
+            if not eclipse_native_request_authorized(self.headers):
+                self.send_json({"error": "native Eclipse discovery authorization failed"}, status=403)
+                return
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            provider_key = query.get("providerKey", [""])[0]
+            if not isinstance(provider_key, str) or not re.fullmatch(r"eclipse:[0-9a-f]{20}", provider_key):
+                self.send_json({"error": "a valid connected Eclipse providerKey is required"}, status=400)
+                return
+            try:
+                # Inventory is a diagnostic for connected Eclipse addons; its
+                # availability must not depend on whether playback is currently
+                # configured for TIDAL-only mode.
+                provider_config = realmax_provider_configuration(load_settings())
+                provider_order = provider_config.get("configuredOrder", [])
+                addon_providers = provider_config.get("_internal_records", {})
+                provider = addon_providers.get(provider_key)
+                if (provider_key not in provider_order or not isinstance(provider, dict)
+                        or provider.get("available") is not True):
+                    self.send_json({"error": "selected Eclipse provider is unavailable or disabled"}, status=404)
+                    return
+                manifest_url = provider.get("manifestUrl")
+                if not isinstance(manifest_url, str) or not manifest_url:
+                    self.send_json({"error": "selected Eclipse provider has no valid manifest"}, status=404)
+                    return
+                try:
+                    duration = float(query.get("duration", ["0"])[0] or 0)
+                except (TypeError, ValueError, OverflowError):
+                    duration = 0
+                try:
+                    timeout_ms = max(1, min(120_000, int(query.get("timeoutMs", ["120000"])[0] or 120_000)))
+                except (TypeError, ValueError, OverflowError):
+                    timeout_ms = 120_000
+                inventory = discover_eclipse_addon_streams(
+                    manifest_url,
+                    addon_id=str(provider.get("addonId") or ""),
+                    addon_name=str(provider.get("name") or provider.get("displayName") or ""),
+                    track_id=query.get("trackId", [""])[0],
+                    title=query.get("title", [""])[0],
+                    artist=query.get("artist", [""])[0],
+                    isrc=query.get("isrc", [""])[0],
+                    duration=duration,
+                    provider_key=provider_key,
+                    timeout_ms=timeout_ms,
+                )
+                self.send_json(inventory)
+            except Exception as exc:
+                self.send_json({"error": f"Eclipse stream discovery failed ({type(exc).__name__})"}, status=502)
 
         elif parsed.path == "/login/status":
             self.send_json(public_login_flow())

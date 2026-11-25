@@ -6,6 +6,10 @@ import vm from "node:vm";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(path.join(root, "..", "omniphony.mjs"), "utf8").replace(/\r\n/g, "\n");
+const pluginBuild = source.match(/^const PLUGIN_BUILD = "([^"]+)";$/m)?.[1];
+const serviceVersion = source.match(/^const REQUIRED_SERVICE_VERSION = "([^"]+)";$/m)?.[1];
+const supervisorModuleId = source.match(/^const NATIVE_SERVICE_SUPERVISOR_MODULE_ID = `([^`]+)`;$/m)?.[1]
+  ?.replace("${PLUGIN_BUILD}", pluginBuild);
 const startupCode = source.match(
   /const SERVICE_STARTUP_STATE_KEY = Symbol\.for\([\s\S]*?(?=\nfunction onLoad\(\) \{)/,
 )?.[0];
@@ -27,6 +31,9 @@ const onLoadSource = source.match(
   /function onLoad\(\) \{[\s\S]*?(?=\nunloads\.add\()/,
 )?.[0];
 assert.ok(startupCode, "renderer startup reads and passes persisted runtime paths");
+assert.ok(pluginBuild, "renderer startup uses the current plugin build identity");
+assert.ok(serviceVersion, "renderer startup uses the current service API version");
+assert.ok(supervisorModuleId, "renderer startup uses a build-specific native supervisor module");
 assert.ok(nativeCode, "renderer startup uses the TidaLuna native supervisor");
 assert.ok(pollGateSource, "service status polling has an explicit startup gate");
 assert.ok(syncLoopSource, "the actual sync loop can be exercised in a controlled harness");
@@ -54,7 +61,7 @@ assert.equal(
   const startupSandbox = {
     pluginDisposed: true,
     localServiceStartupPending: false,
-    PLUGIN_BUILD: "test",
+    PLUGIN_BUILD: pluginBuild,
     console: { log() {}, error() {} },
     ensureLocalOmniFusionService: () => new Promise((resolve) => { settleStartup = resolve; }),
     tracePlaybackEvent() {},
@@ -124,9 +131,10 @@ function makeHarness(result, { ipc = true, mpvDir = "", studioExe = "" } = {}) {
     ["omniphony_studio_path", studioExe],
   ]);
   const sandbox = {
-    SERVICE_STARTUP_STATE_KEY: Symbol.for("omniphony-ex.service-startup-state"),
-    REQUIRED_SERVICE_VERSION: "2.1.36",
-    NATIVE_SERVICE_SUPERVISOR_MODULE_ID: "OmniphonyEX/service-supervisor.native.js",
+    PLUGIN_BUILD: pluginBuild,
+    SERVICE_STARTUP_STATE_KEY: Symbol.for(`omniphony-ex.service-startup-state.${pluginBuild}`),
+    REQUIRED_SERVICE_VERSION: serviceVersion,
+    NATIVE_SERVICE_SUPERVISOR_MODULE_ID: supervisorModuleId,
     NATIVE_SERVICE_SUPERVISOR_MODULE_CODE: nativeCode,
     localStorage: {
       getItem: (key) => storage.get(key) || null,
@@ -154,7 +162,7 @@ function makeHarness(result, { ipc = true, mpvDir = "", studioExe = "" } = {}) {
 {
   const result = {
     ready: true,
-    version: "2.1.36",
+    version: serviceVersion,
     mpvDirectory: "C:\\OmniFusion-Standalone\\mpv",
     studioExecutable: "C:\\OmniFusion\\studio\\omniphony-studio-egui.exe",
   };

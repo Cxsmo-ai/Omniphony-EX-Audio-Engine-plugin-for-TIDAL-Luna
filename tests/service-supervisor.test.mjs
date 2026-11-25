@@ -11,6 +11,7 @@ const moduleSource = fs.readFileSync(path.join(root, "..", "omniphony.mjs"), "ut
 const legacyBootstrapSource = fs.readFileSync(path.join(root, "..", "index.js"), "utf8");
 const pluginVersion = moduleSource.match(/^const PLUGIN_BUILD = "([^"]+)";$/m)?.[1];
 const testServiceVersion = "2.1.36";
+const runtimeBundleSha256 = moduleSource.match(/const bundleSha256 = "([A-F0-9]+)";/)?.[1];
 const runtimeBundleVersion = moduleSource.match(
   /const bundledRuntimeRoot = path\.join\(pluginRoot, "runtime-bundles", "([^"]+)"\);/,
 )?.[1];
@@ -31,8 +32,16 @@ assert.doesNotMatch(supervisorCode, /new Function\s*\(/,
   "the supervisor contains no runtime code generation forbidden by TidaLuna's secure loader");
 assert.match(supervisorCode, /async startEclipseLogin\(serviceBase, requiredVersion, runtimeConfig = \{\}\)[\s\S]*?module\.exports\.ensureService\(requiredVersion, runtimeConfig\)/,
   "Eclipse authentication ensures and uses the service identity in one native-module context");
+assert.match(supervisorCode, /async requestEclipseStreamInventory\(serviceBase, requiredVersion, runtimeConfig = \{\}, input = \{\}\)[\s\S]*?Authorization: "Bearer " \+ shared\.shutdownToken[\s\S]*?X-Omniphony-Service-Instance/,
+  "stream inventory authorization stays inside the native service supervisor");
+assert.match(supervisorCode, /invalid_provider_key[\s\S]*?track_identity_required/,
+  "the native inventory request validates provider and track identity before building its local request");
 assert.ok(pluginVersion, "the plugin build version is declared in the canonical entrypoint");
 assert.ok(runtimeBundleVersion, "the separately versioned API runtime bundle is declared in the supervisor");
+assert.match(moduleSource, /NATIVE_SERVICE_SUPERVISOR_MODULE_ID = `OmniphonyEX\/service-supervisor\.native\.js\.\$\{PLUGIN_BUILD\}`/,
+  "each plugin build registers a fresh native supervisor module");
+assert.match(moduleSource, /SERVICE_STARTUP_STATE_KEY = Symbol\.for\(`omniphony-ex\.service-startup-state\.\$\{PLUGIN_BUILD\}`\)/,
+  "renderer reloads do not reuse a previous plugin build's supervisor channel");
 assert.match(legacyBootstrapSource, /^\/\/ Compatibility entrypoint:[\s\S]*export \* from ["']\.\/omniphony\.mjs["'];?\s*$/,
   "the alternate entrypoint delegates all startup and shutdown behavior to the canonical module");
 assert.doesNotMatch(legacyBootstrapSource, /spawn\(|child_process|ensureLocalServiceRunning|shutdown/,
@@ -93,6 +102,7 @@ function makeHarness({
   for (const file of [
     "runtime/python.exe",
     "omnifusion_service.py",
+    "eclipse_streams.py",
     "vendor/tidalapi/__init__.py",
     "oxideav/adapter-v0.1.71/ac4-to-wav.exe",
     "oxideav/adapter-v0.1.71/omnifusion_ac4_adapter.dll",
@@ -112,6 +122,7 @@ function makeHarness({
     for (const file of [
       "runtime/python.exe",
       "omnifusion_service.py",
+      "eclipse_streams.py",
       "vendor/tidalapi/__init__.py",
       "oxideav/adapter-v0.1.71/ac4-to-wav.exe",
       "oxideav/adapter-v0.1.71/omnifusion_ac4_adapter.dll",
@@ -134,11 +145,14 @@ function makeHarness({
   const queuedHealth = healthResponses.slice();
   let defaultHealth = null;
   const requests = [];
+  const getRequests = [];
   const spawned = [];
   const children = [];
   const syncCalls = [];
+  let inventoryResponseMode = "complete";
   const http = {
     get(_options, callback) {
+      getRequests.push(_options);
       const request = new EventEmitter();
       request.setTimeout = () => {};
       request.destroy = (error) => queueMicrotask(() => request.emit("error", error));
@@ -150,10 +164,20 @@ function makeHarness({
         }
         const response = new EventEmitter();
         response.statusCode = 200;
+        response.complete = true;
         response.setEncoding = () => {};
         callback(response);
         queueMicrotask(() => {
-          response.emit("data", JSON.stringify(health));
+          if (String(_options?.path || "").startsWith("/eclipse/streams") && inventoryResponseMode === "aborted") {
+            response.complete = false;
+            response.emit("data", "{\"partial\":");
+            response.emit("aborted");
+            return;
+          }
+          const payload = String(_options?.path || "").startsWith("/eclipse/streams")
+            ? { complete: false, reason: "upstream_rate_limited", streams: [], attempts: [] }
+            : health;
+          response.emit("data", JSON.stringify(payload));
           response.emit("end");
         });
       });
@@ -180,8 +204,10 @@ function makeHarness({
     luna,
     process: { pid: processPid, env: {} },
     URL,
-    setTimeout: (callback) => queueMicrotask(callback),
-    clearTimeout() {},
+    setTimeout: (callback, delay = 0) => delay >= 900
+      ? globalThis.setTimeout(callback, delay)
+      : queueMicrotask(callback),
+    clearTimeout: (timer) => globalThis.clearTimeout(timer),
     console: { info() {}, error() {} },
     require(name) {
       if (name === "fs") return fs;
@@ -231,6 +257,7 @@ function makeHarness({
   const health = {
     status: "ok",
     version: testServiceVersion,
+    runtimeBundleSha256,
     servicePid: 5678,
     serviceInstanceId: "test-instance-1",
     tidalOwnerPid: browserPid ?? processPid,
@@ -247,7 +274,10 @@ function makeHarness({
     healthResponses: queuedHealth,
     setHealthResponses: (responses) => queuedHealth.splice(0, queuedHealth.length, ...responses),
     setDefaultHealth: (value) => { defaultHealth = value; },
+    setInventoryResponseMode: (value) => { inventoryResponseMode = value; },
+    setEnsureService: (fn) => { module.exports.ensureService = fn; },
     requests,
+    getRequests,
     spawned,
     children,
     syncCalls,
@@ -262,12 +292,80 @@ function makeHarness({
       return {
         ensure: () => reloadedModule.exports.ensureService(testServiceVersion, {}),
         startEclipseLogin: (serviceBase) => reloadedModule.exports.startEclipseLogin(serviceBase, testServiceVersion, {}),
+        requestEclipseStreamInventory: (serviceBase, input) => reloadedModule.exports.requestEclipseStreamInventory(serviceBase, testServiceVersion, {}, input),
       };
     },
     cleanup: () => fs.rmSync(userData, { recursive: true, force: true }),
     ensure: () => module.exports.ensureService(testServiceVersion, {}),
     startEclipseLogin: (serviceBase) => module.exports.startEclipseLogin(serviceBase, testServiceVersion, {}),
+    requestEclipseStreamInventory: (serviceBase, input) => module.exports.requestEclipseStreamInventory(serviceBase, testServiceVersion, {}, input),
   };
+}
+
+{
+  const harness = makeHarness({ healthResponses: [null] });
+  try {
+    const result = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "renderer-supplied-invalid-provider", trackId: "track-1",
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, "invalid_provider_key");
+    const badOrigin = await harness.requestEclipseStreamInventory("http://localhost:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", trackId: "track-1",
+    });
+    assert.equal(badOrigin.error, "invalid_service_endpoint");
+    assert.equal(harness.spawned.length, 0, "invalid requests are rejected before service startup");
+    const inventory = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", title: "A Song & Story", artist: "An Artist",
+    });
+    assert.equal(inventory.ok, true, JSON.stringify(inventory));
+    assert.equal(inventory.inventory.reason, "upstream_rate_limited");
+    const nativeRequest = harness.getRequests.find((request) => String(request?.path || "").startsWith("/eclipse/streams"));
+    assert.ok(nativeRequest, "the inventory route is called by the native process");
+    assert.match(nativeRequest.path, /title=A\+Song\+%26\+Story/);
+    assert.equal(nativeRequest.headers.Authorization, "Bearer " + "5a".repeat(32));
+    assert.equal(nativeRequest.headers["X-Omniphony-Service-Instance"], "test-instance-1");
+    const shortBudget = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", trackId: "track-1", timeoutMs: 1000,
+    });
+    assert.equal(shortBudget.ok, true, `an immediate service readiness can use a one-second inventory budget: ${JSON.stringify(shortBudget)}`);
+    const shortBudgetRequest = harness.getRequests.filter((request) =>
+      String(request?.path || "").startsWith("/eclipse/streams")
+      && request.path.includes("timeoutMs="),
+    ).at(-1);
+    assert.ok(shortBudgetRequest);
+    const requestedTimeoutMs = Number(new URLSearchParams(shortBudgetRequest.path.split("?")[1]).get("timeoutMs"));
+    assert.ok(requestedTimeoutMs > 0 && requestedTimeoutMs <= 1000,
+      "the native request passes its remaining deadline without rounding it upward");
+    harness.setInventoryResponseMode("aborted");
+    const interrupted = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", trackId: "track-1",
+    });
+    assert.equal(interrupted.ok, false);
+    assert.equal(interrupted.error, "inventory_response_aborted",
+      "a partial response abort settles the native promise instead of hanging");
+  } finally {
+    harness.cleanup();
+  }
+}
+
+{
+  const harness = makeHarness({ healthResponses: [null] });
+  harness.setEnsureService(() => new Promise((resolve) => globalThis.setTimeout(
+    () => resolve({ ready: true }), 1100,
+  )));
+  try {
+    const startedAt = Date.now();
+    const result = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", trackId: "track-1", timeoutMs: 1000,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, "inventory_deadline_exceeded");
+    assert.ok(Date.now() - startedAt < 1050, "service readiness is included in the absolute request deadline");
+    assert.equal(harness.getRequests.filter((request) => String(request?.path || "").startsWith("/eclipse/streams")).length, 0);
+  } finally {
+    harness.cleanup();
+  }
 }
 
 {
@@ -422,6 +520,7 @@ function makeHarness({
     assert.equal(options.env.OMNIFUSION_STUDIO_EXE, harness.paths.studioExe);
     assert.equal(options.env.OMNIFUSION_PLUGIN_DIR, harness.health.pluginRoot);
     assert.equal(options.env.OMNIFUSION_TIDAL_PID, "4321");
+    assert.equal(options.env.OMNIFUSION_RUNTIME_SHA256, runtimeBundleSha256);
     assert.equal(options.env.OMNIFUSION_SHUTDOWN_TOKEN, "5a".repeat(32));
     assert.deepEqual(
       JSON.parse(fs.readFileSync(path.join(harness.health.dataRoot, "config", "runtime-paths.json"), "utf8")),
@@ -433,6 +532,21 @@ function makeHarness({
       false,
       "the in-process orender.dll route does not require a separate renderer executable",
     );
+  } finally {
+    harness.cleanup();
+  }
+}
+
+{
+  const harness = makeHarness({ healthResponses: [null] });
+  try {
+    assert.equal((await harness.ensure()).ready, true);
+    const staleRuntime = { ...harness.health, runtimeBundleSha256: "A".repeat(64) };
+    harness.setHealthResponses([staleRuntime, null, harness.health]);
+    const result = await harness.ensure();
+    assert.equal(result.ready, true, "a same-version service from stale runtime bytes is replaced");
+    assert.equal(harness.requests.length, 1, "the stale same-owner service receives authenticated shutdown");
+    assert.equal(harness.spawned.length, 2, "the stale runtime is never reused");
   } finally {
     harness.cleanup();
   }

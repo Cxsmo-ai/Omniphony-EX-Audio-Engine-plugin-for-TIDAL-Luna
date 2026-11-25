@@ -114,6 +114,113 @@ remain first-party implementation details that may change.
 
 ## Static-analysis references
 
+## Stream protocol findings — official APK 0.6.75
+
+The official download URL `https://updates.eclipsemusic.app/android/eclipse0.6.75.apk`
+was fetched again over HTTPS on 2026-11-25. The fetched artifact is
+211,860,329 bytes and SHA-256
+`1406AA117204746D88779FAD1B993CEFA3EC800B29D20AA89DC237FCBD1E188A`, matching
+the previously inspected local APK byte for byte. APKTool 3.0.3 metadata
+identifies package `com.eclipse.android`, version `0.6.75` / code `155`,
+minimum SDK 26 and target SDK 36. The APK contains two DEX files and native
+libraries for ARM64 and ARMv7, including `libeclipseac4`, `libeclipsealac`,
+`libeclipseaudio` and `libeclipsefairplay`.
+
+The JADX output and APKTool Smali output were cross-checked for the addon model
+and DRM data structures. `EclipseAddonManifest` models `resources`, content
+type, DRM systems, playback profiles, settings and catalogs, plus explicit
+capability booleans for search, stream, browse, ISRC/identity resolution,
+catalogs and notices. `EclipseAddonStreamResponse` models direct URL, provider
+attempts, extraction descriptors, video, format, codec, bit depth, sample rate,
+manifest type, quality, both `expiresAt` and `expires_at`, chapters and DRM
+metadata. `AddonDrmInfo` includes system/key system, license and certificate
+endpoints, service certificate, multi-session, initialization-data mapping and
+native FairPlay configuration. The service inventory now preserves this
+information in a native-only descriptor while returning an allowlisted summary.
+
+The decompiled FairPlay bridge declares an Android native FairPlay client,
+checks local availability, creates a per-session challenge and enforces
+initialization-size and session-limit checks. This confirms that the APK uses a
+platform-specific protected playback interface; it does not provide evidence
+that its FairPlay session can be reproduced by the Windows MPV route. No DRM
+keys or protected payloads were extracted or decoded.
+
+### Native library metadata — Rizin 0.9.1
+
+The ARM64 libraries extracted from this hash-verified APK were inspected with
+Rizin 0.9.1 for ELF headers, dynamic symbols, imports, dependencies, and
+readable strings. This was metadata and interface analysis, not an attempt to
+recover DRM secrets or reproduce protected playback.
+
+- `libeclipsefairplay.so` is an ELF64 AArch64 library and exports JNI methods
+  for `nativeInit`, `nativeCreate`, `nativeChallenge`, `nativeInstall`,
+  `nativeDecrypt`, and `nativeClose`. The Java declarations and native exports
+  agree on a platform FairPlay session lifecycle. This is evidence of an
+  official Android-specific decrypt operation inside its authorized session;
+  it is not an entitlement or license interface available to this Windows
+  plugin.
+- `libeclipseac4.so` exports `ea_ac4_abi`, `ea_ac4_probe`, `ea_ac4_create`,
+  `ea_ac4_decode`, `ea_ac4_destroy`, and `ea_ac4_reset`, plus JNI wrappers.
+  Its strings include A-JOC parsing and validation labels. This supports the
+  APK's own AC-4 decoder path but says nothing about which addon streams an
+  account may access.
+- `libeclipseaudio.so` exports JNI audio processing and analysis entry points.
+  It is an audio/DSP interface, not evidence that protected stream descriptors
+  can be transferred into MPV or the Omniphony route.
+
+Rizin's ELF dependency tables list `libdl.so`, `libm.so`, and `libc.so` for
+`libeclipsefairplay.so` and `libeclipseac4.so`; `libeclipseaudio.so` also lists
+`liblog.so`. The FairPlay library imports `dlopen`. These are Android dynamic
+dependencies and do not establish a portable desktop playback contract.
+
+Rizin's dependency and export views do not expose a documented public Windows
+playback contract. No decryption routines were patched, invoked against
+protected media, or reconstructed outside the official client.
+
+### Addon stream request contract observed in the APK
+
+The JADX/Smali cross-reference also confirms the official add-on resource paths
+and negotiation query fields:
+
+- Search: `GET <baseURL>search?q=<encoded query>`.
+- ISRC resolution: `GET <baseURL>resolve-isrc?isrc=<encoded ISRC>` when the
+  manifest exposes the `isrc` resource.
+- Stream resolution: `GET <baseURL>stream/<encoded track id>`.
+- The current official addon guide recommends resolving a known ISRC first
+  when the addon exposes that resource; otherwise Eclipse searches and checks
+  the candidate recording identity. The local inventory follows that order,
+  then falls back to search and the manifest-declared identity resolver.
+- `gv2.m6070c(InstalledAddon, url)` appends the add-on's saved manifest settings
+  as query parameters, encoding spaces as `%20` and replacing duplicate keys.
+- The official Gravity resolver can append `drm`, `dolbyCodecs`, and
+  `playbackProfile`. In the observed Android code, the E-AC-3 Gravity profile is
+  requested only when the manifest advertises `apple-cbcs-eac3-v1` and the
+  device's Dolby codec list contains `eac3`. The Apple FairPlay profile is
+  gated by the platform's native FairPlay availability. These are negotiation
+  inputs; they do not make a protected response playable on Windows.
+- `gv2.m6071d` mints a per-addon token through the Eclipse account API and sends
+  it as `X-Eclipse-Access` to the add-on. The account bearer token is used only
+  for the token-mint request.
+
+The inventory implementation retains the ordinary quality request and only
+uses manifest-declared negotiation values. For Gravity, the observed APK gate
+is applied: `apple-cbcs-eac3-v1` requires the Gravity identity, declared
+`widevine`, the exact declared profile, and local E-AC-3 support; the
+`apple-fps-alac-v1` request also requires native FairPlay availability. The
+Windows runtime does not advertise that FairPlay capability, so it reports
+this profile as platform-blocked instead of trying the request. Protected
+responses remain inventory descriptors and are not handed to
+MPV/OxideAV/Studio. Generic add-ons retain manifest-driven negotiation.
+
+APKTool 3.0.3 Smali and JADX 1.5.7 outputs for both DEX files are present
+locally. Rizin 0.9.1 was used for the native ELF metadata/symbol pass above.
+Android SDK APK Analyzer, ADB, Ghidra, and MobSF are not installed in this
+environment; no isolated emulator, profiling, or Logcat session was available.
+The APK was retrieved from Eclipse's official HTTPS distribution URL and its
+downloaded hash matched the existing analysis record. APK signing-certificate
+verification was unavailable, so provenance is URL-and-hash verified rather
+than cryptographically signer-verified.
+
 Relevant APK artifacts are the decoded `AndroidManifest.xml`, the
 `MainActivity` callback dispatch and `onNewIntent` smali, the callback coroutine
 and URI parser smali, and the `AuthApi` interface. These are identified by

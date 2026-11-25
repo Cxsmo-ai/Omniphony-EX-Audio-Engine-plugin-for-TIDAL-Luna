@@ -1,0 +1,175 @@
+# Eclipse stream inventory
+
+The service exposes a native-only, authenticated inventory route:
+
+```text
+GET /eclipse/streams?providerKey=eclipse:<20-hex-key>&trackId=<addon-track-id>
+```
+
+Use either a provider-local `trackId`, or `title`, `artist`, and optionally
+`isrc` to identify the recording. Requests must include the current service
+launch bearer token and `X-Omniphony-Service-Instance` headers. The provider key
+comes from `/realmax/providers`; the tokenized manifest URL is never accepted
+from the renderer.
+
+The route reads the account-connected provider's manifest and enumerates
+`select` settings with the recognized audio-quality keys `quality`,
+`audioQuality`, and `streamQuality` (including underscore and hyphen spellings).
+It requests the exact option values declared by the addon. When an addon
+declares DRM systems or playback profiles, the resolver also tries bounded
+negotiation variants derived only from those declared values. Other selectable
+settings are reported as unclassified and are not overwritten with manifest
+defaults. The account connections response does not provide the user's current
+per-addon setting values; manifest query configuration is retained.
+Exact manifest quality selector values are used only by the native request
+planner. The renderer receives the manifest's display label (or a generic
+option ordinal), not the selector token.
+
+Returned descriptors contain addon and track identity, requested and returned
+quality labels, codec/container/manifest, reported audio parameters, expiration,
+protection state, sanitized HLS/DASH audio representation summaries, and a
+short-lived opaque `streamRef`. Raw media URLs, license
+URLs, provider headers, and the original addon response stay in the native
+service's short-lived in-memory store. The inventory route does not serve that
+private record to the renderer and does not authorize playback by itself.
+Manifest selector tokens and media rendition URLs remain native-only. The
+renderer gets provider display labels and rendition facts, with aggregate HLS
+bandwidth explicitly distinguished from audio bitrate.
+
+Playback admission now uses the same provider-neutral protection classifier for
+Gravity, Tido, and other Eclipse playback paths. It rejects protected response
+metadata and checks HLS/DASH protection declarations before using those
+manifests. Manifest inspection is bounded, uses public HTTPS destinations with
+TLS hostname checks, and follows only same-origin redirects for each request.
+An unreadable, malformed, encrypted, or over-limit manifest remains ineligible
+for this MPV/OxideAV route. This does not establish that arbitrary direct media
+files are DRM-free; an add-on's `encrypted: false` remains only a provider
+claim in the inventory.
+
+The legacy playback resolvers now bind search/stream cache entries and queued
+network work to the current Eclipse account generation. Stale responses are
+discarded before caching or playback admission. Quality values that are
+ambiguous or malformed are marked incomplete instead of silently omitted, and
+manifest capability parsing recognizes the official `isrc` resource name.
+Discovery snapshots the Eclipse account generation, rejects manifest/add-on
+identity mismatches, caps concurrent discoveries at two, quality/setting
+combinations at 4096, protocol request plans at 4096, returned descriptors per
+inventory at 2048, and the native descriptor cache at 4096 entries. Reaching a
+bound marks the result incomplete/truncated. Repeated 401/403/429 responses
+stop quality probing; 429 starts a per-addon cooldown using `Retry-After` when
+available. HTTP 503 responses receive up to two bounded retries, respecting
+`Retry-After` up to 30 seconds and the overall discovery deadline. HTTPS
+requests resolve and pin only globally routable destination addresses,
+preserve TLS hostname verification, disable system proxy tunneling, and reject
+cross-origin redirects.
+For adaptive media, the shared bounded inspector traverses at most 16 HLS
+playlist references, returns at most 256 HLS/DASH representation summaries per
+manifest, and inspects at most 64 unique manifests per inventory. Exceeding a
+bound or failing to inspect a declared manifest leaves `mediaVariantsComplete`
+false. HLS rendition bandwidth is never presented as audio bitrate unless the
+playlist identifies it as an audio rendition; DASH audio representation
+bandwidth is scoped to that representation. Unclassified DASH representations
+are reported as such and make adaptive coverage incomplete. Extensionless
+direct URLs are sniffed with a bounded range request before adaptive coverage is
+claimed. Provider headers are sent to an HLS child playlist only when it shares
+the original manifest's origin; manifest inspection cache entries include a
+private digest of URL, manifest type, and request headers. Parent protection
+metadata is inherited by each adaptive rendition. Quality selector values are
+matched against returned values only inside the service. `qualityMatchStatus`
+distinguishes `matched`, `mismatched` (only when the returned value is another
+known selector token), `ambiguous`, and `unreported`; display-label collisions
+are marked ambiguous. Malformed or truncated DRM/profile arrays set
+`addonCapabilitiesComplete` false. Gravity negotiation follows the observed
+APK gates: the CBCS E-AC-3 profile requires declared `widevine`, the exact
+declared Gravity profile, and local E-AC-3 support. The FairPlay ALAC profile
+is platform-blocked when native FairPlay is unavailable. Opaque stream
+references get their local lifetime when the inventory response completes,
+capped by provider expiry. Finalization verifies every returned reference is
+still present and account-bound; an evicted reference is marked
+`reference_unavailable` and makes the inventory incomplete. Provider expiry is
+re-evaluated at finalization, and `referenceExpiresAt` reports the local handle
+deadline separately from provider `expiresAt`.
+
+## Completeness fields
+
+- `qualityRequestsComplete` means each generated declared-quality request
+  returned valid JSON. It does not prove a stream exists for every option.
+- `qualityEnumerationTruncated` reports when the bounded option-product limit
+  was reached.
+- `protocolRequestTruncated` reports when negotiation variants or the bounded
+  request plan prevented some combinations from being tried.
+- `streamResultsTruncated` reports when returned variants exceeded the bounded
+  response limit; `malformedStreamCandidates` reports non-descriptor entries.
+- Identical native stream responses are deduplicated by a service-only digest;
+  `requestedQualities` retains each quality/configuration that returned that
+  same stream.
+- `mediaVariantsComplete` covers the bounded, recognized audio representation
+  metadata parsed from returned HLS/DASH manifests. It does not prove the
+  upstream client exposes the same variant list; `providerParityVerified`
+  remains independently false until compared with Eclipse.
+- `paginationComplete` is currently unknown for track search.
+- `providerParityVerified` remains `false` until account-authorized live
+  comparisons with the official client are completed.
+- Top-level `complete` is scoped to declared options and supported request
+  variants. `providerCoverageStatus` remains `unknown`; this does not claim all
+  account-hidden tiers, pagination, or official-client parity were exhausted.
+- `addonCapabilitiesComplete` and `malformedAddonCapabilityFields` report
+  invalid/truncated DRM or playback-profile declarations.
+- `nativeReferencesComplete` confirms every returned stream handle was present
+  and account-bound when the inventory response was finalized.
+- `platformBlockedProfiles` names declared profiles that cannot be negotiated
+  here because the required native platform capability is unavailable.
+- An addon `encrypted: false` claim is preserved as `reportedStatus: "clear"`,
+  while the effective protection status remains `unknown` until media
+  inspection verifies it. Protected streams include a normalized DRM system
+  when supplied but are never handed to the MPV/Omniphony playback route.
+
+## Current verification matrix
+
+| Source / path | Current evidence | Status |
+| --- | --- | --- |
+| TIDAL API AC-4 IMS | Live playback and seeking verified previously on Natural; mobile OAuth profile | Verified playback |
+| TIDAL API E-AC-3 JOC | Live playback, seek, pause, embedded `orender` and Studio headphone route verified previously | Verified playback |
+| TIDAL API FLAC tiers | Existing resolver and fixture coverage; no complete live tier enumeration in this work | Supported, live verification pending |
+| Gravity account connection | Authenticated account discovery returned Gravity enabled | Connected; the settings inventory can now query its declared qualities |
+| Gravity stream resolution | Previous authenticated probe requested six manifest tiers; every request returned HTTP 415. Local resolver now narrows profile negotiation to APK-observed gates. | Previous live failure recorded; new build requires fresh authenticated verification |
+| Gravity E-AC-3 JOC / Atmos | APK confirms Gravity's protected CBCS E-AC-3 profile and its Widevine/profile/local-codec conditions. | Descriptor discovery supported; fresh live verification pending; protected playback remains unavailable in this route |
+| Gravity ALAC | APK gates the FairPlay ALAC profile on native FairPlay availability. | Platform-blocked on Windows; profile is surfaced as such and is not claimed playable |
+| Other enabled Eclipse addons | Account-dependent; must be queried by connected provider key | Not yet verified |
+| Disabled Eclipse addons | Not enumerated or enabled automatically | Connected-disabled; untested |
+| FairPlay / Widevine / PlayReady | Protection metadata retained; authorized platform playback is not implemented by this route | Descriptor-only; protected playback unavailable here |
+
+The Luna settings panel now accepts a provider-local track ID or title/artist
+and requests inventory for enabled Eclipse providers in RealMAX order. The
+request is made by the TidaLuna native supervisor with its per-launch service
+credential; the renderer receives only the sanitized inventory summary. The
+inventory layer preserves addon-returned formats without mapping them to a
+RealMAX playback quality. The existing player continues to admit only its
+explicitly supported playback candidates and retains its established TIDAL
+AC-4 IMS and E-AC-3 JOC routes.
+
+The native supervisor now identifies a service by both API version and the
+SHA-256 digest of the verified runtime archive. It passes that digest to the
+service at launch, and `/health` reports it without exposing credentials. A
+same-version process with a missing or different digest is treated as stale;
+the supervisor replaces it only when the process is its authenticated,
+same-TIDAL-owned child. The bundle completeness check also requires
+`eclipse_streams.py`, preventing an older runtime from being treated as a
+complete Eclipse build.
+
+Current local verification after the discovery changes: the API Python suite
+passes 227 tests (1 skipped), the root pytest suite passes 295 tests (1
+skipped, plus 76 subtests), all 13 Node tests pass, and the priority UI check
+passes. The focused Gravity/lifecycle suite passes 165 tests (1 skipped, plus
+30 subtests). The runtime archive verifier confirms 269 members, embedded
+imports, and the matching pinned SHA-256 for the current 2.1.78 build.
+This verification does not constitute post-update live inventory through the settings UI, a
+per-addon catalog run for every connected provider, live media-manifest
+enumeration for each enabled addon, or comparison with the official Eclipse client. At the
+start of this continuation, TIDAL PID 41788 owned service PID 38952 at API
+version 2.1.45, but the installed runtime archive marker and service source
+did not match the repository's verified archive digest. The stale-runtime
+replacement fix is implemented and must be exercised by reloading the plugin
+before live inventory. Gravity's previously observed HTTP 415 result does not
+identify whether the stream requires a protected playback interface, or
+whether the addon rejected the request for another reason.

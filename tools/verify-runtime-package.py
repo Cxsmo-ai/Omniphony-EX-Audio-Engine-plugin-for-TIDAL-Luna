@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 
 REQUIRED = (
     "api/omnifusion_service.py",
+    "api/eclipse_streams.py",
     "api/runtime/python.exe",
     "api/vendor/tidalapi/__init__.py",
     "api/oxideav/adapter-v0.1.71/ac4-to-wav.exe",
@@ -68,12 +69,14 @@ def main() -> int:
 
         with tempfile.TemporaryDirectory(prefix="omniphony-runtime-verify-") as temp:
             root = Path(temp)
-            bundle.extractall(root, filter="data")
+            # Member paths, roots and types were validated above; use the
+            # compatible API because the verifier also runs under Python 3.10.
+            bundle.extractall(root)
             api = root / "api"
             python = api / "runtime" / "python.exe"
             code = (
                 "import sys; sys.path.insert(0, sys.argv[1]); "
-                "import tidalapi, requests, psutil, mpegdash; "
+                "import tidalapi, requests, psutil, mpegdash, eclipse_streams; "
                 "print('python-tidal and runtime dependencies import successfully')"
             )
             result = subprocess.run(

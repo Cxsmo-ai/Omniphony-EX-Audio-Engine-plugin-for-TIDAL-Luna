@@ -17,6 +17,7 @@ EXCLUDED_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "
 FORBIDDEN_NAMES = {".env", "token.json", "tidal-session.json"}
 REQUIRED_FILES = (
     "api/omnifusion_service.py",
+    "api/eclipse_streams.py",
     "api/runtime/python.exe",
     "api/vendor/tidalapi/__init__.py",
     "api/oxideav/adapter-v0.1.71/ac4-to-wav.exe",

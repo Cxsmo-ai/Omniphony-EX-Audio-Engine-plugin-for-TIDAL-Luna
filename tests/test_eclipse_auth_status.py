@@ -576,7 +576,7 @@ def test_addon_access_token_network_request_runs_outside_auth_lock_and_caches_to
     service._ECLIPSE_AUTH_CACHE = {"jwt": "account-jwt", "addon_tokens": {}}
     service._ECLIPSE_ACCOUNT_STATUS = {"user": user, "checked_at": 0, "session_mtime": 1}
     service._ECLIPSE_AUTH_GENERATION = 5
-    service.eclipse_account_status = lambda force_refresh=False: {"connected": True, "user": user}
+    service.eclipse_account_status = lambda force_refresh=False, deadline=None: {"connected": True, "user": user}
     try:
         def fetch(request, timeout):
             assert lock.depth == 0, "remote addon-token requests must not hold the account lock"
@@ -606,7 +606,7 @@ def test_addon_access_token_result_is_discarded_after_account_changes():
     service._ECLIPSE_AUTH_CACHE = {"jwt": "account-jwt-a", "addon_tokens": {}}
     service._ECLIPSE_ACCOUNT_STATUS = {"user": user, "checked_at": 0, "session_mtime": 1}
     service._ECLIPSE_AUTH_GENERATION = 5
-    service.eclipse_account_status = lambda force_refresh=False: {"connected": True, "user": user}
+    service.eclipse_account_status = lambda force_refresh=False, deadline=None: {"connected": True, "user": user}
     try:
         def switch_account(_request, timeout):
             service._ECLIPSE_AUTH_CACHE["jwt"] = "account-jwt-b"
@@ -637,7 +637,7 @@ def test_addon_access_token_retry_never_switches_to_a_different_account():
     service._ECLIPSE_ACCOUNT_STATUS = {"user": first_user, "checked_at": 0, "session_mtime": 1}
     service._ECLIPSE_AUTH_GENERATION = 5
 
-    def status(force_refresh=False):
+    def status(force_refresh=False, deadline=None):
         if force_refresh:
             service._ECLIPSE_AUTH_CACHE["jwt"] = "account-jwt-b"
             service._ECLIPSE_ACCOUNT_STATUS["user"] = second_user
