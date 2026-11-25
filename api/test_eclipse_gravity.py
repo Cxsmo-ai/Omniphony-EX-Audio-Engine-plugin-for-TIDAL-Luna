@@ -15,6 +15,32 @@ import omnifusion_service as service
 class GravityResolverTests(unittest.TestCase):
     manifest_url = "https://gravity.example/account/manifest.json"
 
+    def test_manifest_failure_diagnostic_exposes_only_http_category(self):
+        url = "https://addon.example/private-account-path/manifest.json?token=private"
+        auth_cache = {"manifest_cache": {}, "manifest_errors": {}}
+        error = urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+        with patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache), \
+             patch.object(service, "_bounded_eclipse_response", side_effect=error):
+            self.assertIsNone(service._get_eclipse_manifest(url, force_refresh=True))
+            reason = service._eclipse_manifest_failure_reason(url)
+
+        self.assertEqual(reason, "manifest_http_403")
+        self.assertNotIn("private-account-path", reason)
+        self.assertNotIn("token", reason)
+
+    def test_manifest_inventory_returns_sanitized_fetch_failure_category(self):
+        url = "https://addon.example/private-account-path/manifest.json?token=private"
+        auth_cache = {"manifest_cache": {}, "manifest_errors": {}}
+        with patch.object(service, "_ECLIPSE_AUTH_CACHE", auth_cache), \
+             patch.object(service, "_bounded_eclipse_response", side_effect=TimeoutError()):
+            inventory = service.discover_eclipse_addon_streams(
+                url, addon_id="test.addon", addon_name="Test", track_id="track-1"
+            )
+
+        self.assertEqual(inventory["reason"], "manifest_timeout")
+        self.assertNotIn("private-account-path", json.dumps(inventory))
+        self.assertNotIn("token", json.dumps(inventory))
+
     def test_native_inventory_route_accepts_enabled_addon_outside_realmax_playback_order(self):
         provider_key = "eclipse:" + "a" * 20
         handler = object.__new__(service.RequestHandler)

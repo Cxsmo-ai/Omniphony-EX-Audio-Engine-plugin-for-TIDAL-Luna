@@ -41,10 +41,10 @@ function normalizeRealmaxSourceMode(value) {
   if (value === "eclipse_addons" || value === "eclipse_only" || value === "amazon_only") return "eclipse_addons";
   return "both";
 }
-const REQUIRED_SERVICE_VERSION = "2.1.45";
+const REQUIRED_SERVICE_VERSION = "2.1.46";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
 const ECLIPSE_ACCOUNT_LINKING_SUPPORTED = true;
-const PLUGIN_BUILD = "2.1.82";
+const PLUGIN_BUILD = "2.1.83";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -661,11 +661,11 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.82");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.83");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.82/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "237755CA86542E128DCC73F74BB78A1D2DD4C36148ACF2A2804492F072E3C48C";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.83/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "036DE57636D6199EF200F5938D10699E31BC00C19141719CB7057F9AE7271F15";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -738,7 +738,7 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.82"
+        return marker.pluginVersion === "2.1.83"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -807,7 +807,7 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.82", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.83", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         let backup = null;
         try {

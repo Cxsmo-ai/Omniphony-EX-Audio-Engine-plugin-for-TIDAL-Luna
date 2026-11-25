@@ -292,7 +292,7 @@ MPV_EXE = MPV_DIR / "mpv.exe"
 PIPE_NAME = "omnifusion-standalone.mpv"
 PIPE_PATH = f"//./pipe/{PIPE_NAME}".replace("/", "\\")
 PORT = 8765
-SERVICE_VERSION = "2.1.45"
+SERVICE_VERSION = "2.1.46"
 SERVICE_INSTANCE_ID = uuid.uuid4().hex
 RUNTIME_BUNDLE_SHA256 = os.environ.get("OMNIFUSION_RUNTIME_SHA256", "").strip().upper()
 if not re.fullmatch(r"[A-F0-9]{64}", RUNTIME_BUNDLE_SHA256):
@@ -4673,6 +4673,7 @@ _ECLIPSE_AUTH_CACHE: dict[str, object] = {
     "addon_tokens": {},
     "account_addons": {},
     "manifest_cache": {},
+    "manifest_errors": {},
     "search_cache": {},
     "stream_cache": {},
     "discovered_streams": {},
@@ -5254,6 +5255,10 @@ def _invalidate_eclipse_account_cache(clear_jwt: bool = False) -> None:
     if isinstance(manifest_cache, dict):
         for url in account_urls:
             manifest_cache.pop(url, None)
+    manifest_errors = _ECLIPSE_AUTH_CACHE.get("manifest_errors")
+    if isinstance(manifest_errors, dict):
+        for url in account_urls:
+            manifest_errors.pop(hashlib.sha256(url.encode("utf-8")).hexdigest(), None)
     if clear_jwt:
         _ECLIPSE_AUTH_CACHE["jwt"] = None
         _ECLIPSE_ACCOUNT_STATUS.update({"user": None, "checked_at": 0.0, "session_mtime": None})
@@ -5805,6 +5810,61 @@ def _eclipse_worker_url(addon_manifest_url: str, resource_path: str, params: dic
     return result
 
 
+def _eclipse_manifest_failure_code(exc: Exception) -> str:
+    """Return a renderer-safe manifest failure category without provider details."""
+    if isinstance(exc, urllib.error.HTTPError):
+        code = int(exc.code)
+        return f"manifest_http_{code}" if 400 <= code <= 599 else "manifest_http_error"
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "manifest_timeout"
+    if isinstance(exc, ssl.SSLError):
+        return "manifest_tls_error"
+    if isinstance(exc, socket.gaierror):
+        return "manifest_dns_error"
+    if isinstance(exc, (UnicodeError, json.JSONDecodeError)):
+        return "manifest_invalid_json"
+    if isinstance(exc, ValueError):
+        return "manifest_url_or_payload_invalid"
+    if isinstance(exc, urllib.error.URLError):
+        return "manifest_network_error"
+    if isinstance(exc, OSError):
+        return "manifest_network_error"
+    return "manifest_fetch_error"
+
+
+def _record_eclipse_manifest_failure(addon_manifest_url: str, reason: str) -> None:
+    key = hashlib.sha256(addon_manifest_url.encode("utf-8", errors="replace")).hexdigest()
+    with _ECLIPSE_AUTH_LOCK:
+        errors = _ECLIPSE_AUTH_CACHE.setdefault("manifest_errors", {})
+        if isinstance(errors, dict):
+            now = time.time()
+            for stale_key in [
+                stale_key for stale_key, item in errors.items()
+                if not isinstance(item, dict) or now >= float(item.get("expires_at") or 0)
+            ]:
+                errors.pop(stale_key, None)
+            if key not in errors and len(errors) >= 128:
+                oldest_key = min(
+                    errors,
+                    key=lambda stale_key: float(errors[stale_key].get("expires_at") or 0)
+                    if isinstance(errors[stale_key], dict) else 0,
+                )
+                errors.pop(oldest_key, None)
+            errors[key] = {"reason": reason, "expires_at": time.time() + 60}
+
+
+def _eclipse_manifest_failure_reason(addon_manifest_url: str) -> str:
+    key = hashlib.sha256(addon_manifest_url.encode("utf-8", errors="replace")).hexdigest()
+    with _ECLIPSE_AUTH_LOCK:
+        errors = _ECLIPSE_AUTH_CACHE.setdefault("manifest_errors", {})
+        item = errors.get(key) if isinstance(errors, dict) else None
+        if isinstance(item, dict) and time.time() < float(item.get("expires_at") or 0):
+            reason = item.get("reason")
+            if isinstance(reason, str) and re.fullmatch(r"manifest_(?:http_[45][0-9]{2}|[a-z_]+)", reason):
+                return reason
+    return "manifest_unavailable"
+
+
 def _get_eclipse_manifest(addon_manifest_url: str, force_refresh: bool = False, timeout: float = 6.0) -> dict | None:
     """Fetch and briefly cache a public Eclipse addon manifest."""
     manifest_url = addon_manifest_url.strip()
@@ -5824,14 +5884,24 @@ def _get_eclipse_manifest(addon_manifest_url: str, force_refresh: bool = False, 
             req, 1_000_000, request_deadline, max(0.1, float(timeout))
         )
         if len(raw_manifest) > 1_000_000:
+            _record_eclipse_manifest_failure(manifest_url, "manifest_payload_too_large")
             return None
         manifest = json.loads(raw_manifest.decode("utf-8"))
-        if not isinstance(manifest, dict) or not isinstance(manifest.get("id"), str) or not manifest["id"].strip():
+        if not isinstance(manifest, dict):
+            _record_eclipse_manifest_failure(manifest_url, "manifest_payload_invalid")
+            return None
+        manifest_id = manifest.get("id")
+        if not isinstance(manifest_id, str) or not manifest_id.strip():
+            _record_eclipse_manifest_failure(manifest_url, "manifest_identity_missing_or_invalid")
             return None
     except Exception as exc:
+        _record_eclipse_manifest_failure(addon_manifest_url, _eclipse_manifest_failure_code(exc))
         print(f"[-] Eclipse manifest fetch failed ({type(exc).__name__})")
         return None
     with _ECLIPSE_AUTH_LOCK:
+        errors = _ECLIPSE_AUTH_CACHE.setdefault("manifest_errors", {})
+        if isinstance(errors, dict):
+            errors.pop(hashlib.sha256(manifest_url.encode("utf-8")).hexdigest(), None)
         cache = _ECLIPSE_AUTH_CACHE.setdefault("manifest_cache", {})
         if isinstance(cache, dict):
             cache[manifest_url] = {"manifest": manifest, "expires_at": time.time() + 300}
@@ -6404,7 +6474,12 @@ def _discover_eclipse_addon_streams_impl(
     if time.monotonic() >= discovery_deadline:
         return {"complete": False, "reason": "discovery_deadline_exceeded", "streams": [], "attempts": []}
     if not isinstance(manifest, dict):
-        return {"complete": False, "reason": "manifest_unavailable", "streams": [], "attempts": []}
+        return {
+            "complete": False,
+            "reason": _eclipse_manifest_failure_reason(addon_manifest_url),
+            "streams": [],
+            "attempts": [],
+        }
     raw_manifest_id = manifest.get("id")
     manifest_id = raw_manifest_id.strip() if isinstance(raw_manifest_id, str) else ""
     requested_addon_id = addon_id.strip() if isinstance(addon_id, str) else ""
