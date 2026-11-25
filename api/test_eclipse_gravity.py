@@ -255,6 +255,27 @@ class GravityResolverTests(unittest.TestCase):
         ]}
         self.assertEqual(service.quality_candidates(malformed)[0]["settings"], {})
 
+    def test_artwork_quality_selectors_are_not_enumerated_as_audio_qualities(self):
+        manifest = {"settings": [
+            {"key": "audioQuality", "label": "Audio quality", "type": "select", "options": [
+                {"value": "lossless", "label": "Lossless"},
+                {"value": "aac", "label": "High Quality"},
+            ]},
+            {"key": "coverQuality", "label": "Cover quality", "type": "select", "options": [
+                {"value": "original", "label": "Original"},
+                {"value": "large", "label": "Large (1024 px)"},
+                {"value": "medium", "label": "Medium (500 px)"},
+                {"value": "small", "label": "Small (300 px)"},
+            ]},
+        ]}
+
+        candidates = service.quality_candidates(manifest, include_default=True)
+
+        self.assertEqual([item["settings"] for item in candidates], [
+            {"audioQuality": "lossless"}, {"audioQuality": "aac"}, {},
+        ])
+        self.assertEqual(service.unclassified_select_settings(manifest), ["coverQuality"])
+
     def test_stream_request_variants_match_apk_declared_negotiation_fields(self):
         manifest = {
             "drmSystems": ["widevine"],

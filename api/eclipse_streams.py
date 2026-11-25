@@ -26,6 +26,7 @@ MAX_METADATA_DEPTH = 6
 MAX_METADATA_NODES = 128
 _QUALITY_KEYS = {"quality", "audioquality", "audio_quality", "audio-quality", "streamquality", "stream_quality", "stream-quality"}
 _VIDEO_KEY = re.compile(r"video|resolution|subtitle", re.I)
+_NON_AUDIO_QUALITY = re.compile(r"\b(?:cover|artwork|image|thumbnail|poster|video|resolution|subtitle)\b", re.I)
 _AUDIO_QUALITY_LABEL = re.compile(r"(?:audio|stream|music).{0,24}quality|quality.{0,24}(?:audio|stream|music)", re.I)
 _KNOWN_DRM_SYSTEMS = {
     "com.apple.fps": "fairplay",
@@ -139,6 +140,10 @@ def _quality_settings(manifest: dict) -> list[dict]:
         key_token = key.lower().replace(" ", "")
         category = str(setting.get("category") or setting.get("purpose") or "").strip().lower()
         label_text = label or ""
+        # Manifest setting keys can be camelCase (for example
+        # `coverQuality`), so split those words before checking whether a
+        # generic quality selector actually belongs to artwork or video.
+        setting_hints = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", f"{key} {label_text} {category}")
         # Addons may use provider-specific setting keys. Recognize those only
         # when the key itself contains "quality", the category explicitly
         # names audio quality, or the human label ties quality to audio/music
@@ -154,6 +159,7 @@ def _quality_settings(manifest: dict) -> list[dict]:
             or _VIDEO_KEY.search(key)
             or _VIDEO_KEY.search(label_text)
             or _VIDEO_KEY.search(category)
+            or _NON_AUDIO_QUALITY.search(setting_hints)
             or not declared_audio_quality
         ):
             continue

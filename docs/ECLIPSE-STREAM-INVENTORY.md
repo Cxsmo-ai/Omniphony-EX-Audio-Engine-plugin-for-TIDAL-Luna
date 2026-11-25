@@ -136,11 +136,12 @@ deadline separately from provider `expiresAt`.
 | TIDAL API AC-4 IMS | Live playback and seeking verified previously on Natural; mobile OAuth profile | Verified playback |
 | TIDAL API E-AC-3 JOC | Live playback, seek, pause, embedded `orender` and Studio headphone route verified previously | Verified playback |
 | TIDAL API FLAC tiers | Existing resolver and fixture coverage; no complete live tier enumeration in this work | Supported, live verification pending |
-| Gravity account connection | An earlier authenticated account discovery returned Gravity enabled; the current running TIDAL session reports Eclipse disconnected. | Previously connected; live checks blocked until the updated plugin is installed and Eclipse is reconnected |
-| Gravity stream resolution | Earlier probe requested six manifest tiers; each returned HTTP 415. Local resolver now narrows profile negotiation to APK-observed gates. | New build not yet live-verified; upstream behavior remains unresolved |
-| Gravity E-AC-3 JOC / Atmos | APK confirms Gravity's protected CBCS E-AC-3 profile and its Widevine/profile/local-codec conditions. | Descriptor discovery supported; fresh live verification pending; protected playback remains unavailable in this route |
-| Gravity ALAC | APK gates the FairPlay ALAC profile on native FairPlay availability. | Platform-blocked on Windows; profile is surfaced as such and is not claimed playable |
-| Other enabled Eclipse addons | Account-dependent; must be queried by connected provider key | Not yet verified |
+| Eclipse account connection | The saved Eclipse session remains connected. TIDAL's latest quick-close Discord sign-in attempt is marked canceled; two enabled account add-ons remain ready: Gravity and NetEase Cloud Music. | Cached account and add-on list are available; no new Discord authorization was completed |
+| Gravity manifest qualities | For Imagine Dragons — “Natural”, the manifest exposed six audio labels: Dolby Atmos, Hi-Res Lossless up to 192 kHz, Hi-Res Lossless up to 96 kHz, Lossless up to 48 kHz, AAC High Quality, and HE-AAC Data Saver. It also exposed four cover-art sizes. | Manifest options observed; audio availability is not established by declarations |
+| Gravity stream resolution | v2.1.81 generated 100 requests by crossing audio and cover-art settings with negotiation variants. The first 25 requests (24 audio/cover combinations plus the default) returned HTTP 415; the next returned HTTP 429; the remaining requests were not attempted after rate limiting. **0 descriptors** were returned. | Upstream stream resolution unverified; rerun with v2.1.82 |
+| Gravity E-AC-3 JOC / Atmos | APK confirms Gravity's protected CBCS E-AC-3 profile and its Widevine/profile/local-codec conditions. | Static support evidence only; fresh descriptor not observed; protected playback remains unavailable in this route |
+| Gravity ALAC | APK gates the FairPlay ALAC profile on native FairPlay availability. | Windows FairPlay capability unavailable; do not claim playable |
+| NetEase Cloud Music stream qualities | Account connection is enabled. The inventory run returned `manifest_unavailable` before any quality request or descriptor. | No stream result; cause and provider qualities remain unknown |
 | Disabled Eclipse addons | Not enumerated or enabled automatically | Connected-disabled; untested |
 | FairPlay / Widevine / PlayReady | Protection metadata retained; authorized platform playback is not implemented by this route | Descriptor-only; protected playback unavailable here |
 
@@ -177,17 +178,34 @@ same-TIDAL-owned child. The bundle completeness check also requires
 `eclipse_streams.py`, preventing an older runtime from being treated as a
 complete Eclipse build.
 
-v2.1.81 local verification on 2026-11-25: Python suite **304 passed, 1
-skipped, 79 subtests**; all `tests/*.test.mjs` suites passed; the RealMAX/UI
-harness passed; store manifest checks **3 passed**; the built Windows runtime
-archive verifier passed with **269 members** and matching build/pinned SHA-256
-`198EEB068B63C6C365B219101B07F5C4CB11E07C3BA118F2D451B3377E51FC98`.
-`git diff --check` passed. These local checks do not establish post-update
-live stream parity. At the start of this work, TIDAL PID 8600 owned service
-PID 27304 at API version 2.1.45, with an older runtime digest; the current
-Eclipse status was disconnected. Therefore no per-addon authenticated stream
-resolution, live media-manifest enumeration, expiration/renewal check, or
-official-client comparison has been completed for this build. Gravity's
-earlier HTTP 415 result remains ambiguous: it does not reveal whether the
-stream requires a protected playback interface or whether the addon rejected
-the request for another reason.
+The current TIDAL process is PID 40860 and its owned service is PID 41928 at
+API version 2.1.45. `/health` reports the earlier runtime-bundle digest
+`198EEB068B63C6C365B219101B07F5C4CB11E07C3BA118F2D451B3377E51FC98`, the
+configured MPV and Studio paths, and the live TIDAL owner. TIDAL's Eclipse UI
+reports that the saved account session remains connected and that two account
+add-ons are ready, while recording the latest Discord sign-in attempt as
+canceled. The connected inventory listed NetEase Cloud Music and Gravity as
+enabled. Gravity's manifest-listed audio qualities and four artwork-size
+options are recorded above. The earlier resolver incorrectly
+treated the artwork selector as an audio-quality axis, produced 100 attempts,
+received HTTP 415 for the first 25, then HTTP 429, and returned no descriptors.
+NetEase returned `manifest_unavailable` before any quality request. These are
+provider results, not evidence that the corresponding qualities are absent.
+A local fix now excludes cover/artwork/image selectors from audio-quality
+enumeration. It is built and installed on disk as v2.1.82 with a verified
+269-member runtime archive (SHA-256
+`237755CA86542E128DCC73F74BB78A1D2DD4C36148ACF2A2804492F072E3C48C`). The
+running service still reports the earlier runtime digest, so the new selector
+logic has not yet been loaded or live-tested. The exact plugin module version
+resident in TIDAL is not exposed by the inspected UI. Release assets were
+staged on C: because the E: workspace drive has no free space; no GitHub
+release was published.
+
+Verification during this continuation: `api/test_eclipse_gravity.py` **90
+passed** including the new cover-quality regression; the complete Python
+suite **237 passed, 1 skipped**; `node --test tests/*.test.mjs` **13 passed**;
+the runtime archive verifier passed with **269 members** and matching build
+and pinned SHA-256; the Luna store manifest verifier passed; the isolated
+loopback shutdown-authentication test passed. These checks do not establish
+live stream parity. Gravity's HTTP 415 result remains unexplained; the new
+build has not yet repeated the request without artwork selector combinations.
