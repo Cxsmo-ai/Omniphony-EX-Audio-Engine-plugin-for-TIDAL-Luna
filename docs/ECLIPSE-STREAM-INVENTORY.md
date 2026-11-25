@@ -3,7 +3,7 @@
 The service exposes a native-only, authenticated inventory route:
 
 ```text
-GET /eclipse/streams?providerKey=eclipse:<20-hex-key>&trackId=<addon-track-id>
+GET /eclipse/streams?providerKey=eclipse:<20-hex-key>&operationId=<opaque-id>&trackId=<addon-track-id>
 ```
 
 Use either a provider-local `trackId`, or `title`, `artist`, and optionally
@@ -94,6 +94,11 @@ deadline separately from provider `expiresAt`.
 
 - `qualityRequestsComplete` means each generated declared-quality request
   returned valid JSON. It does not prove a stream exists for every option.
+- For addons with quality selectors, inventory also requests one default
+  response without overriding the add-on's existing manifest URL settings.
+  That response is labeled as default/unselected; it is not counted as a
+  named selector match. Playback resolution continues using its configured
+  quality order and does not add a default-quality fallback.
 - `qualityEnumerationTruncated` reports when the bounded option-product limit
   was reached.
 - `protocolRequestTruncated` reports when negotiation variants or the bounded
@@ -131,22 +136,37 @@ deadline separately from provider `expiresAt`.
 | TIDAL API AC-4 IMS | Live playback and seeking verified previously on Natural; mobile OAuth profile | Verified playback |
 | TIDAL API E-AC-3 JOC | Live playback, seek, pause, embedded `orender` and Studio headphone route verified previously | Verified playback |
 | TIDAL API FLAC tiers | Existing resolver and fixture coverage; no complete live tier enumeration in this work | Supported, live verification pending |
-| Gravity account connection | Authenticated account discovery returned Gravity enabled | Connected; the settings inventory can now query its declared qualities |
-| Gravity stream resolution | Previous authenticated probe requested six manifest tiers; every request returned HTTP 415. Local resolver now narrows profile negotiation to APK-observed gates. | Previous live failure recorded; new build requires fresh authenticated verification |
+| Gravity account connection | An earlier authenticated account discovery returned Gravity enabled; the current running TIDAL session reports Eclipse disconnected. | Previously connected; live checks blocked until the updated plugin is installed and Eclipse is reconnected |
+| Gravity stream resolution | Earlier probe requested six manifest tiers; each returned HTTP 415. Local resolver now narrows profile negotiation to APK-observed gates. | New build not yet live-verified; upstream behavior remains unresolved |
 | Gravity E-AC-3 JOC / Atmos | APK confirms Gravity's protected CBCS E-AC-3 profile and its Widevine/profile/local-codec conditions. | Descriptor discovery supported; fresh live verification pending; protected playback remains unavailable in this route |
 | Gravity ALAC | APK gates the FairPlay ALAC profile on native FairPlay availability. | Platform-blocked on Windows; profile is surfaced as such and is not claimed playable |
 | Other enabled Eclipse addons | Account-dependent; must be queried by connected provider key | Not yet verified |
 | Disabled Eclipse addons | Not enumerated or enabled automatically | Connected-disabled; untested |
 | FairPlay / Widevine / PlayReady | Protection metadata retained; authorized platform playback is not implemented by this route | Descriptor-only; protected playback unavailable here |
 
-The Luna settings panel now accepts a provider-local track ID or title/artist
-and requests inventory for enabled Eclipse providers in RealMAX order. The
-request is made by the TidaLuna native supervisor with its per-launch service
-credential; the renderer receives only the sanitized inventory summary. The
-inventory layer preserves addon-returned formats without mapping them to a
-RealMAX playback quality. The existing player continues to admit only its
-explicitly supported playback candidates and retains its established TIDAL
-AC-4 IMS and E-AC-3 JOC routes.
+The Omniphony playback-details panel now provides a connected-addon inventory
+form for a provider-local track ID or title/artist (with optional ISRC). It
+lists every enabled connection on the signed-in Eclipse account. The native
+service accepts an enabled account connection even when it is not selected in
+the RealMAX playback order; a disabled or disconnected addon remains rejected.
+When several addons are enabled, use title/artist or ISRC so each provider can
+resolve its own track identity. The request is made by the TidaLuna native
+supervisor with its per-launch service credential; the renderer receives only
+the sanitized inventory summary. Signed URLs, provider headers, and opaque
+stream references remain in native memory. The inventory layer preserves
+addon-returned formats without mapping them to a RealMAX playback quality. The
+existing player continues to admit only its explicitly supported playback
+candidates and retains its established TIDAL AC-4 IMS and E-AC-3 JOC routes.
+The inventory view has an add-on selector, so provider-local IDs can be used
+safely with multiple account connections. Refresh failures clear provider
+eligibility until a successful refresh. A session-generation check discards
+pending results after account changes, disconnects, panel closure, or plugin
+unload. Cancellation is sent through a second native-authenticated request and
+checked between addon requests; an already-running upstream HTTP request is
+bounded by its existing per-request timeout and may take up to that timeout to
+return. Inventory output reports identity, declared-request completion,
+blocked profiles, media inspection completeness, expiry, and truncation.
+HLS rendition bandwidth is labeled as bandwidth, not audio bitrate.
 
 The native supervisor now identifies a service by both API version and the
 SHA-256 digest of the verified runtime archive. It passes that digest to the
@@ -157,19 +177,17 @@ same-TIDAL-owned child. The bundle completeness check also requires
 `eclipse_streams.py`, preventing an older runtime from being treated as a
 complete Eclipse build.
 
-Current local verification after the discovery changes: the API Python suite
-passes 227 tests (1 skipped), the root pytest suite passes 295 tests (1
-skipped, plus 76 subtests), all 13 Node tests pass, and the priority UI check
-passes. The focused Gravity/lifecycle suite passes 165 tests (1 skipped, plus
-30 subtests). The runtime archive verifier confirms 269 members, embedded
-imports, and the matching pinned SHA-256 for the current 2.1.78 build.
-This verification does not constitute post-update live inventory through the settings UI, a
-per-addon catalog run for every connected provider, live media-manifest
-enumeration for each enabled addon, or comparison with the official Eclipse client. At the
-start of this continuation, TIDAL PID 41788 owned service PID 38952 at API
-version 2.1.45, but the installed runtime archive marker and service source
-did not match the repository's verified archive digest. The stale-runtime
-replacement fix is implemented and must be exercised by reloading the plugin
-before live inventory. Gravity's previously observed HTTP 415 result does not
-identify whether the stream requires a protected playback interface, or
-whether the addon rejected the request for another reason.
+v2.1.81 local verification on 2026-11-25: Python suite **304 passed, 1
+skipped, 79 subtests**; all `tests/*.test.mjs` suites passed; the RealMAX/UI
+harness passed; store manifest checks **3 passed**; the built Windows runtime
+archive verifier passed with **269 members** and matching build/pinned SHA-256
+`198EEB068B63C6C365B219101B07F5C4CB11E07C3BA118F2D451B3377E51FC98`.
+`git diff --check` passed. These local checks do not establish post-update
+live stream parity. At the start of this work, TIDAL PID 8600 owned service
+PID 27304 at API version 2.1.45, with an older runtime digest; the current
+Eclipse status was disconnected. Therefore no per-addon authenticated stream
+resolution, live media-manifest enumeration, expiration/renewal check, or
+official-client comparison has been completed for this build. Gravity's
+earlier HTTP 415 result remains ambiguous: it does not reveal whether the
+stream requires a protected playback interface or whether the addon rejected
+the request for another reason.

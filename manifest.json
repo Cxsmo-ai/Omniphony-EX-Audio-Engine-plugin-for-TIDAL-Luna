@@ -3,7 +3,7 @@
   "description": "RealMAX TIDAL and enabled Eclipse add-on playback with AC-4 IMS, E-AC-3 JOC routing, and native transport controls.",
   "author": "Pickymarker",
   "dependencies": {},
-  "version": "2.1.78",
-  "main": "omniphony.mjs?version=2.1.78&service=2.1.45",
-  "hash": "87AF8CB29D9F56B49A4F4D0CCC9D094647C2CE580A8B916DBA0F710C0EE9AD38"
+  "version": "2.1.81",
+  "main": "omniphony.mjs?version=2.1.81&service=2.1.45",
+  "hash": "53AD41F79BD628A5B6907DE005336803579C48AC22EE619FB1DDAED19FFC0283"
 }

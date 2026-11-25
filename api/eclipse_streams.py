@@ -160,12 +160,14 @@ def _quality_settings(manifest: dict) -> list[dict]:
         folded_key = key.casefold()
         if folded_key in seen_keys:
             seen_keys[folded_key]["optionsUnsafe"] = True
+            seen_keys[folded_key]["selectorAmbiguous"] = True
             continue
         options = setting.get("options")
         if not isinstance(options, list):
             definition = {
                 "key": key, "label": label or key, "default": None,
                 "options": [], "optionsTruncated": False, "optionsUnsafe": True,
+                "selectorAmbiguous": False,
             }
             result.append(definition)
             seen_keys[folded_key] = definition
@@ -204,6 +206,7 @@ def _quality_settings(manifest: dict) -> list[dict]:
             definition = {
                 "key": key, "label": label or key, "default": None,
                 "options": [], "optionsTruncated": False, "optionsUnsafe": True,
+                "selectorAmbiguous": False,
             }
             result.append(definition)
             seen_keys[folded_key] = definition
@@ -216,13 +219,14 @@ def _quality_settings(manifest: dict) -> list[dict]:
             "options": choices,
             "optionsTruncated": len(seen) > MAX_QUALITY_OPTIONS or len(options) > MAX_QUALITY_OPTIONS,
             "optionsUnsafe": options_unsafe,
+            "selectorAmbiguous": False,
         }
         result.append(definition)
         seen_keys[folded_key] = definition
     return result
 
 
-def quality_candidates(manifest: dict) -> list[dict]:
+def quality_candidates(manifest: dict, *, include_default: bool = False) -> list[dict]:
     """Build bounded exact request configurations from addon-declared defaults/options.
 
     Only confidently identified audio/stream quality settings are varied.
@@ -235,15 +239,23 @@ def quality_candidates(manifest: dict) -> list[dict]:
     # An invalid or empty setting must not erase the useful combinations from
     # other valid settings. Omit only the unsafe key; completeness reporting
     # still marks the inventory as partial through quality_options_unsafe().
-    valid_defs = [definition for definition in quality_defs if definition["options"]]
+    valid_defs = [definition for definition in quality_defs
+                  if definition["options"] and not definition.get("selectorAmbiguous")]
     if not valid_defs:
         # Still ask the add-on for its default stream. Unsafe/empty selectors
         # keep the inventory partial; they must not hide an otherwise usable
         # default response.
         return [{"requestedQuality": None, "settings": {}, "qualityKey": None}]
+    # Query the manifest-configured/default response as well as explicit
+    # selectors. Eclipse appends saved add-on settings to this request; the
+    # account API does not expose those saved values, so the baseline preserves
+    # the URL's existing configuration without inventing a selector.
     candidates = []
+    explicit_limit = MAX_QUALITY_OPTIONS - (1 if include_default else 0)
     option_groups = [definition["options"] for definition in valid_defs]
     for combination in product(*option_groups):
+        if len(candidates) >= explicit_limit:
+            break
         params = {definition["key"]: option["value"] for definition, option in zip(valid_defs, combination)}
         label = combination[0]["label"] if len(combination) == 1 else "; ".join(
             f"{definition['label']}: {option['label']}" for definition, option in zip(valid_defs, combination)
@@ -259,16 +271,17 @@ def quality_candidates(manifest: dict) -> list[dict]:
             "settings": params,
             "publicSettings": display_settings,
         })
-        if len(candidates) >= MAX_QUALITY_OPTIONS:
-            break
+    if include_default:
+        candidates.append({"requestedQuality": None, "settings": {}, "qualityKey": None})
     return candidates
 
 
-def quality_candidate_limit_exceeded(manifest: dict) -> bool:
+def quality_candidate_limit_exceeded(manifest: dict, *, include_default: bool = False) -> bool:
     definitions = _quality_settings(manifest)
-    groups = [item["options"] for item in definitions if item["options"]]
+    groups = [item["options"] for item in definitions
+              if item["options"] and not item.get("selectorAmbiguous")]
     return any(item.get("optionsTruncated") for item in definitions) or (
-        bool(groups) and math.prod(len(group) for group in groups) > MAX_QUALITY_OPTIONS
+        bool(groups) and math.prod(len(group) for group in groups) + int(include_default) > MAX_QUALITY_OPTIONS
     )
 
 
@@ -280,6 +293,8 @@ def quality_selector_label_map(manifest: dict) -> dict[str, str | None]:
     """Map selector tokens to labels, marking conflicting labels as ambiguous."""
     labels_by_value: dict[str, set[str]] = {}
     for definition in _quality_settings(manifest):
+        if definition.get("selectorAmbiguous"):
+            continue
         for option in definition["options"]:
             value, label = option.get("value"), option.get("label")
             if isinstance(value, str) and isinstance(label, str):
@@ -310,14 +325,16 @@ def stream_request_candidates(
     declared_profile_count = len(profiles) if isinstance(profiles, list) else 0
     drm_systems = [
         value for item in drm_systems[:32] if isinstance(item, str)
-        for value in [_renderer_text(item, 96)] if value
+        for value in [_renderer_text(item, 96)] if value and value == item
     ] if isinstance(drm_systems, list) else []
     profiles = [
         value for item in profiles[:32] if isinstance(item, str)
-        for value in [_renderer_text(item, 128)] if value
+        for value in [_renderer_text(item, 128)] if value and value == item
     ] if isinstance(profiles, list) else []
     seen = {tuple(sorted(base.items()))}
-    truncated = declared_drm_count > 32 or declared_profile_count > 32
+    truncated = (declared_drm_count > 32 or declared_profile_count > 32
+                 or len(drm_systems) != min(declared_drm_count, 32)
+                 or len(profiles) != min(declared_profile_count, 32))
 
     def add(negotiation: dict) -> None:
         nonlocal truncated
@@ -396,15 +413,20 @@ def build_stream_request_plan(
             "settings": dict(quality.get("settings") or {}),
             "negotiation": {},
         })
+    expanded = []
     for quality in quality_requests:
         variants, variants_truncated = stream_request_candidates(
             manifest, quality, addon_id=addon_id,
             fairplay_available=fairplay_available, dolby_codecs=dolby_codecs,
         )
         truncated = truncated or variants_truncated
-        for variant in variants:
-            if not variant.get("negotiation"):
+        expanded.append((quality, [variant for variant in variants if variant.get("negotiation")]))
+    max_variants = max((len(variants) for _, variants in expanded), default=0)
+    for variant_index in range(max_variants):
+        for quality, variants in expanded:
+            if variant_index >= len(variants):
                 continue
+            variant = variants[variant_index]
             if len(plan) >= limit:
                 return plan, True
             plan.append({
@@ -524,11 +546,13 @@ def _url_is_http(value: Any) -> bool:
 
 def _protection(raw: dict) -> dict:
     drm = raw.get("drm")
+    systems: list[str] = []
     system = None
     encryption = None
+    drm_scheme = drm.get("scheme") if isinstance(drm, dict) else None
     if isinstance(drm, dict):
         system = drm.get("system") or drm.get("keySystem")
-        scheme = drm.get("scheme")
+        scheme = drm_scheme
         encryption = drm.get("encryptionScheme") or drm.get("method")
         if scheme and str(scheme).strip().lower() not in _KNOWN_DRM_SYSTEMS:
             encryption = encryption or scheme
@@ -536,8 +560,32 @@ def _protection(raw: dict) -> dict:
             system = system or scheme
     elif isinstance(drm, str) and drm.strip():
         system = drm.strip()
+    raw_systems = [
+        system,
+        drm.get("system") if isinstance(drm, dict) else None,
+        drm.get("keySystem") if isinstance(drm, dict) else None,
+        drm_scheme if isinstance(drm_scheme, str) and drm_scheme.strip().lower() in _KNOWN_DRM_SYSTEMS else None,
+        raw.get("keySystem"), raw.get("drmSystem"),
+    ]
+    for candidate in raw_systems:
+        text = _renderer_text(candidate, 160)
+        if text:
+            normalized = _KNOWN_DRM_SYSTEMS.get(text.lower(), text.lower())
+            if normalized not in systems:
+                systems.append(normalized)
     system = system or raw.get("keySystem") or raw.get("drmSystem")
-    encryption = raw.get("encryptionScheme") or raw.get("encryptionMethod") or raw.get("protectionScheme") or encryption
+    encryption_values = []
+    for candidate in (
+        drm.get("encryptionScheme") if isinstance(drm, dict) else None,
+        drm.get("method") if isinstance(drm, dict) else None,
+        drm.get("protectionScheme") if isinstance(drm, dict) else None,
+        drm_scheme if isinstance(drm_scheme, str) and drm_scheme.strip().lower() not in _KNOWN_DRM_SYSTEMS else None,
+        raw.get("encryptionScheme"), raw.get("encryptionMethod"), raw.get("protectionScheme"),
+    ):
+        text = _renderer_text(candidate, 160)
+        if text and all(text.casefold() != current.casefold() for current in encryption_values):
+            encryption_values.append(text)
+    encryption = encryption or (encryption_values[0] if encryption_values else None)
     system_indicator_present = bool(system) or bool(raw.get("keySystem")) or bool(raw.get("drmSystem"))
     encryption_indicator_present = bool(encryption) or any(
         bool(raw.get(key)) for key in ("encryptionScheme", "encryptionMethod", "protectionScheme")
@@ -575,6 +623,12 @@ def _protection(raw: dict) -> dict:
         and not license_available and not certificate_available and not service_certificate_available
         and not init_mapping_available and not native_fairplay_available
     )
+    conflicting_systems = len(systems) > 1
+    conflicting_encryption = len(encryption_values) > 1
+    if conflicting_systems:
+        normalized_system = None
+    if conflicting_encryption:
+        encryption_text = None
     return {
         "status": "protected" if encrypted else "unknown",
         "reportedStatus": "clear" if reported_clear else None,
@@ -587,9 +641,10 @@ def _protection(raw: dict) -> dict:
         "multiSession": drm.get("multiSession") if isinstance(drm, dict) and isinstance(drm.get("multiSession"), bool) else None,
         "initDataMappingAvailable": init_mapping_available,
         "nativeFairPlayAvailable": native_fairplay_available,
-        "conflictingProtectionMetadata": False,
-        "conflictingProtectionFields": [],
-        "systems": [normalized_system] if normalized_system else [],
+        "conflictingProtectionMetadata": conflicting_systems or conflicting_encryption,
+        "conflictingProtectionFields": (["system"] if conflicting_systems else [])
+        + (["encryptionScheme"] if conflicting_encryption else []),
+        "systems": systems or ([normalized_system] if normalized_system else []),
     }
 
 
@@ -617,7 +672,11 @@ def _merge_protection(parent: dict | None, child: dict) -> dict:
     child_system = child_info.get("system")
     parent_scheme = parent_info.get("encryptionScheme")
     child_scheme = child_info.get("encryptionScheme")
-    conflicts = []
+    conflicts = list(dict.fromkeys(
+        value for info in (parent_info, child_info)
+        for value in (info.get("conflictingProtectionFields") or [])
+        if isinstance(value, str)
+    ))
     if parent_system and child_system and parent_system.casefold() != child_system.casefold():
         conflicts.append("system")
     if parent_scheme and child_scheme and parent_scheme.casefold() != child_scheme.casefold():
@@ -627,15 +686,22 @@ def _merge_protection(parent: dict | None, child: dict) -> dict:
         if isinstance(value, str) and value
     ))
     merged["systems"] = systems
+    if len(systems) > 1 and "system" not in conflicts:
+        conflicts.append("system")
+    if len(systems) > 1:
+        merged["system"] = None
     if conflicts:
         if "system" in conflicts:
             merged["system"] = None
         if "encryptionScheme" in conflicts:
             merged["encryptionScheme"] = None
         merged["conflictingProtectionMetadata"] = True
-        merged["conflictingProtectionFields"] = conflicts
+        merged["conflictingProtectionFields"] = list(dict.fromkeys(conflicts))
         merged["status"] = "protected"
         merged["reportedStatus"] = None
+    else:
+        merged["conflictingProtectionMetadata"] = False
+        merged["conflictingProtectionFields"] = []
     return merged
 
 
@@ -667,7 +733,10 @@ def _normalize_stream(raw: dict, *, addon_id: str, addon_name: str, track_id: st
     manifest_type = _renderer_text(combined.get("manifest"), 32)
     if not manifest_type and isinstance(media_url, str):
         manifest_type = "hls" if ".m3u8" in media_url.lower() else "dash" if ".mpd" in media_url.lower() else None
-    raw_actual_quality = _clean_text(combined.get("quality") or combined.get("audioQuality"), 160)
+    actual_quality_value = combined.get("quality")
+    if actual_quality_value is None:
+        actual_quality_value = combined.get("audioQuality")
+    raw_actual_quality = _clean_text(actual_quality_value, 160)
     actual_quality = (
         quality_selector_labels.get(raw_actual_quality)
         if raw_actual_quality is not None and isinstance(quality_selector_labels, dict)
@@ -728,6 +797,7 @@ def _normalize_stream(raw: dict, *, addon_id: str, addon_name: str, track_id: st
         "container": container,
         "manifestType": manifest_type,
         "bitrate": _bounded_integer(combined.get("bitrate"), minimum=1, maximum=100_000_000),
+        "bitrateBps": _bounded_integer(combined.get("bitrate"), minimum=1, maximum=100_000_000),
         "sampleRate": _bounded_integer(combined.get("sampleRate"), minimum=8_000, maximum=768_000),
         "bitDepth": _bounded_integer(combined.get("bitDepth"), minimum=1, maximum=64),
         "channels": _bounded_integer(combined.get("channels"), minimum=1, maximum=64),

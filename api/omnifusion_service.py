@@ -4623,6 +4623,49 @@ def seek_settle_timeout_seconds(proxy, position: float) -> float:
 
 _ECLIPSE_AUTH_LOCK = threading.RLock()
 _ECLIPSE_STREAM_DISCOVERY_SEMAPHORE = threading.BoundedSemaphore(2)
+_ECLIPSE_INVENTORY_CANCEL_LOCK = threading.Lock()
+_ECLIPSE_INVENTORY_OPERATIONS: dict[str, tuple[threading.Event, float]] = {}
+
+
+def _register_eclipse_inventory_operation(operation_id: str) -> threading.Event | None:
+    if not isinstance(operation_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{24,64}", operation_id):
+        return None
+    now = time.monotonic()
+    with _ECLIPSE_INVENTORY_CANCEL_LOCK:
+        for key, (_event, created) in list(_ECLIPSE_INVENTORY_OPERATIONS.items()):
+            if now - created > 180:
+                _ECLIPSE_INVENTORY_OPERATIONS.pop(key, None)
+        existing = _ECLIPSE_INVENTORY_OPERATIONS.get(operation_id)
+        if existing is not None:
+            return existing[0] if existing[0].is_set() else None
+        if len(_ECLIPSE_INVENTORY_OPERATIONS) >= 32:
+            return None
+        event = threading.Event()
+        _ECLIPSE_INVENTORY_OPERATIONS[operation_id] = (event, now)
+        return event
+
+
+def _cancel_eclipse_inventory_operation(operation_id: str) -> bool:
+    if not isinstance(operation_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{24,64}", operation_id):
+        return False
+    with _ECLIPSE_INVENTORY_CANCEL_LOCK:
+        operation = _ECLIPSE_INVENTORY_OPERATIONS.get(operation_id)
+        if operation is None:
+            if len(_ECLIPSE_INVENTORY_OPERATIONS) >= 32:
+                return False
+            event = threading.Event()
+            event.set()
+            _ECLIPSE_INVENTORY_OPERATIONS[operation_id] = (event, time.monotonic())
+            return True
+        operation[0].set()
+        return True
+
+
+def _unregister_eclipse_inventory_operation(operation_id: str, event: threading.Event) -> None:
+    with _ECLIPSE_INVENTORY_CANCEL_LOCK:
+        operation = _ECLIPSE_INVENTORY_OPERATIONS.get(operation_id)
+        if operation is not None and operation[0] is event:
+            _ECLIPSE_INVENTORY_OPERATIONS.pop(operation_id, None)
 _ECLIPSE_DNS_LOOKUP_SLOTS = threading.BoundedSemaphore(4)
 _ECLIPSE_REQUEST_WORKER_SLOTS = threading.BoundedSemaphore(4)
 _ECLIPSE_AUTH_CACHE: dict[str, object] = {
@@ -6331,6 +6374,7 @@ def _discover_eclipse_addon_streams_impl(
     duration: int | float = 0,
     provider_key: str | None = None,
     timeout_ms: int = 120_000,
+    cancel_event: threading.Event | None = None,
 ) -> dict:
     """Enumerate declared addon quality options independently of local playback.
 
@@ -6343,10 +6387,20 @@ def _discover_eclipse_addon_streams_impl(
     except (TypeError, ValueError, OverflowError):
         timeout_ms = 120_000
     discovery_deadline = time.monotonic() + timeout_ms / 1000.0
+    def canceled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    def canceled_result() -> dict:
+        return {"complete": False, "reason": "inventory_canceled", "streams": [], "attempts": []}
+
+    if canceled():
+        return canceled_result()
     manifest_remaining = discovery_deadline - time.monotonic()
     if manifest_remaining <= 0:
         return {"complete": False, "reason": "discovery_deadline_exceeded", "streams": [], "attempts": []}
     manifest = _get_eclipse_manifest(addon_manifest_url, timeout=min(6.0, manifest_remaining))
+    if canceled():
+        return canceled_result()
     if time.monotonic() >= discovery_deadline:
         return {"complete": False, "reason": "discovery_deadline_exceeded", "streams": [], "attempts": []}
     if not isinstance(manifest, dict):
@@ -6451,6 +6505,8 @@ def _discover_eclipse_addon_streams_impl(
         nonlocal token, last_retry_after
         last_retry_after = None
         for attempt in range(3):
+            if canceled():
+                return None, "inventory_canceled"
             remaining = discovery_deadline - time.monotonic()
             if remaining <= 0:
                 return None, "discovery_deadline_exceeded"
@@ -6507,7 +6563,11 @@ def _discover_eclipse_addon_streams_impl(
                     if retry_seconds >= discovery_deadline - time.monotonic():
                         return None, "discovery_deadline_exceeded"
                     if retry_seconds > 0:
-                        time.sleep(retry_seconds)
+                        if cancel_event is not None:
+                            if cancel_event.wait(retry_seconds):
+                                return None, "inventory_canceled"
+                        else:
+                            time.sleep(retry_seconds)
                     continue
                 if exc.code in (401, 403) and attempt == 0:
                     refreshed = _get_eclipse_addon_access_token(
@@ -6587,9 +6647,9 @@ def _discover_eclipse_addon_streams_impl(
         }
 
     resolved_track_id = str(selected_track["id"]).strip()[:512]
-    quality_requests = quality_candidates(manifest) if capabilities["stream"] is not False else []
+    quality_requests = quality_candidates(manifest, include_default=True) if capabilities["stream"] is not False else []
     quality_labels_by_selector = quality_selector_label_map(manifest)
-    quality_limit_exceeded = quality_candidate_limit_exceeded(manifest)
+    quality_limit_exceeded = quality_candidate_limit_exceeded(manifest, include_default=True)
     quality_options_unsafe_flag = quality_options_unsafe(manifest)
     stream_request_plan, protocol_request_truncated = build_stream_request_plan(
         manifest, quality_requests, limit=MAX_ECLIPSE_STREAM_REQUESTS,
@@ -6796,6 +6856,8 @@ def _discover_eclipse_addon_streams_impl(
         incomplete = True
 
     for candidate in stream_request_plan:
+        if canceled():
+            return canceled_result()
         remaining = discovery_deadline - time.monotonic()
         if remaining <= 0.05:
             incomplete = True
@@ -6856,6 +6918,8 @@ def _discover_eclipse_addon_streams_impl(
             malformed_stream_candidates = True
             incomplete = True
         for item in flatten_stream_payload(payload):
+            if canceled():
+                return canceled_result()
             parent = item.pop("_parent", None)
             normalized = _normalize_stream(
                 item,
@@ -6895,6 +6959,8 @@ def _discover_eclipse_addon_streams_impl(
             incomplete = True
         attempts.append(attempt)
     with _ECLIPSE_AUTH_LOCK:
+        if canceled():
+            return canceled_result()
         if _ECLIPSE_AUTH_GENERATION != account_generation:
             return {"complete": False, "reason": "account_changed_during_discovery", "streams": [], "attempts": []}
         # Start the local opaque-reference TTL when discovery completes, not
@@ -6971,12 +7037,15 @@ def _discover_eclipse_addon_streams_impl(
     }
 
 
-def discover_eclipse_addon_streams(addon_manifest_url: str, *, timeout_ms: int = 120_000, **kwargs) -> dict:
+def discover_eclipse_addon_streams(addon_manifest_url: str, *, timeout_ms: int = 120_000,
+                                   cancel_event: threading.Event | None = None, **kwargs) -> dict:
     """Run at most two authenticated addon discoveries concurrently."""
     if not _ECLIPSE_STREAM_DISCOVERY_SEMAPHORE.acquire(blocking=False):
         return {"complete": False, "reason": "discovery_capacity_reached", "streams": [], "attempts": []}
     try:
-        return _discover_eclipse_addon_streams_impl(addon_manifest_url, timeout_ms=timeout_ms, **kwargs)
+        return _discover_eclipse_addon_streams_impl(
+            addon_manifest_url, timeout_ms=timeout_ms, cancel_event=cancel_event, **kwargs,
+        )
     finally:
         _ECLIPSE_STREAM_DISCOVERY_SEMAPHORE.release()
 
@@ -9008,6 +9077,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"error": "native Eclipse discovery authorization failed"}, status=403)
                 return
             query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            operation_id = query.get("operationId", [""])[0]
+            if not isinstance(operation_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{24,64}", operation_id):
+                self.send_json({"error": "a valid inventory operation ID is required"}, status=400)
+                return
             provider_key = query.get("providerKey", [""])[0]
             if not isinstance(provider_key, str) or not re.fullmatch(r"eclipse:[0-9a-f]{20}", provider_key):
                 self.send_json({"error": "a valid connected Eclipse providerKey is required"}, status=400)
@@ -9017,12 +9090,12 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 # availability must not depend on whether playback is currently
                 # configured for TIDAL-only mode.
                 provider_config = realmax_provider_configuration(load_settings())
-                provider_order = provider_config.get("configuredOrder", [])
                 addon_providers = provider_config.get("_internal_records", {})
                 provider = addon_providers.get(provider_key)
-                if (provider_key not in provider_order or not isinstance(provider, dict)
+                if (not isinstance(provider, dict)
+                        or provider.get("accountConnected") is not True
                         or provider.get("available") is not True):
-                    self.send_json({"error": "selected Eclipse provider is unavailable or disabled"}, status=404)
+                    self.send_json({"error": "connected Eclipse provider is unavailable or disabled"}, status=404)
                     return
                 manifest_url = provider.get("manifestUrl")
                 if not isinstance(manifest_url, str) or not manifest_url:
@@ -9036,6 +9109,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     timeout_ms = max(1, min(120_000, int(query.get("timeoutMs", ["120000"])[0] or 120_000)))
                 except (TypeError, ValueError, OverflowError):
                     timeout_ms = 120_000
+                cancel_event = _register_eclipse_inventory_operation(operation_id)
+                if cancel_event is None:
+                    self.send_json({"error": "inventory operation is duplicate or capacity is full"}, status=409)
+                    return
                 inventory = discover_eclipse_addon_streams(
                     manifest_url,
                     addon_id=str(provider.get("addonId") or ""),
@@ -9047,9 +9124,13 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     duration=duration,
                     provider_key=provider_key,
                     timeout_ms=timeout_ms,
+                    cancel_event=cancel_event,
                 )
+                _unregister_eclipse_inventory_operation(operation_id, cancel_event)
                 self.send_json(inventory)
             except Exception as exc:
+                if "cancel_event" in locals() and cancel_event is not None:
+                    _unregister_eclipse_inventory_operation(operation_id, cancel_event)
                 self.send_json({"error": f"Eclipse stream discovery failed ({type(exc).__name__})"}, status=502)
 
         elif parsed.path == "/login/status":
@@ -9462,9 +9543,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         if self.reject_untrusted_origin(require_origin=True):
             return
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path in {"/eclipse-auth/complete", "/eclipse-auth/flow-status"}:
+        if parsed.path in {"/eclipse-auth/complete", "/eclipse-auth/flow-status", "/eclipse/streams/cancel"}:
             if not eclipse_native_request_authorized(self.headers):
-                return self.send_json({"error": "Eclipse sign-in request authorization failed"}, status=403)
+                return self.send_json({"error": "native Eclipse request authorization failed"}, status=403)
         if parsed.path == "/shutdown":
             if not shutdown_request_authorized(self.headers):
                 return self.send_json({"error": "service shutdown authorization failed"}, status=403)
@@ -9489,6 +9570,12 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
             return self.send_json({"error": f"invalid JSON request: {exc}"}, status=400)
+
+        if parsed.path == "/eclipse/streams/cancel":
+            operation_id = body.get("operationId")
+            if not isinstance(operation_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{24,64}", operation_id):
+                return self.send_json({"error": "a valid inventory operation ID is required"}, status=400)
+            return self.send_json({"canceled": _cancel_eclipse_inventory_operation(operation_id)})
 
         if parsed.path == "/eclipse-auth/complete":
             if not ECLIPSE_ACCOUNT_LINKING_SUPPORTED:

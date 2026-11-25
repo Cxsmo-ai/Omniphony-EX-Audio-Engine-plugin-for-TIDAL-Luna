@@ -1801,6 +1801,10 @@ const sandbox = {
   API_BASE: "http://127.0.0.1:8765",
   crypto: globalThis.crypto,
   AbortController,
+  MutationObserver: class {
+    observe() {}
+    disconnect() {}
+  },
   console: testConsole,
   setInterval: (callback) => { intervalCallback = callback; const id = ++intervalId; intervals.set(id, callback); return id; },
   clearInterval: (id) => { clearedIntervals.add(id); intervals.delete(id); },

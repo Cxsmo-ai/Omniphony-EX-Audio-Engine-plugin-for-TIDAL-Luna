@@ -1,5 +1,6 @@
 import io
 import json
+import threading
 import time
 import unittest
 import urllib.error
@@ -14,19 +15,22 @@ import omnifusion_service as service
 class GravityResolverTests(unittest.TestCase):
     manifest_url = "https://gravity.example/account/manifest.json"
 
-    def test_native_inventory_route_remains_available_in_tidal_only_playback_mode(self):
+    def test_native_inventory_route_accepts_enabled_addon_outside_realmax_playback_order(self):
         provider_key = "eclipse:" + "a" * 20
         handler = object.__new__(service.RequestHandler)
-        handler.path = f"/eclipse/streams?providerKey={provider_key}&trackId=track-1"
+        handler.path = f"/eclipse/streams?providerKey={provider_key}&trackId=track-1&operationId={'a' * 32}"
         handler.headers = {"Authorization": "Bearer native-test", "X-Omniphony-Service-Instance": "instance"}
         handler.reject_untrusted_origin = lambda: False
         handler.send_json = Mock()
         expected = {"complete": False, "reason": "upstream_rate_limited", "streams": [], "attempts": []}
-        provider = {"addonId": "test.addon", "name": "Test", "manifestUrl": self.manifest_url, "available": True}
+        provider = {
+            "addonId": "test.addon", "name": "Test", "manifestUrl": self.manifest_url,
+            "available": True, "accountConnected": True, "source": "eclipse_account",
+        }
         with patch.object(service, "eclipse_native_request_authorized", return_value=True), \
              patch.object(service, "load_settings", return_value={"realmax_source": "tidal_api"}), \
              patch.object(service, "realmax_provider_configuration", return_value={
-                 "configuredOrder": ["tidal_api", provider_key],
+                "configuredOrder": ["tidal_api"],
                  "_internal_records": {provider_key: provider},
              }), \
              patch.object(service, "discover_eclipse_addon_streams", return_value=expected) as discover:
@@ -35,11 +39,12 @@ class GravityResolverTests(unittest.TestCase):
         self.assertEqual(handler.send_json.call_args.args[0], expected)
         self.assertEqual(discover.call_args.kwargs["provider_key"], provider_key)
         self.assertEqual(discover.call_args.kwargs["track_id"], "track-1")
+        self.assertIsInstance(discover.call_args.kwargs["cancel_event"], threading.Event)
 
     def test_native_inventory_route_rejects_disabled_provider_before_discovery(self):
         provider_key = "eclipse:" + "a" * 20
         handler = object.__new__(service.RequestHandler)
-        handler.path = f"/eclipse/streams?providerKey={provider_key}&trackId=track-1"
+        handler.path = f"/eclipse/streams?providerKey={provider_key}&trackId=track-1&operationId={'b' * 32}"
         handler.headers = {}
         handler.reject_untrusted_origin = lambda: False
         handler.send_json = Mock()
@@ -49,7 +54,7 @@ class GravityResolverTests(unittest.TestCase):
                  "configuredOrder": [provider_key],
                  "_internal_records": {provider_key: {
                      "addonId": "test.addon", "name": "Test", "manifestUrl": self.manifest_url,
-                     "available": False,
+                    "available": False, "accountConnected": True, "source": "eclipse_account",
                  }},
              }), \
              patch.object(service, "discover_eclipse_addon_streams") as discover:
@@ -57,6 +62,104 @@ class GravityResolverTests(unittest.TestCase):
 
         self.assertEqual(handler.send_json.call_args.kwargs["status"], 404)
         discover.assert_not_called()
+
+    def test_inventory_cancel_operation_is_bounded_and_scoped(self):
+        operation_id = "c" * 32
+        event = service._register_eclipse_inventory_operation(operation_id)
+        self.assertIsInstance(event, threading.Event)
+        self.assertFalse(event.is_set())
+        self.assertTrue(service._cancel_eclipse_inventory_operation(operation_id))
+        self.assertTrue(event.is_set())
+        self.assertFalse(service._cancel_eclipse_inventory_operation("bad-id"))
+        service._unregister_eclipse_inventory_operation(operation_id, event)
+        self.assertTrue(service._cancel_eclipse_inventory_operation(operation_id))
+        late_event = service._register_eclipse_inventory_operation(operation_id)
+        self.assertTrue(late_event.is_set())
+        service._unregister_eclipse_inventory_operation(operation_id, late_event)
+
+    def test_cancel_arriving_before_inventory_registration_is_remembered(self):
+        operation_id = "f" * 32
+        self.assertTrue(service._cancel_eclipse_inventory_operation(operation_id))
+        event = service._register_eclipse_inventory_operation(operation_id)
+        self.assertIsInstance(event, threading.Event)
+        self.assertTrue(event.is_set())
+        service._unregister_eclipse_inventory_operation(operation_id, event)
+
+    def test_canceled_inventory_exits_before_manifest_network_request(self):
+        event = threading.Event()
+        event.set()
+        with patch.object(service, "_get_eclipse_manifest") as manifest:
+            inventory = service.discover_eclipse_addon_streams(
+                self.manifest_url, addon_id="test.addon", addon_name="Test", track_id="track-1",
+                cancel_event=event,
+            )
+        self.assertEqual(inventory["reason"], "inventory_canceled")
+        self.assertEqual(inventory["streams"], [])
+        manifest.assert_not_called()
+
+    def test_cancellation_during_manifest_fetch_discards_inventory_before_token_mint(self):
+        event = threading.Event()
+
+        def cancel_during_fetch(*_args, **_kwargs):
+            event.set()
+            return {"id": "test.addon", "settings": []}
+
+        with patch.object(service, "_get_eclipse_manifest", side_effect=cancel_during_fetch), \
+             patch.object(service, "_get_eclipse_addon_access_token") as token_request:
+            inventory = service.discover_eclipse_addon_streams(
+                self.manifest_url, addon_id="test.addon", addon_name="Test", track_id="track-1",
+                cancel_event=event,
+            )
+        self.assertEqual(inventory["reason"], "inventory_canceled")
+        token_request.assert_not_called()
+
+    def test_native_cancel_route_sets_only_the_named_inventory_event(self):
+        operation_id = "9" * 32
+        event = service._register_eclipse_inventory_operation(operation_id)
+        handler = object.__new__(service.RequestHandler)
+        handler.path = "/eclipse/streams/cancel"
+        handler.headers = {
+            "Authorization": "Bearer native-test",
+            "X-Omniphony-Service-Instance": "instance",
+            "Content-Length": str(len(json.dumps({"operationId": operation_id}))),
+        }
+        handler.reject_untrusted_origin = lambda require_origin=False: False
+        handler.connection = type("Connection", (), {"settimeout": lambda *_args: None})()
+        handler.rfile = io.BytesIO(json.dumps({"operationId": operation_id}).encode())
+        handler.send_json = Mock()
+        other_id = "8" * 32
+        other_event = service._register_eclipse_inventory_operation(other_id)
+        with patch.object(service, "eclipse_native_request_authorized", return_value=True):
+            service.RequestHandler._do_POST(handler)
+        self.assertEqual(handler.send_json.call_args.args[0], {"canceled": True})
+        self.assertTrue(event.is_set())
+        self.assertFalse(other_event.is_set())
+        service._unregister_eclipse_inventory_operation(operation_id, event)
+        service._unregister_eclipse_inventory_operation(other_id, other_event)
+
+    def test_inventory_keeps_enabled_addons_discoverable_outside_provider_order(self):
+        addons = [
+            {"addonId": "enabled.first", "manifestUrl": "https://one.example/manifest.json", "displayName": "First", "isEnabled": True},
+            {"addonId": "enabled.second", "manifestUrl": "https://two.example/manifest.json", "displayName": "Second", "isEnabled": True},
+            {"addonId": "disabled.third", "manifestUrl": "https://three.example/manifest.json", "displayName": "Disabled", "isEnabled": False},
+        ]
+        account = {"connected": True, "available": True, "addons": addons}
+        for source_mode in ("tidal_api", "both", "eclipse_addons"):
+            with self.subTest(source_mode=source_mode), \
+                 patch.object(service, "eclipse_account_addons", return_value=account), \
+                 patch.object(service, "is_main_tidal_api_authorized", return_value=True):
+                config = service.realmax_provider_configuration({
+                    "realmax_source": source_mode,
+                    "realmax_provider_order": ["tidal_api"],
+                })
+            records = config["_internal_records"]
+            self.assertEqual(config["configuredOrder"], ["tidal_api"])
+            self.assertEqual(len([row for row in records.values() if row.get("available") is True]), 2)
+            self.assertEqual(len([row for row in records.values() if row.get("available") is False]), 1)
+            self.assertEqual(
+                {row["addonId"] for row in records.values() if row.get("available") is True},
+                {"enabled.first", "enabled.second"},
+            )
 
     def test_short_inventory_deadline_is_not_raised_to_a_five_second_floor(self):
         manifest = {"id": "test.addon", "settings": []}
@@ -96,10 +199,27 @@ class GravityResolverTests(unittest.TestCase):
         candidates = service.quality_candidates(manifest)
         self.assertEqual(len(candidates), 4)
         self.assertEqual(candidates[0]["settings"], {"quality": "low", "audioQuality": "lossy"})
+        with_default = service.quality_candidates(manifest, include_default=True)
+        self.assertEqual(len(with_default), 5)
+        self.assertEqual(with_default[-1], {"requestedQuality": None, "settings": {}, "qualityKey": None})
         self.assertEqual(service.unclassified_select_settings(manifest), ["normalization"])
         with patch("eclipse_streams.MAX_QUALITY_OPTIONS", 2):
             self.assertTrue(service.quality_candidate_limit_exceeded(manifest))
             self.assertEqual(len(service.quality_candidates(manifest)), 2)
+        boundary = {"settings": [{
+            "key": "quality", "type": "select", "options": [{"value": "high"}, {"value": "lossless"}],
+        }]}
+        with patch("eclipse_streams.MAX_QUALITY_OPTIONS", 2):
+            self.assertEqual(service.quality_candidates(boundary, include_default=True), [
+                {"requestedQuality": "Option 1", "requestedQualityLabel": "Option 1", "qualityKey": "quality",
+                 "settings": {"quality": "high"}, "publicSettings": {"quality": "Option 1"}},
+                {"requestedQuality": None, "settings": {}, "qualityKey": None},
+            ])
+            self.assertTrue(service.quality_candidate_limit_exceeded(boundary, include_default=True))
+        with patch("eclipse_streams.MAX_QUALITY_OPTIONS", 1):
+            self.assertEqual(service.quality_candidates(boundary, include_default=True), [
+                {"requestedQuality": None, "settings": {}, "qualityKey": None},
+            ])
         oversized = {"settings": [{
             "key": "quality", "type": "select",
             "options": [{"value": f"q{index}"} for index in range(65)],
@@ -118,6 +238,14 @@ class GravityResolverTests(unittest.TestCase):
         }]}
         self.assertTrue(service.quality_options_unsafe(unsafe_quality))
         self.assertEqual(service.quality_candidates(unsafe_quality), [
+            {"requestedQuality": None, "settings": {}, "qualityKey": None},
+        ])
+        duplicated = {"settings": [
+            {"key": "quality", "type": "select", "options": [{"value": "high"}]},
+            {"key": "QUALITY", "type": "select", "options": [{"value": "lossless"}]},
+        ]}
+        self.assertTrue(service.quality_options_unsafe(duplicated))
+        self.assertEqual(service.quality_candidates(duplicated), [
             {"requestedQuality": None, "settings": {}, "qualityKey": None},
         ])
         malformed = {"settings": [
@@ -181,6 +309,11 @@ class GravityResolverTests(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertEqual(len(colliding), 1)
         self.assertEqual(colliding[0]["settings"]["playbackProfile"], "lossless-token")
+        malformed_tokens, malformed_truncated = eclipse_streams.stream_request_candidates(
+            {"drmSystems": [" widevine "], "playbackProfiles": [" apple-cbcs-eac3-v1 "]}, quality,
+        )
+        self.assertTrue(malformed_truncated)
+        self.assertEqual(malformed_tokens, [{"settings": {"quality": "Atmos"}, "negotiation": {}}])
 
     def test_gravity_negotiation_matches_apk_profile_and_platform_gates(self):
         manifest = {
@@ -217,6 +350,12 @@ class GravityResolverTests(unittest.TestCase):
         self.assertEqual(eclipse_streams.quality_selector_label_map(manifest), {
             "same": None, "opaque": "Hi-Res",
         })
+        ambiguous = {"settings": [
+            {"key": "quality", "type": "select", "options": [{"value": "ambiguous", "label": "High"}]},
+            {"key": "QUALITY", "type": "select", "options": [{"value": "other", "label": "Lossless"}]},
+            {"key": "audioQuality", "type": "select", "options": [{"value": "lossless", "label": "Lossless"}]},
+        ]}
+        self.assertEqual(eclipse_streams.quality_selector_label_map(ambiguous), {"lossless": "Lossless"})
 
     def test_invalid_declared_playback_capabilities_are_reported_incomplete(self):
         capabilities = service.declared_addon_capabilities({
@@ -318,6 +457,14 @@ class GravityResolverTests(unittest.TestCase):
         self.assertEqual([item["settings"]["quality"] for item in plan[:2]], ["low", "high"])
         self.assertTrue(truncated)
 
+        round_robin, round_robin_truncated = eclipse_streams.build_stream_request_plan(
+            {"drmSystems": ["widevine"]}, qualities, limit=4,
+        )
+        self.assertFalse(round_robin_truncated)
+        self.assertEqual([item.get("negotiation", {}).get("drm") for item in round_robin[2:]],
+                         ["widevine", "widevine"])
+        self.assertEqual([item["settings"]["quality"] for item in round_robin[2:]], ["low", "high"])
+
         exact_plan, exact_truncated = eclipse_streams.build_stream_request_plan(
             {}, qualities, limit=2,
         )
@@ -370,6 +517,7 @@ class GravityResolverTests(unittest.TestCase):
              "quality": "Atmos", "drm": {"system": "widevine", "licenseUrl": "https://license.example/license"}},
             {"url": "https://cdn.example/profile.m3u8", "manifest": "hls", "codec": "eac3_joc",
              "quality": "Atmos", "drm": {"system": "widevine", "licenseUrl": "https://license.example/license"}},
+            {"streams": []}, {"streams": []}, {"streams": []},
         ])
         requests = []
         cache = {"search_cache": {}, "stream_cache": {}, "addon_tokens": {}, "discovered_streams": {}}
@@ -388,18 +536,23 @@ class GravityResolverTests(unittest.TestCase):
             )
 
         queries = [urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query) for request in requests]
-        self.assertEqual(len(queries), 3)
+        self.assertEqual(len(queries), 6)
         self.assertEqual(queries[0], {"quality": ["Atmos"]})
-        self.assertEqual(queries[1], {"quality": ["Atmos"], "drm": ["widevine"]})
-        self.assertEqual(queries[2], {
+        self.assertEqual(queries[1], {})
+        self.assertEqual(queries[2], {"quality": ["Atmos"], "drm": ["widevine"]})
+        self.assertEqual(queries[3], {"drm": ["widevine"]})
+        self.assertEqual(queries[4], {
             "quality": ["Atmos"], "drm": ["widevine"],
             "playbackProfile": ["apple-cbcs-eac3-v1"], "dolbyCodecs": ["eac3"],
+        })
+        self.assertEqual(queries[5], {
+            "drm": ["widevine"], "playbackProfile": ["apple-cbcs-eac3-v1"], "dolbyCodecs": ["eac3"],
         })
         self.assertTrue(inventory["complete"], inventory)
         self.assertEqual(len(inventory["streams"]), 2)
         self.assertTrue(all(item["playbackCompatibility"] == "authorized_protected_playback_required"
                             for item in inventory["streams"]))
-        self.assertEqual(inventory["attempts"][2]["negotiation"], {
+        self.assertEqual(inventory["attempts"][4]["negotiation"], {
             "drm": "widevine", "playbackProfile": "apple-cbcs-eac3-v1", "dolbyCodecs": "eac3",
         })
 
@@ -456,7 +609,7 @@ class GravityResolverTests(unittest.TestCase):
             )
 
         self.assertTrue(inventory["complete"])
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
         sleep.assert_called_once_with(2.0)
 
     def test_provider_specific_quality_keys_are_detected_from_clear_semantics(self):
@@ -536,6 +689,72 @@ class GravityResolverTests(unittest.TestCase):
         self.assertIsNone(descriptor["protection"]["system"])
         self.assertEqual(descriptor["protection"]["systems"], ["fairplay", "widevine"])
         self.assertTrue(descriptor["protection"]["conflictingProtectionMetadata"])
+
+    def test_conflicting_protection_fields_in_one_descriptor_are_preserved(self):
+        protection = eclipse_streams._protection({
+            "drm": {"system": "widevine", "keySystem": "com.apple.fps"},
+            "encrypted": True,
+        })
+        self.assertEqual(protection["status"], "protected")
+        self.assertEqual(set(protection["systems"]), {"widevine", "fairplay"})
+        self.assertTrue(protection["conflictingProtectionMetadata"])
+        self.assertIsNone(protection["system"])
+
+        scheme_conflict = eclipse_streams._protection({
+            "drm": {"system": "widevine", "scheme": "cbcs", "encryptionScheme": "cenc"},
+        })
+        self.assertTrue(scheme_conflict["conflictingProtectionMetadata"])
+        self.assertIn("encryptionScheme", scheme_conflict["conflictingProtectionFields"])
+        self.assertIsNone(scheme_conflict["encryptionScheme"])
+
+        system_scheme_conflict = eclipse_streams._protection({
+            "drm": {"system": "widevine", "scheme": "com.apple.fps"},
+        })
+        self.assertTrue(system_scheme_conflict["conflictingProtectionMetadata"])
+        self.assertEqual(set(system_scheme_conflict["systems"]), {"widevine", "fairplay"})
+        self.assertIn("system", system_scheme_conflict["conflictingProtectionFields"])
+        self.assertIsNone(system_scheme_conflict["system"])
+
+    def test_inherited_protection_conflicts_and_encryption_scheme_conflicts_survive_merge(self):
+        inherited = eclipse_streams._merge_protection(
+            {"drm": {"system": "widevine", "keySystem": "com.apple.fps"}}, {},
+        )
+        self.assertTrue(inherited["conflictingProtectionMetadata"])
+        self.assertIn("system", inherited["conflictingProtectionFields"])
+        self.assertIsNone(inherited["system"])
+        scheme = eclipse_streams._protection({
+            "encrypted": True,
+            "drm": {"system": "widevine", "encryptionScheme": "cenc"},
+            "encryptionScheme": "cbcs",
+        })
+        self.assertTrue(scheme["conflictingProtectionMetadata"])
+        self.assertIn("encryptionScheme", scheme["conflictingProtectionFields"])
+        self.assertEqual(scheme["status"], "protected")
+        merged = eclipse_streams._merge_protection(
+            {"drm": {"system": "widevine", "encryptionScheme": "cenc"}},
+            {"drm": {"system": "widevine", "encryptionScheme": "cbcs"}},
+        )
+        self.assertTrue(merged["conflictingProtectionMetadata"])
+        self.assertIsNone(merged["encryptionScheme"])
+        self.assertIn("encryptionScheme", merged["conflictingProtectionFields"])
+        standalone = eclipse_streams._merge_protection(None, {
+            "drm": {"system": "widevine", "keySystem": "fairplay",
+                    "encryptionScheme": "cenc", "protectionScheme": "cbcs"},
+        })
+        self.assertTrue(standalone["conflictingProtectionMetadata"])
+        self.assertIsNone(standalone["system"])
+        self.assertIsNone(standalone["encryptionScheme"])
+
+    def test_stream_quality_zero_and_precise_bitrate_are_not_lost(self):
+        descriptor = service.normalize_stream(
+            {"url": "https://cdn.example/audio.flac", "quality": 0, "bitrate": 1411200,
+             "sampleRate": 22050},
+            addon_id="test.addon", addon_name="Test", track_id="track-1",
+            requested_quality="default", request_settings={},
+        )
+        self.assertEqual(descriptor["actualQuality"], "0")
+        self.assertEqual(descriptor["bitrateBps"], 1411200)
+        self.assertEqual(descriptor["sampleRate"], 22050)
 
     def test_media_manifest_inspector_blocks_encrypted_hls_and_follows_master_playlists(self):
         def response(request, *_args, **_kwargs):
@@ -1231,6 +1450,7 @@ same-origin.m3u8
         responses = iter([
             {"url": "https://cdn.example/max.mp3", "codec": "mp3", "container": "mp3", "quality": "max", "encrypted": False},
             {"url": "https://cdn.example/lossless.m3u8", "codec": "alac", "container": "m4a", "manifest": "hls", "quality": "lossless", "encrypted": True, "drm": {"system": "com.apple.fps", "licenseUrl": "https://license.example/private"}},
+            {"url": "https://cdn.example/max.mp3", "codec": "mp3", "container": "mp3", "quality": "max", "encrypted": False},
         ])
         requests = []
         auth_cache = {"search_cache": {}, "stream_cache": {}, "addon_tokens": {}}
@@ -1260,7 +1480,7 @@ same-origin.m3u8
             )
 
         self.assertTrue(inventory["complete"])
-        self.assertEqual([x["requestedQuality"] for x in inventory["qualityOptions"]], ["Maximum", "Lossless"])
+        self.assertEqual([x["requestedQuality"] for x in inventory["qualityOptions"]], ["Maximum", "Lossless", None])
         self.assertEqual(len(inventory["streams"]), 2)
         protected = inventory["streams"][1]
         self.assertEqual(protected["protection"]["system"], "fairplay")
@@ -1279,8 +1499,8 @@ same-origin.m3u8
         self.assertTrue(all("cdn.example" in json.dumps(entry["native"]) for entry in private_entries.values()))
         self.assertTrue(all("secret-addon-token" in json.dumps(entry["addonRequestHeaders"]) for entry in private_entries.values()))
         self.assertEqual(
-            [urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)["quality"][0] for request in requests],
-            ["max", "lossless"],
+            [urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query).get("quality", [None])[0] for request in requests],
+            ["max", "lossless", None],
         )
         for request in requests:
             self.assertEqual(request.get_header("X-eclipse-access"), "secret-addon-token")
@@ -1519,7 +1739,7 @@ same-origin.m3u8
              patch.object(service, "_get_eclipse_addon_access_token", side_effect=initialize_account_generation), \
              patch.object(service, "_ECLIPSE_AUTH_CACHE", cache), \
              patch.object(service, "_ECLIPSE_AUTH_GENERATION", generation), \
-             patch.object(service, "_eclipse_authenticated_urlopen", return_value=io.BytesIO(json.dumps({
+             patch.object(service, "_eclipse_authenticated_urlopen", side_effect=lambda *_a, **_k: io.BytesIO(json.dumps({
                  "url": "https://cdn.example/first-inventory.mp3", "codec": "mp3", "quality": "high",
              }).encode("utf-8"))):
             inventory = service.discover_eclipse_addon_streams(
@@ -1653,7 +1873,7 @@ same-origin.m3u8
              patch.object(service, "_get_eclipse_addon_access_token", return_value=None), \
              patch.object(service, "_ECLIPSE_AUTH_CACHE", cache), \
              patch.object(service, "_ECLIPSE_AUTH_GENERATION", generation), \
-             patch.object(service, "_eclipse_authenticated_urlopen", return_value=io.BytesIO(json.dumps(response).encode("utf-8"))):
+             patch.object(service, "_eclipse_authenticated_urlopen", side_effect=lambda *_a, **_k: io.BytesIO(json.dumps(response).encode("utf-8"))):
             inventory = service.discover_eclipse_addon_streams(
                 self.manifest_url, addon_id="test.addon", addon_name="Test", track_id="track-1",
                 provider_key="eclipse:" + "a" * 20,

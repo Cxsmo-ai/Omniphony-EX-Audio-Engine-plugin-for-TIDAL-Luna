@@ -44,7 +44,7 @@ function normalizeRealmaxSourceMode(value) {
 const REQUIRED_SERVICE_VERSION = "2.1.45";
 const REQUIRED_SERVICE_CAPABILITY = "prepared-playback-v1";
 const ECLIPSE_ACCOUNT_LINKING_SUPPORTED = true;
-const PLUGIN_BUILD = "2.1.78";
+const PLUGIN_BUILD = "2.1.81";
 const NATIVE_PLAYER_GUARD_MODULE_ID = "OmniphonyEX/player-guard.native.js";
 const NATIVE_PLAYER_GUARD_MODULE_CODE = String.raw`module.exports = {
   install(token) {
@@ -371,7 +371,9 @@ const shared = luna[stateKey] || (luna[stateKey] = {
   servicePid: null,
   shutdownToken: null,
   serviceInstanceId: null,
+  activeInventoryRequests: new Map(),
 });
+if (!(shared.activeInventoryRequests instanceof Map)) shared.activeInventoryRequests = new Map();
 module.exports = {
   async requestEclipseStreamInventory(serviceBase, requiredVersion, runtimeConfig = {}, input = {}) {
     let base;
@@ -383,6 +385,8 @@ module.exports = {
     if (!input || typeof input !== "object" || !/^eclipse:[0-9a-f]{20}$/.test(String(input.providerKey || ""))) {
       return { ok: false, error: "invalid_provider_key" };
     }
+    const operationId = String(input.operationId || "");
+    if (!/^[A-Za-z0-9_-]{24,64}$/.test(operationId)) return { ok: false, error: "invalid_operation_id" };
     const bounded = (value, maximum) => {
       if (value === undefined || value === null || value === "") return { value: "", valid: true };
       if (typeof value !== "string" || value.trim().length > maximum
@@ -406,12 +410,46 @@ module.exports = {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120000) {
       return { ok: false, error: "invalid_inventory_deadline" };
     }
+    const now = Date.now();
+    for (const [staleId, staleOperation] of shared.activeInventoryRequests) {
+      if (staleOperation?.canceled === true
+        && staleOperation.cancelPending !== true
+        && now - (staleOperation.canceledAt || staleOperation.createdAt) > 120000) {
+        shared.activeInventoryRequests.delete(staleId);
+      }
+    }
+    const existingOperation = shared.activeInventoryRequests.get(operationId);
+    if (existingOperation) return { ok: false, error: existingOperation.canceled
+      ? "inventory_canceled" : "inventory_operation_in_progress" };
+    if (shared.activeInventoryRequests.size >= 32) {
+      return { ok: false, error: "inventory_operation_limit_reached" };
+    }
+    let resolveCancellation;
+    const cancellation = new Promise((resolve) => { resolveCancellation = resolve; });
+    const operation = {
+      createdAt: Date.now(), canceled: false, canceledAt: null, cancelPending: false, request: null, finish: null,
+      cancel() {
+        if (this.canceled) return;
+        this.canceled = true;
+        this.canceledAt = Date.now();
+        resolveCancellation({ ready: false, reason: "inventory_canceled" });
+        this.finish?.({ ok: false, error: "inventory_canceled" });
+      },
+    };
+    shared.activeInventoryRequests.set(operationId, operation);
+    const removeOperation = () => {
+      if (shared.activeInventoryRequests.get(operationId) === operation) {
+        if (operation.canceled) operation.request = null;
+        else shared.activeInventoryRequests.delete(operationId);
+      }
+    };
     const absoluteDeadline = Date.now() + timeoutMs;
     let readinessTimer = null;
     let readiness;
     try {
       readiness = await Promise.race([
         module.exports.ensureService(requiredVersion, runtimeConfig),
+        cancellation,
         new Promise((resolve) => {
           readinessTimer = setTimeout(
             () => resolve({ ready: false, reason: "inventory_deadline_exceeded" }),
@@ -420,18 +458,31 @@ module.exports = {
         }),
       ]);
     } catch (_) {
-      return { ok: false, error: "service_unavailable" };
+      removeOperation();
+      return { ok: false, error: operation.canceled ? "inventory_canceled" : "service_unavailable" };
     } finally {
       if (readinessTimer) clearTimeout(readinessTimer);
     }
     const remainingMs = absoluteDeadline - Date.now();
-    if (remainingMs < 1) return { ok: false, error: "inventory_deadline_exceeded" };
-    if (readiness?.ready !== true) return { ok: false, error: readiness?.reason || "service_unavailable" };
+    if (operation.canceled) {
+      removeOperation();
+      return { ok: false, error: "inventory_canceled" };
+    }
+    if (remainingMs < 1) {
+      removeOperation();
+      return { ok: false, error: "inventory_deadline_exceeded" };
+    }
+    if (readiness?.ready !== true) {
+      removeOperation();
+      return { ok: false, error: readiness?.reason || "service_unavailable" };
+    }
     if (typeof shared?.shutdownToken !== "string" || !shared.shutdownToken
       || typeof shared?.serviceInstanceId !== "string" || !shared.serviceInstanceId) {
+      removeOperation();
       return { ok: false, error: "service_identity_unavailable" };
     }
     base.searchParams.set("timeoutMs", String(Math.min(120000, Math.floor(remainingMs))));
+    base.searchParams.set("operationId", operationId);
     const http = require("http");
     return await new Promise((resolve) => {
       let settled = false;
@@ -441,8 +492,11 @@ module.exports = {
         if (settled) return;
         settled = true;
         if (deadlineTimer) clearTimeout(deadlineTimer);
-        resolve(value);
+        operation.finish = null;
+        removeOperation();
+        resolve(operation.canceled ? { ok: false, error: "inventory_canceled" } : value);
       };
+      operation.finish = finish;
       const request = http.get({
         hostname: "127.0.0.1", port: 8765, path: base.pathname + base.search, timeout: remainingMs,
         headers: {
@@ -470,10 +524,85 @@ module.exports = {
           if (response.complete === false) finish({ ok: false, error: "inventory_response_incomplete" });
         });
       });
+      operation.request = request;
       request.on("error", () => finish({ ok: false, error: "inventory_request_failed" }));
       request.on("timeout", () => request.destroy(new Error("inventory request timed out")));
       deadlineTimer = setTimeout(() => request.destroy(new Error("inventory request deadline exceeded")), remainingMs);
     });
+  },
+  async cancelEclipseStreamInventory(serviceBase, requiredVersion, runtimeConfig = {}, input = {}) {
+    const operationId = String(input?.operationId || "");
+    if (!/^[A-Za-z0-9_-]{24,64}$/.test(operationId)) return { ok: false, error: "invalid_operation_id" };
+    const operation = shared.activeInventoryRequests.get(operationId);
+    const request = operation?.request || null;
+    const ownsCancellationTransport = Boolean(operation && request);
+    if (ownsCancellationTransport) operation.cancelPending = true;
+    operation?.cancel();
+    if (operation) operation.request = null;
+    if (typeof shared?.shutdownToken !== "string" || !shared.shutdownToken
+      || typeof shared?.serviceInstanceId !== "string" || !shared.serviceInstanceId) {
+      if (operation) {
+        request?.destroy(new Error("inventory canceled"));
+        if (ownsCancellationTransport) operation.cancelPending = false;
+        if (!request) return { ok: true, canceled: true };
+      }
+      return { ok: false, error: "service_identity_unavailable" };
+    }
+    if (operation && !request) return { ok: true, canceled: true };
+    const http = require("http");
+    const body = JSON.stringify({ operationId });
+    const result = await new Promise((resolve) => {
+      let settled = false;
+      let deadlineTimer = null;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+        resolve(value);
+      };
+      const cancel = http.request({
+        hostname: "127.0.0.1", port: 8765, path: "/eclipse/streams/cancel", method: "POST", timeout: 3000,
+        headers: {
+          Origin: "http://127.0.0.1:8765",
+          Authorization: "Bearer " + shared.shutdownToken,
+          "X-Omniphony-Service-Instance": shared.serviceInstanceId,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "Content-Length": String(body.length),
+        },
+      }, (response) => {
+        let payload = "";
+        response.setEncoding("utf8");
+        response.on("aborted", () => finish({ ok: false, error: "inventory_cancel_response_aborted" }));
+        response.on("error", () => finish({ ok: false, error: "inventory_cancel_response_failed" }));
+        response.on("close", () => {
+          if (response.complete === false) finish({ ok: false, error: "inventory_cancel_response_incomplete" });
+        });
+        response.on("data", (chunk) => {
+          payload += chunk;
+          if (payload.length > 64 * 1024) {
+            finish({ ok: false, error: "inventory_cancel_response_too_large" });
+            response.destroy();
+            cancel.destroy();
+          }
+        });
+        response.on("end", () => {
+          let parsed;
+          try { parsed = JSON.parse(payload); } catch (_) { return finish({ ok: false, error: "invalid_cancel_response" }); }
+          finish(response.statusCode === 200 ? { ok: true, canceled: parsed?.canceled === true } : { ok: false, error: "inventory_cancel_http_" + response.statusCode });
+        });
+      });
+      cancel.on("error", () => finish({ ok: false, error: "inventory_cancel_failed" }));
+      cancel.on("timeout", () => cancel.destroy());
+      deadlineTimer = setTimeout(() => {
+        cancel.destroy(new Error("inventory cancellation deadline exceeded"));
+        finish({ ok: false, error: "inventory_cancel_deadline_exceeded" });
+      }, 3000);
+      cancel.end(body);
+    });
+    if (request) request.destroy(new Error("inventory canceled"));
+    if (ownsCancellationTransport) operation.cancelPending = false;
+    return result;
   },
   async startEclipseLogin(serviceBase, requiredVersion, runtimeConfig = {}) {
     if (typeof module.exports.ensureService === "function") {
@@ -532,11 +661,11 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
     const pluginRoot = path.resolve(app.getPath("userData"), "plugins", "omniphony-tidal-luna-plugin");
     const dataRoot = path.join(pluginRoot, "data");
     const runtimePathsFile = path.join(dataRoot, "config", "runtime-paths.json");
-    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.78");
+    const bundledRuntimeRoot = path.join(pluginRoot, "runtime-bundles", "2.1.81");
     const bundledApiRoot = path.join(bundledRuntimeRoot, "api");
     const localApiRoot = path.join(pluginRoot, "api");
-    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.78/OmniphonyEX-API-win-x64.tar.gz";
-    const bundleSha256 = "55DA3FDECA98D86DD090079374032DCDDDBB8EDB98E19A445CFB45BE6BEFBAE8";
+    const bundleUrl = "https://github.com/Cxsmo-ai/Omniphony-EX-Audio-Engine-plugin-for-TIDAL-Luna/releases/download/v2.1.81/OmniphonyEX-API-win-x64.tar.gz";
+    const bundleSha256 = "198EEB068B63C6C365B219101B07F5C4CB11E07C3BA118F2D451B3377E51FC98";
     const readPersistedRuntimePaths = () => {
       try {
         const saved = JSON.parse(fs.readFileSync(runtimePathsFile, "utf8"));
@@ -609,7 +738,7 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
     const hasVerifiedRuntimeBundle = () => {
       try {
         const marker = JSON.parse(fs.readFileSync(path.join(bundledRuntimeRoot, "bundle-version.json"), "utf8"));
-        return marker.pluginVersion === "2.1.78"
+        return marker.pluginVersion === "2.1.81"
           && marker.serviceVersion === requiredVersion
           && marker.sha256 === bundleSha256;
       } catch (_) {
@@ -678,7 +807,7 @@ ${NATIVE_ECLIPSE_AUTH_MODULE_CODE}
         });
         if (extracted.error || extracted.status !== 0) throw new Error("runtime bundle extraction failed: " + (extracted.error || extracted.stderr));
         if (!hasApiBundle(path.join(staging, "api"))) throw new Error("runtime bundle is missing the Python API payload");
-        const marker = { pluginVersion: "2.1.78", serviceVersion: requiredVersion, sha256: bundleSha256 };
+        const marker = { pluginVersion: "2.1.81", serviceVersion: requiredVersion, sha256: bundleSha256 };
         fs.writeFileSync(path.join(staging, "bundle-version.json"), JSON.stringify(marker, null, 2), "utf8");
         let backup = null;
         try {
@@ -1295,6 +1424,144 @@ async function requestEclipseInventoryWithNativeSupervisor(input) {
     throw new Error(result?.error || "Eclipse stream inventory request failed");
   }
   return result.inventory;
+}
+
+async function cancelEclipseInventoryWithNativeSupervisor(operationId) {
+  const ipc = window?.__ipcRenderer;
+  if (typeof ipc?.invoke !== "function") return { ok: false, error: "native_ipc_unavailable" };
+  const sharedState = globalThis[SERVICE_STARTUP_STATE_KEY] ||
+    (globalThis[SERVICE_STARTUP_STATE_KEY] = { starting: false, promise: null });
+  let channel = getSharedServiceSupervisorChannel(sharedState);
+  if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) {
+    channel = await ipc.invoke(
+      "__Luna.registerNative",
+      NATIVE_SERVICE_SUPERVISOR_MODULE_ID,
+      NATIVE_SERVICE_SUPERVISOR_MODULE_CODE,
+    );
+    if (typeof channel !== "string" || !channel.startsWith("__LunaNative.")) {
+      return { ok: false, error: "native_supervisor_unavailable" };
+    }
+    retainSharedServiceSupervisorChannel(channel, sharedState);
+  }
+  return await ipc.invoke(
+    channel,
+    "cancelEclipseStreamInventory",
+    API_BASE,
+    REQUIRED_SERVICE_VERSION,
+    getConfiguredRuntimePaths(),
+    { operationId },
+  );
+}
+
+function createEclipseInventoryOperationId() {
+  const token = globalThis.crypto?.randomUUID?.().replace(/-/g, "");
+  return /^[a-f0-9]{32}$/i.test(token || "")
+    ? token
+    : Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+}
+
+function formatEclipseInventoryReports(reports, maximumLength = 24000) {
+  const safeReports = Array.isArray(reports) ? reports.map((report) => String(report)) : [];
+  const max = Math.max(1024, Number(maximumLength) || 24000);
+  let output = "";
+  let included = 0;
+  for (let index = 0; index < safeReports.length; index++) {
+    const report = safeReports[index];
+    const remainingReports = safeReports.length - index - 1;
+    const reserve = remainingReports ? Math.min(max - output.length, remainingReports * 160 + 48) : 0;
+    const available = Math.max(160, max - output.length - reserve);
+    const chunk = report.length > available
+      ? `${report.slice(0, Math.max(0, available - 90))}\n  Report shortened for display (${report.length} characters).`
+      : report;
+    output += `${output ? "\n\n" : ""}${chunk}`;
+    included++;
+    if (output.length >= max) break;
+  }
+  const omitted = Math.max(0, safeReports.length - included);
+  if (output.length >= max && omitted > 0) output = `${output.slice(0, Math.max(0, max - 100))}\n\n${omitted} provider report(s) omitted due to the display limit.`;
+  return output.slice(0, max);
+}
+
+function formatEclipseInventorySummary(providerName, inventory) {
+  const attempts = Array.isArray(inventory?.attempts) ? inventory.attempts : [];
+  const streams = Array.isArray(inventory?.streams) ? inventory.streams : [];
+  const lines = [
+    `${String(providerName || "Eclipse add-on").slice(0, 120)}: ${inventory?.complete === true
+      ? "declared quality requests completed; provider-wide coverage is unverified"
+      : `inventory incomplete (${String(inventory?.reason || "unverified").slice(0, 120)})`} · ${attempts.length} quality attempts · ${streams.length} descriptors returned`,
+  ];
+  for (const attempt of attempts.slice(0, 256)) {
+    const quality = typeof attempt?.requestedQuality === "string"
+      ? attempt.requestedQuality.slice(0, 120)
+      : attempt?.requestedQuality && typeof attempt.requestedQuality === "object"
+        ? JSON.stringify(attempt.requestedQuality).slice(0, 160)
+        : "default quality";
+    lines.push(`  ${quality}: ${String(attempt?.status || "unknown").slice(0, 80)}${attempt?.reason ? ` (${String(attempt.reason).slice(0, 120)})` : ""}`);
+  }
+  for (const stream of streams.slice(0, 256)) {
+    const quality = String(stream?.actualQuality || "actual quality unreported").slice(0, 120);
+    const format = [stream?.codec, stream?.container || stream?.format].filter(Boolean).map((value) => String(value).slice(0, 80)).join(" / ") || "format unreported";
+    const protection = String(stream?.protection?.status || "protection unknown").slice(0, 80);
+    const systems = Array.isArray(stream?.protection?.systems)
+      ? stream.protection.systems.slice(0, 8).map((value) => String(value).slice(0, 60)).join(", ")
+      : String(stream?.protection?.system || "").slice(0, 80);
+    const technical = [
+      stream?.bitrateBps != null && Number.isFinite(Number(stream.bitrateBps)) ? `${Number(stream.bitrateBps)} b/s (${Math.round(Number(stream.bitrateBps) / 1000)} kb/s)` : null,
+      stream?.sampleRate != null && Number.isFinite(Number(stream.sampleRate)) ? `${Number(stream.sampleRate)} Hz (${(Number(stream.sampleRate) / 1000).toFixed(Number(stream.sampleRate) % 1000 ? 1 : 0)} kHz)` : null,
+      stream?.bitDepth != null && Number.isFinite(Number(stream.bitDepth)) ? `${stream.bitDepth}-bit` : null,
+      stream?.channels != null && Number.isFinite(Number(stream.channels)) ? `${stream.channels} ch` : null,
+      stream?.manifestType ? String(stream.manifestType).toUpperCase().slice(0, 16) : null,
+    ].filter(Boolean).join(" · ");
+    const notes = [
+      stream?.requestedQuality != null ? `requested: ${typeof stream.requestedQuality === "object" ? JSON.stringify(stream.requestedQuality) : String(stream.requestedQuality).slice(0, 120)}` : null,
+      stream?.qualityMatchStatus === "matched" ? "requested selector confirmed" : null,
+      stream?.qualityMatchStatus === "mismatched" ? "returned selector differs" : null,
+      stream?.qualityMatchStatus === "ambiguous" ? "quality match ambiguous" : null,
+      systems ? `DRM: ${systems}` : null,
+      stream?.protection?.encryptionScheme ? `scheme: ${String(stream.protection.encryptionScheme).slice(0, 60)}` : null,
+      stream?.playbackCompatibility ? String(stream.playbackCompatibility).slice(0, 160) : null,
+      stream?.availability === "reference_unavailable" ? "native stream reference unavailable" : null,
+      stream?.expiresAt != null && Number.isFinite(Number(stream.expiresAt))
+        ? (stream.expired ? "provider stream expired" : `provider stream expires ${new Date(Number(stream.expiresAt) * 1000).toLocaleTimeString()}`) : null,
+      stream?.referenceExpiresAt != null && Number.isFinite(Number(stream.referenceExpiresAt))
+        ? `native reference expires ${new Date(Number(stream.referenceExpiresAt) * 1000).toLocaleTimeString()}` : null,
+    ].filter(Boolean).join(" · ");
+    lines.push(`  Stream: ${quality} · ${format} · ${protection}${technical ? ` · ${technical}` : ""}${notes ? `\n    ${notes}` : ""}`);
+    if (stream?.trackIdentityStatus) lines.push(`    Track identity: ${String(stream.trackIdentityStatus).slice(0, 80)}`);
+    if (stream?.mediaVariantsInspectionComplete === false) lines.push("    Adaptive media representation inspection incomplete.");
+    for (const variant of (Array.isArray(stream?.mediaVariants) ? stream.mediaVariants : []).slice(0, 64)) {
+      const bandwidth = variant?.bandwidth ?? variant?.declaredBandwidth ?? variant?.averageBandwidth;
+      const details = [variant?.name || variant?.id || variant?.kind, variant?.codecs,
+        bandwidth != null && Number.isFinite(Number(bandwidth))
+          ? `${Math.round(Number(bandwidth) / 1000)} kb/s bandwidth (${variant.bandwidthScope || "representation scope unknown"})` : null,
+        variant?.sampleRate != null ? `${(Number(variant.sampleRate) / 1000).toFixed(Number(variant.sampleRate) % 1000 ? 1 : 0)} kHz` : null,
+        variant?.channels != null ? `${variant.channels} ch` : null, variant?.protectionStatus]
+        .filter(Boolean).map((value) => String(value).slice(0, 100)).join(" · ");
+      if (details) lines.push(`    Audio representation: ${details}`);
+    }
+  }
+  if (!streams.length) lines.push("  No stream descriptor returned.");
+  if (attempts.length > 256) lines.push(`  ${attempts.length - 256} additional quality attempts omitted from display.`);
+  if (streams.length > 256) lines.push(`  ${streams.length - 256} additional stream descriptors omitted from display.`);
+  const blocked = Array.isArray(inventory?.blockedProfiles) ? inventory.blockedProfiles
+    : Array.isArray(inventory?.completeness?.platformBlockedProfiles) ? inventory.completeness.platformBlockedProfiles : [];
+  if (blocked.length) lines.push(`  Platform-blocked playback profiles: ${blocked.slice(0, 16).map((item) => String(item).slice(0, 80)).join(", ")}${blocked.length > 16 ? ` (+${blocked.length - 16} more)` : ""}.`);
+  if (inventory?.completeness && typeof inventory.completeness === "object") {
+    const flags = Object.entries(inventory.completeness)
+      .filter(([, value]) => value === true)
+      .map(([key]) => key);
+    lines.push(`  Completeness flags: ${flags.length ? flags.slice(0, 24).join(", ") : "none reported"}.`);
+  }
+  if (inventory?.truncated === true || inventory?.completeness?.streamResultsTruncated === true) {
+    lines.push(`  Result truncated: ${Number(inventory?.streamCount ?? streams.length)} descriptors returned; the addon may have more.`);
+  }
+  if (inventory?.referenceExpiresAt != null) lines.push(`  Native reference expiry: ${String(inventory.referenceExpiresAt).slice(0, 40)}.`);
+  lines.push("Protected streams are reported as descriptors only; this inspection does not play them. Provider parity remains unverified.");
+  const summary = lines.join("\n");
+  const displayLimit = 24000;
+  if (summary.length <= displayLimit) return summary;
+  const notice = `\n\nInventory display shortened at ${displayLimit} characters; ${attempts.length} attempts and ${streams.length} descriptors were returned by the service.`;
+  return summary.slice(0, displayLimit - notice.length) + notice;
 }
 
 function onLoad() {
@@ -7664,6 +7931,53 @@ function toggleSettingsPanel() {
   eclipseConnectionsList.style.cssText = "display:none;max-height:120px;overflow:auto;margin:0 0 8px;padding:0 8px;border-left:2px solid #40556a;color:#bbb;font-size:10px;line-height:1.5;";
   panel.appendChild(eclipseConnectionsList);
 
+  const eclipseInventoryPanel = document.createElement("div");
+  eclipseInventoryPanel.id = "omniphony-eclipse-inventory-panel";
+  eclipseInventoryPanel.style.cssText = "display:none;border-top:1px solid rgba(255,255,255,.1);padding-top:10px;margin-top:8px;";
+  const eclipseInventoryHeading = document.createElement("div");
+  eclipseInventoryHeading.textContent = "Connected add-on stream inventory";
+  eclipseInventoryHeading.style.cssText = "font-weight:600;margin-bottom:4px;";
+  eclipseInventoryPanel.appendChild(eclipseInventoryHeading);
+  const eclipseInventoryHelp = document.createElement("div");
+  eclipseInventoryHelp.textContent = "Inspect declared quality options and returned stream descriptors. Use a provider track ID or title and artist; ISRC is optional.";
+  eclipseInventoryHelp.style.cssText = "color:#aaa;font-size:10px;line-height:1.4;margin-bottom:8px;";
+  eclipseInventoryPanel.appendChild(eclipseInventoryHelp);
+  const eclipseInventoryProvider = document.createElement("select");
+  eclipseInventoryProvider.id = "omniphony-eclipse-inventory-provider";
+  eclipseInventoryProvider.setAttribute("aria-label", "Eclipse inventory provider");
+  eclipseInventoryProvider.style.cssText = "width:100%;box-sizing:border-box;background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:7px 8px;margin:0 0 6px;font:inherit;font-size:11px;";
+  const inventoryAllProvidersOption = document.createElement("option");
+  inventoryAllProvidersOption.value = "";
+  inventoryAllProvidersOption.textContent = "All enabled Eclipse add-ons";
+  eclipseInventoryProvider.appendChild(inventoryAllProvidersOption);
+  eclipseInventoryPanel.appendChild(eclipseInventoryProvider);
+  const makeInventoryInput = (id, placeholder, label) => {
+    const input = document.createElement("input");
+    input.id = id;
+    input.type = "text";
+    input.placeholder = placeholder;
+    input.setAttribute("aria-label", label);
+    input.autocomplete = "off";
+    input.style.cssText = "width:100%;box-sizing:border-box;background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:7px 8px;margin:0 0 6px;font:inherit;font-size:11px;";
+    eclipseInventoryPanel.appendChild(input);
+    return input;
+  };
+  const eclipseInventoryTrackId = makeInventoryInput("omniphony-eclipse-inventory-track-id", "Provider-local track ID (optional)", "Eclipse provider-local track ID");
+  const eclipseInventoryTitle = makeInventoryInput("omniphony-eclipse-inventory-title", "Track title", "Eclipse inventory track title");
+  const eclipseInventoryArtist = makeInventoryInput("omniphony-eclipse-inventory-artist", "Track artist", "Eclipse inventory artist");
+  const eclipseInventoryIsrc = makeInventoryInput("omniphony-eclipse-inventory-isrc", "ISRC (optional)", "Eclipse inventory ISRC");
+  const eclipseInventoryButton = document.createElement("button");
+  eclipseInventoryButton.id = "omniphony-eclipse-inventory-run";
+  eclipseInventoryButton.type = "button";
+  eclipseInventoryButton.textContent = "Inspect connected Eclipse qualities";
+  eclipseInventoryButton.style.cssText = "width:100%;background:#173b3b;color:#e5ffff;border:1px solid #286969;border-radius:6px;padding:8px 10px;cursor:pointer;font:inherit;font-size:11px;margin-bottom:7px;";
+  eclipseInventoryPanel.appendChild(eclipseInventoryButton);
+  const eclipseInventoryStatus = document.createElement("pre");
+  eclipseInventoryStatus.id = "omniphony-eclipse-inventory-status";
+  eclipseInventoryStatus.style.cssText = "display:none;white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto;background:rgba(0,0,0,.25);border-radius:6px;padding:8px;margin:0;color:#c8d2da;font:10px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;";
+  eclipseInventoryPanel.appendChild(eclipseInventoryStatus);
+  panel.appendChild(eclipseInventoryPanel);
+
   let eclipseAuthNativeChannel = null;
   let eclipseAuthStatusTimer = null;
   let eclipseAccountWasConnected = false;
@@ -7671,6 +7985,21 @@ function toggleSettingsPanel() {
   let eclipseConnectionsRequest = 0;
   let eclipseAuthStatusRequest = 0;
   let eclipseAuthStatusInFlight = false;
+  let eclipseEnabledProviders = [];
+  let eclipseInventoryBusy = false;
+  let eclipseInventoryGeneration = 0;
+  let activeEclipseInventoryOperationId = null;
+  const invalidateEclipseInventory = (reason) => {
+    eclipseInventoryGeneration++;
+    const operationId = activeEclipseInventoryOperationId;
+    activeEclipseInventoryOperationId = null;
+    if (operationId) void cancelEclipseInventoryWithNativeSupervisor(operationId).catch(() => {});
+    eclipseInventoryBusy = false;
+    eclipseInventoryButton.disabled = false;
+    eclipseInventoryButton.textContent = "Inspect connected Eclipse qualities";
+    eclipseInventoryStatus.style.display = "block";
+    eclipseInventoryStatus.textContent = reason || "Inventory canceled because the account or panel changed.";
+  };
   const refreshEclipseConnections = async () => {
     const requestId = ++eclipseConnectionsRequest;
     eclipseConnectionsButton.disabled = true;
@@ -7682,11 +8011,19 @@ function toggleSettingsPanel() {
       const data = await response.json();
       if (requestId !== eclipseConnectionsRequest || !panel.isConnected) return;
       if (data?.connected !== true) {
+        invalidateEclipseInventory("Inventory canceled because the Eclipse account is disconnected.");
+        eclipseEnabledProviders = [];
+        eclipseInventoryProvider.replaceChildren(inventoryAllProvidersOption);
+        eclipseInventoryPanel.style.display = "none";
         eclipseConnectionsStatus.textContent = "Connect your Eclipse account to load its add-ons.";
         eclipseConnectionsStatus.style.color = "#e4b363";
         return;
       }
       if (data?.available !== true) {
+        invalidateEclipseInventory("Inventory canceled because Eclipse account connections could not be refreshed.");
+        eclipseEnabledProviders = [];
+        eclipseInventoryProvider.replaceChildren(inventoryAllProvidersOption);
+        eclipseInventoryPanel.style.display = "none";
         eclipseConnectionsStatus.textContent = data?.reason === "unauthorized"
           ? "Eclipse rejected the saved session. Reconnect with Discord to refresh account access."
           : "Could not load the Eclipse account add-ons right now. Try Refresh again.";
@@ -7695,6 +8032,17 @@ function toggleSettingsPanel() {
       }
       const addons = Array.isArray(data.addons) ? data.addons : [];
       const active = addons.filter((addon) => addon?.isEnabled === true && typeof addon.key === "string");
+      eclipseEnabledProviders = active;
+      const previousProvider = eclipseInventoryProvider.value;
+      eclipseInventoryProvider.replaceChildren(inventoryAllProvidersOption);
+      for (const addon of active) {
+        const option = document.createElement("option");
+        option.value = addon.key;
+        option.textContent = String(addon.displayName || addon.name || addon.addonId || "Eclipse add-on").slice(0, 120);
+        eclipseInventoryProvider.appendChild(option);
+      }
+      if (active.some((addon) => addon.key === previousProvider)) eclipseInventoryProvider.value = previousProvider;
+      eclipseInventoryPanel.style.display = active.length ? "block" : "none";
       const inactive = addons.filter((addon) => addon?.isEnabled !== true);
       eclipseConnectionsStatus.textContent = active.length
         ? `${active.length} enabled account add-on${active.length === 1 ? "" : "s"} ready for RealMAX, following your Eclipse playback order${inactive.length ? ` · ${inactive.length} disabled` : ""}.`
@@ -7707,6 +8055,10 @@ function toggleSettingsPanel() {
       }
     } catch (_) {
       if (requestId === eclipseConnectionsRequest && panel.isConnected) {
+        invalidateEclipseInventory("Inventory canceled because the Eclipse connection refresh failed.");
+        eclipseEnabledProviders = [];
+        eclipseInventoryProvider.replaceChildren(inventoryAllProvidersOption);
+        eclipseInventoryPanel.style.display = "none";
         eclipseConnectionsStatus.textContent = "Eclipse account connections could not be loaded. Check the service connection and try again.";
         eclipseConnectionsStatus.style.color = "#e4b363";
       }
@@ -7715,6 +8067,92 @@ function toggleSettingsPanel() {
     }
   };
   eclipseConnectionsButton.onclick = () => { void refreshEclipseConnections(); };
+  eclipseInventoryButton.onclick = async () => {
+    if (eclipseInventoryBusy) {
+      invalidateEclipseInventory("Cancellation requested. The active bounded network request is being stopped.");
+      return;
+    }
+    const trackId = eclipseInventoryTrackId.value.trim();
+    const title = eclipseInventoryTitle.value.trim();
+    const artist = eclipseInventoryArtist.value.trim();
+    const isrc = eclipseInventoryIsrc.value.trim();
+    if (!trackId && !(title && artist) && !isrc) {
+      eclipseInventoryStatus.style.display = "block";
+      eclipseInventoryStatus.textContent = "Enter a provider track ID, both title and artist, or an ISRC.";
+      return;
+    }
+    const selectedProviderKey = eclipseInventoryProvider.value;
+    const providers = selectedProviderKey
+      ? eclipseEnabledProviders.filter((provider) => provider.key === selectedProviderKey)
+      : eclipseEnabledProviders.slice();
+    if (!providers.length) {
+      eclipseInventoryStatus.style.display = "block";
+      eclipseInventoryStatus.textContent = "No enabled Eclipse account add-ons are available. Refresh Eclipse account add-ons and try again.";
+      return;
+    }
+    if (trackId && !selectedProviderKey && providers.length > 1) {
+      eclipseInventoryStatus.style.display = "block";
+      eclipseInventoryStatus.textContent = "Select one add-on before using a provider-local track ID, or use title and artist to search all enabled add-ons.";
+      return;
+    }
+    eclipseInventoryBusy = true;
+    const operationGeneration = ++eclipseInventoryGeneration;
+    const accountKeyAtStart = eclipseAccountSessionKey;
+    eclipseInventoryButton.disabled = true;
+    eclipseInventoryButton.textContent = "Inspecting connected add-ons…";
+    eclipseInventoryStatus.style.display = "block";
+    const reports = [];
+    const deadline = Date.now() + 120000;
+    try {
+      for (const provider of providers) {
+        if (!panel.isConnected || operationGeneration !== eclipseInventoryGeneration
+          || accountKeyAtStart !== eclipseAccountSessionKey) break;
+        const timeoutMs = Math.floor(deadline - Date.now());
+        if (timeoutMs < 1000) {
+          reports.push("Stopped: the 120-second inventory deadline was reached.");
+          break;
+        }
+        eclipseInventoryStatus.textContent = `${reports.join("\n\n")}${reports.length ? "\n\n" : ""}Inspecting ${String(provider.displayName || provider.addonId || "Eclipse add-on").slice(0, 120)}…`;
+        let operationId = null;
+        try {
+          operationId = createEclipseInventoryOperationId();
+          activeEclipseInventoryOperationId = operationId;
+          const inventory = await requestEclipseInventoryWithNativeSupervisor({
+            providerKey: provider.key,
+            operationId,
+            ...(trackId ? { trackId } : { title, artist, ...(isrc ? { isrc } : {}) }),
+            timeoutMs: Math.min(120000, timeoutMs),
+          });
+          if (activeEclipseInventoryOperationId === operationId) activeEclipseInventoryOperationId = null;
+          if (!panel.isConnected || operationGeneration !== eclipseInventoryGeneration
+            || accountKeyAtStart !== eclipseAccountSessionKey) break;
+          reports.push(formatEclipseInventorySummary(provider.displayName || provider.addonId, inventory));
+        } catch (error) {
+          activeEclipseInventoryOperationId = null;
+          if (operationGeneration !== eclipseInventoryGeneration) break;
+          reports.push(`${String(provider.displayName || provider.addonId || "Eclipse add-on").slice(0, 120)}: request failed (${String(error?.message || "service error").slice(0, 180)}).`);
+        }
+        if (operationGeneration === eclipseInventoryGeneration) eclipseInventoryStatus.textContent = formatEclipseInventoryReports(reports);
+      }
+      if (operationGeneration === eclipseInventoryGeneration) {
+        eclipseInventoryStatus.textContent = `${formatEclipseInventoryReports(reports)}\n\nInventory inspection finished. Provider parity is unverified; protected streams remain descriptor-only.`;
+      }
+    } finally {
+      if (operationGeneration === eclipseInventoryGeneration) {
+        eclipseInventoryBusy = false;
+        eclipseInventoryButton.disabled = false;
+        eclipseInventoryButton.textContent = "Inspect connected Eclipse qualities";
+      }
+    }
+  };
+  const inventoryPanelObserver = new MutationObserver(() => {
+    if (!panel.isConnected && eclipseInventoryBusy) invalidateEclipseInventory("Inventory canceled because the panel was closed.");
+  });
+  inventoryPanelObserver.observe(document.documentElement, { childList: true, subtree: true });
+  unloads.add(() => {
+    inventoryPanelObserver.disconnect();
+    if (eclipseInventoryBusy) invalidateEclipseInventory("Inventory canceled because Omniphony EX unloaded.");
+  });
   const updateEclipseAuthStatus = async () => {
     if (eclipseAuthStatusInFlight || !panel.isConnected) return;
     eclipseAuthStatusInFlight = true;
@@ -7740,6 +8178,10 @@ function toggleSettingsPanel() {
         const loginInProgress = data?.loginAttemptActive === true;
         const accountChanged = eclipseAccountWasConnected && eclipseAccountSessionKey !== accountSessionKey;
         if (accountChanged) {
+          invalidateEclipseInventory("Inventory canceled because the Eclipse account changed.");
+          eclipseEnabledProviders = [];
+          eclipseInventoryProvider.replaceChildren(inventoryAllProvidersOption);
+          eclipseInventoryPanel.style.display = "none";
           eclipseConnectionsRequest++;
           eclipseConnectionsList.replaceChildren();
           eclipseConnectionsStatus.textContent = "Eclipse account changed. Loading its connections…";
@@ -7761,7 +8203,11 @@ function toggleSettingsPanel() {
         eclipseAccountWasConnected = true;
         eclipseAccountSessionKey = accountSessionKey;
       } else {
+        invalidateEclipseInventory("Inventory canceled because the Eclipse account is disconnected.");
         eclipseConnectionsRequest++;
+        eclipseEnabledProviders = [];
+        eclipseInventoryProvider.replaceChildren(inventoryAllProvidersOption);
+        eclipseInventoryPanel.style.display = "none";
         eclipseConnectionsButton.disabled = false;
         eclipseConnectionsList.replaceChildren();
         eclipseAuthStatus.textContent = data?.lastLoginError
@@ -8192,12 +8638,16 @@ export const Settings = () => {
   const [providerStatus, setProviderStatus] = React.useState("Loading TIDAL and Eclipse providers…");
   const [eclipseAccountStatus, setEclipseAccountStatus] = React.useState("Checking Eclipse account…");
   const [eclipseInventoryTrackId, setEclipseInventoryTrackId] = React.useState("");
+  const [eclipseInventoryProviderKey, setEclipseInventoryProviderKey] = React.useState("");
   const [eclipseInventoryTitle, setEclipseInventoryTitle] = React.useState("");
   const [eclipseInventoryArtist, setEclipseInventoryArtist] = React.useState("");
   const [eclipseInventoryIsrc, setEclipseInventoryIsrc] = React.useState("");
   const [eclipseInventoryStatus, setEclipseInventoryStatus] = React.useState("Enter a provider track ID, or a title and artist, to inspect connected add-on qualities.");
   const [eclipseInventoryBusy, setEclipseInventoryBusy] = React.useState(false);
   const eclipseInventoryCancelRef = React.useRef(false);
+  const eclipseInventoryOperationRef = React.useRef(null);
+  const eclipseInventoryGenerationRef = React.useRef(0);
+  const eclipseAccountSessionRef = React.useRef("");
   const providerOrderRef = React.useRef([]);
   const providerSaveQueue = React.useRef(Promise.resolve());
   const providerMutationSequence = React.useRef(0);
@@ -8234,14 +8684,30 @@ export const Settings = () => {
       else if (data?.accountAvailable !== true) setProviderStatus("Eclipse is signed in, but its add-on connections are temporarily unavailable. Refresh to retry.");
       else setProviderStatus(`${enabledCount} provider${enabledCount === 1 ? "" : "s"} selected · ${tidalReady ? "TIDAL API ready" : "TIDAL API needs authorization"} · ${eclipseCount} Eclipse account add-on${eclipseCount === 1 ? "" : "s"} available${data?.customized ? " · custom priority" : " · following Eclipse account order"}`);
     } catch (error) {
-      if (refreshSequence === providerRefreshSequence.current) setProviderStatus(`Provider list unavailable: ${error?.message || "service error"}`);
+      if (refreshSequence === providerRefreshSequence.current) {
+        const operationId = eclipseInventoryOperationRef.current;
+        eclipseInventoryCancelRef.current = true;
+        eclipseInventoryGenerationRef.current++;
+        eclipseInventoryOperationRef.current = null;
+        if (operationId) void cancelEclipseInventoryWithNativeSupervisor(operationId).catch(() => {});
+        setEclipseInventoryBusy(false);
+        setEclipseInventoryStatus("Inventory canceled because the provider refresh failed.");
+        setRealmaxProviders([]);
+        setProviderOrder([]);
+        providerOrderRef.current = [];
+        setProviderStatus(`Provider list unavailable: ${error?.message || "service error"}`);
+      }
     }
   }, []);
 
   const inspectEclipseStreamInventory = React.useCallback(async () => {
     if (eclipseInventoryBusy) {
       eclipseInventoryCancelRef.current = true;
-      setEclipseInventoryStatus("Canceling after the current bounded request completes…");
+      const operationId = eclipseInventoryOperationRef.current;
+      if (operationId) void cancelEclipseInventoryWithNativeSupervisor(operationId).catch(() => {});
+      const canceledGeneration = ++eclipseInventoryGenerationRef.current;
+      if (eclipseInventoryGenerationRef.current === canceledGeneration) setEclipseInventoryBusy(false);
+      setEclipseInventoryStatus("Cancellation requested. Stopping the active bounded request…");
       return;
     }
     const trackId = eclipseInventoryTrackId.trim();
@@ -8252,40 +8718,60 @@ export const Settings = () => {
       setEclipseInventoryStatus("Enter a provider track ID, both title and artist, or an ISRC.");
       return;
     }
-    const providers = providerOrder
-      .map((key) => realmaxProviders.find((row) => row?.key === key))
+    const enabledProviders = realmaxProviders
       .filter((row) => row && row.type !== "tidal_api" && row.available === true);
-    if (!providers.length) {
-      setEclipseInventoryStatus("No enabled Eclipse account add-ons are selected in RealMAX provider order.");
+    const selectedProviders = providerOrder
+      .map((key) => enabledProviders.find((row) => row.key === key))
+      .filter(Boolean);
+    const selectedProviderKeys = new Set(selectedProviders.map((row) => row.key));
+    const providers = [
+      ...selectedProviders,
+      ...enabledProviders.filter((row) => !selectedProviderKeys.has(row.key)),
+    ];
+    const selectedInventoryProviders = eclipseInventoryProviderKey
+      ? providers.filter((row) => row.key === eclipseInventoryProviderKey)
+      : providers;
+    if (!selectedInventoryProviders.length) {
+      setEclipseInventoryStatus("No enabled Eclipse account add-ons are available.");
       return;
     }
-    if (trackId && providers.length !== 1) {
-      setEclipseInventoryStatus("Provider-local track IDs are ambiguous across multiple enabled add-ons. Enter the title and artist to search each add-on independently, or enable only one add-on for an ID lookup.");
+    if (trackId && !eclipseInventoryProviderKey && selectedInventoryProviders.length > 1) {
+      setEclipseInventoryStatus("Select one add-on before using a provider-local track ID, or search by title and artist across all enabled add-ons.");
       return;
     }
     eclipseInventoryCancelRef.current = false;
+    const generation = ++eclipseInventoryGenerationRef.current;
+    const accountSessionAtStart = eclipseAccountSessionRef.current;
     const overallDeadline = Date.now() + 120000;
     setEclipseInventoryBusy(true);
-    setEclipseInventoryStatus(`Inspecting declared quality options from ${providers.length} enabled Eclipse add-on${providers.length === 1 ? "" : "s"}…`);
+    setEclipseInventoryStatus(`Inspecting declared quality options from ${selectedInventoryProviders.length} enabled Eclipse add-on${selectedInventoryProviders.length === 1 ? "" : "s"}…`);
     const reports = [];
     try {
-      for (const provider of providers) {
-        if (eclipseInventoryCancelRef.current) break;
+      for (const provider of selectedInventoryProviders) {
+        if (eclipseInventoryCancelRef.current || generation !== eclipseInventoryGenerationRef.current
+          || accountSessionAtStart !== eclipseAccountSessionRef.current) break;
         const remainingMs = Math.floor(overallDeadline - Date.now());
         if (remainingMs < 1000) {
           reports.push("Stopped: the 120-second total inventory deadline was reached.");
           break;
         }
-        setEclipseInventoryStatus(`Inspecting ${provider.name} (${reports.length + 1}/${providers.length})…`);
+        setEclipseInventoryStatus(`Inspecting ${provider.name} (${reports.length + 1}/${selectedInventoryProviders.length})…`);
+        let operationId = null;
         try {
+          operationId = createEclipseInventoryOperationId();
+          eclipseInventoryOperationRef.current = operationId;
           const inventory = await requestEclipseInventoryWithNativeSupervisor({
             providerKey: provider.key,
+            operationId,
             ...(trackId ? { trackId } : { title, artist, ...(isrc ? { isrc } : {}) }),
             timeoutMs: Math.min(120000, remainingMs),
           });
+          if (eclipseInventoryOperationRef.current === operationId) eclipseInventoryOperationRef.current = null;
+          if (generation !== eclipseInventoryGenerationRef.current
+            || accountSessionAtStart !== eclipseAccountSessionRef.current) break;
           const attempts = Array.isArray(inventory.attempts) ? inventory.attempts : [];
           const streams = Array.isArray(inventory.streams) ? inventory.streams : [];
-          const qualityLines = attempts.map((attempt) => {
+          const qualityLines = attempts.slice(0, 256).map((attempt) => {
             const quality = typeof attempt?.requestedQuality === "string"
               ? attempt.requestedQuality
               : attempt?.requestedQuality && typeof attempt.requestedQuality === "object"
@@ -8293,8 +8779,8 @@ export const Settings = () => {
                 : "default quality";
             return `${quality}: ${attempt?.status || "unknown"}${attempt?.reason ? ` (${attempt.reason})` : ""}`;
           });
-          const streamLines = streams.map((stream) => {
-            const quality = stream?.actualQuality || stream?.requestedQuality || "quality unreported";
+          const streamLines = streams.slice(0, 256).map((stream) => {
+          const quality = stream?.actualQuality || "actual quality unreported";
             const codec = [stream?.codec, stream?.container || stream?.format].filter(Boolean).join(" / ") || "codec/container unreported";
             const protection = stream?.protection?.status || "protection unknown";
             const systems = Array.isArray(stream?.protection?.systems) && stream.protection.systems.length
@@ -8306,8 +8792,8 @@ export const Settings = () => {
               stream?.protection?.conflictingProtectionMetadata ? "conflicting protection metadata" : null,
             ].filter(Boolean).join(" / ");
             const audioDetails = [
-              stream?.bitrate != null && Number.isFinite(Number(stream.bitrate)) ? `${Math.round(Number(stream.bitrate) / 1000)} kb/s` : null,
-              stream?.sampleRate != null && Number.isFinite(Number(stream.sampleRate)) ? `${(Number(stream.sampleRate) / 1000).toFixed(Number(stream.sampleRate) % 1000 ? 1 : 0)} kHz` : null,
+              stream?.bitrateBps != null && Number.isFinite(Number(stream.bitrateBps)) ? `${Number(stream.bitrateBps)} b/s (${Math.round(Number(stream.bitrateBps) / 1000)} kb/s)` : null,
+              stream?.sampleRate != null && Number.isFinite(Number(stream.sampleRate)) ? `${Number(stream.sampleRate)} Hz (${(Number(stream.sampleRate) / 1000).toFixed(Number(stream.sampleRate) % 1000 ? 1 : 0)} kHz)` : null,
               stream?.bitDepth != null && Number.isFinite(Number(stream.bitDepth)) ? `${stream.bitDepth}-bit` : null,
               stream?.channels != null && Number.isFinite(Number(stream.channels)) ? `${stream.channels} ch` : null,
               stream?.manifestType ? stream.manifestType.toUpperCase() : null,
@@ -8345,12 +8831,13 @@ export const Settings = () => {
               referenceExpiry,
             ].filter(Boolean).join(" · ");
             const mediaVariantLines = (Array.isArray(stream?.mediaVariants) ? stream.mediaVariants : []).map((variant) => {
+              const bandwidth = variant?.bandwidth ?? variant?.declaredBandwidth ?? variant?.averageBandwidth;
               const variantDetails = [
                 variant?.name || variant?.id || variant?.kind,
                 variant?.codecs,
-                variant?.bandwidth != null ? `${Math.round(Number(variant.bandwidth) / 1000)} kb/s (${variant.bandwidthScope || "scope unknown"})` : null,
-                variant?.declaredBandwidth != null ? `${Math.round(Number(variant.declaredBandwidth) / 1000)} kb/s (${variant.bandwidthScope || "scope unknown"})` : null,
-                variant?.sampleRate != null ? `${(Number(variant.sampleRate) / 1000).toFixed(Number(variant.sampleRate) % 1000 ? 1 : 0)} kHz` : null,
+                bandwidth != null && Number.isFinite(Number(bandwidth))
+                  ? `${Math.round(Number(bandwidth) / 1000)} kb/s bandwidth (${variant.bandwidthScope || "representation scope unknown"})` : null,
+                variant?.sampleRate != null ? `${Number(variant.sampleRate)} Hz (${(Number(variant.sampleRate) / 1000).toFixed(Number(variant.sampleRate) % 1000 ? 1 : 0)} kHz)` : null,
                 variant?.channels != null ? `${variant.channels} ch` : null,
                 variant?.language || null,
                 variant?.protectionStatus || null,
@@ -8362,18 +8849,37 @@ export const Settings = () => {
           const completeness = inventory.complete === true
             ? "Declared quality requests completed; provider-wide coverage is unverified."
             : `Inventory incomplete: ${inventory.reason || "one or more requests were not verified"}.`;
-          reports.push(`${provider.name}: ${completeness}${qualityLines.length ? `\n${qualityLines.join("\n")}` : ""}${streamLines.length ? `\n${streamLines.join("\n")}` : "\nNo stream descriptor returned."}`);
+          const completenessFlags = inventory.completeness && typeof inventory.completeness === "object"
+            ? Object.entries(inventory.completeness).filter(([, value]) => value === true).map(([key]) => key)
+            : [];
+          const extras = [
+            `Track identity: ${inventory.trackIdentityStatus || "unreported"}`,
+            `Media variants: ${inventory.mediaVariantsInspectionComplete === false ? "inspection incomplete" : "inspection status per stream"}`,
+            completenessFlags.length ? `Completeness flags: ${completenessFlags.slice(0, 24).join(", ")}` : null,
+            inventory.completeness?.streamResultsTruncated ? `Stream result list truncated (${inventory.streamCount ?? streams.length} returned).` : null,
+            inventory.referenceExpiresAt != null ? `Native reference expiry: ${inventory.referenceExpiresAt}` : null,
+            attempts.length > 256 ? `${attempts.length - 256} additional attempts omitted.` : null,
+            streams.length > 256 ? `${streams.length - 256} additional streams omitted.` : null,
+          ].filter(Boolean).join("\n");
+          reports.push(`${provider.name}: ${completeness}${extras ? `\n${extras}` : ""}${qualityLines.length ? `\n${qualityLines.join("\n")}` : ""}${streamLines.length ? `\n${streamLines.join("\n")}` : "\nNo stream descriptor returned."}`);
         } catch (error) {
+          if (operationId && eclipseInventoryOperationRef.current === operationId) {
+            eclipseInventoryOperationRef.current = null;
+          }
+          if (generation !== eclipseInventoryGenerationRef.current
+            || accountSessionAtStart !== eclipseAccountSessionRef.current) break;
           reports.push(`${provider.name}: inventory request failed (${String(error?.message || "service error").slice(0, 180)}).`);
         }
-        setEclipseInventoryStatus(`${reports.join("\n\n")}\n\n${eclipseInventoryCancelRef.current ? "Cancel requested; stopping before the next add-on." : "Working through selected add-ons…"}`);
+        if (generation === eclipseInventoryGenerationRef.current) setEclipseInventoryStatus(formatEclipseInventoryReports(reports));
       }
-      const ending = eclipseInventoryCancelRef.current ? "Inventory canceled after the active request." : "Inventory inspection finished.";
-      setEclipseInventoryStatus(`${reports.join("\n\n")}\n\n${ending} HLS/DASH audio representations are listed when the bounded manifest inspection can read them. Provider parity is still unverified. Protected streams are reported as descriptors; this action does not play them.`);
+      if (generation === eclipseInventoryGenerationRef.current) {
+        const ending = eclipseInventoryCancelRef.current ? "Inventory canceled." : "Inventory inspection finished.";
+        setEclipseInventoryStatus(`${formatEclipseInventoryReports(reports)}\n\n${ending} HLS/DASH audio representations are listed when bounded manifest inspection can read them. Provider parity is unverified. Protected streams are descriptor-only.`);
+      }
     } finally {
-      setEclipseInventoryBusy(false);
+      if (generation === eclipseInventoryGenerationRef.current) setEclipseInventoryBusy(false);
     }
-  }, [eclipseInventoryBusy, eclipseInventoryTrackId, eclipseInventoryTitle, eclipseInventoryArtist, eclipseInventoryIsrc, providerOrder, realmaxProviders]);
+  }, [eclipseInventoryBusy, eclipseInventoryTrackId, eclipseInventoryTitle, eclipseInventoryArtist, eclipseInventoryIsrc, eclipseInventoryProviderKey, providerOrder, realmaxProviders]);
 
   const refreshEclipseAccount = React.useCallback(async () => {
     if (eclipseAccountInFlightRef.current) return;
@@ -8384,6 +8890,19 @@ export const Settings = () => {
       if (!statusResponse.ok) throw new Error(`status ${statusResponse.status}`);
       const status = await statusResponse.json();
       if (requestId !== eclipseAccountRequestRef.current) return;
+      const nextSessionKey = status?.connected === true
+        ? `${Number.isSafeInteger(status?.sessionGeneration) ? status.sessionGeneration : 0}:${String(status?.user?.id || status?.user?.userId || status?.user?.email || status?.user?.name || "unknown-account")}`
+        : "";
+      if (eclipseAccountSessionRef.current && eclipseAccountSessionRef.current !== nextSessionKey) {
+        const operationId = eclipseInventoryOperationRef.current;
+        eclipseInventoryCancelRef.current = true;
+        eclipseInventoryGenerationRef.current++;
+        eclipseInventoryOperationRef.current = null;
+        if (operationId) void cancelEclipseInventoryWithNativeSupervisor(operationId).catch(() => {});
+        setEclipseInventoryBusy(false);
+        setEclipseInventoryStatus("Inventory canceled because the Eclipse account changed or disconnected.");
+      }
+      eclipseAccountSessionRef.current = nextSessionKey;
       if (status?.connected !== true) {
         setEclipseAccountStatus(status?.lastLoginError
           ? eclipseAuthFailureMessage(status.lastLoginError)
@@ -8451,6 +8970,11 @@ export const Settings = () => {
   React.useEffect(() => {
     void refreshEclipseAccount();
     return () => {
+      const operationId = eclipseInventoryOperationRef.current;
+      eclipseInventoryCancelRef.current = true;
+      eclipseInventoryGenerationRef.current++;
+      eclipseInventoryOperationRef.current = null;
+      if (operationId) void cancelEclipseInventoryWithNativeSupervisor(operationId).catch(() => {});
       if (eclipseConnectPollRef.current) clearInterval(eclipseConnectPollRef.current);
       eclipseConnectPollRef.current = null;
     };
@@ -8532,6 +9056,18 @@ export const Settings = () => {
       disabled: !ECLIPSE_ACCOUNT_LINKING_SUPPORTED,
       onClick: connectEclipseAccount
     }, ECLIPSE_ACCOUNT_LINKING_SUPPORTED ? "Connect Eclipse with Discord" : "Eclipse account linking unavailable"),
+    React.createElement(
+      LunaSelectSetting,
+      {
+        title: "Eclipse inventory provider",
+        desc: "Inspect all enabled add-ons or choose one. Choose one when entering a provider-local track ID.",
+        value: eclipseInventoryProviderKey,
+        onChange: (event) => setEclipseInventoryProviderKey(String(event?.target?.value || "")),
+      },
+      React.createElement(LunaSelectItem, { value: "" }, "All enabled Eclipse add-ons"),
+      ...realmaxProviders.filter((row) => row && row.type !== "tidal_api" && row.available === true)
+        .map((row) => React.createElement(LunaSelectItem, { key: row.key, value: row.key }, row.name || row.addonId || row.key)),
+    ),
     React.createElement(LunaTextSetting, {
       title: "Eclipse inventory track ID",
       desc: "Optional provider-local track ID. Leave blank to search by title and artist.",

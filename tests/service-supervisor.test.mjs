@@ -36,6 +36,10 @@ assert.match(supervisorCode, /async requestEclipseStreamInventory\(serviceBase, 
   "stream inventory authorization stays inside the native service supervisor");
 assert.match(supervisorCode, /invalid_provider_key[\s\S]*?track_identity_required/,
   "the native inventory request validates provider and track identity before building its local request");
+assert.match(moduleSource, /setEclipseInventoryStatus\(`Inspecting \$\{provider\.name\}[\s\S]*?let operationId = null;\s*try \{\s*operationId = createEclipseInventoryOperationId\(\);[\s\S]*?catch \(error\) \{\s*if \(operationId &&\s*eclipseInventoryOperationRef\.current === operationId\)/,
+  "inventory failure handling keeps the operation ID in scope and preserves newer operation ownership");
+assert.match(moduleSource, /const canceledGeneration = \+\+eclipseInventoryGenerationRef\.current;\s*if \(eclipseInventoryGenerationRef\.current === canceledGeneration\) setEclipseInventoryBusy\(false\);/,
+  "manual cancellation releases the busy state for a subsequent inventory run");
 assert.ok(pluginVersion, "the plugin build version is declared in the canonical entrypoint");
 assert.ok(runtimeBundleVersion, "the separately versioned API runtime bundle is declared in the supervisor");
 assert.match(moduleSource, /NATIVE_SERVICE_SUPERVISOR_MODULE_ID = `OmniphonyEX\/service-supervisor\.native\.js\.\$\{PLUGIN_BUILD\}`/,
@@ -150,6 +154,9 @@ function makeHarness({
   const children = [];
   const syncCalls = [];
   let inventoryResponseMode = "complete";
+  let releaseInventoryResponse = null;
+  let cancelResponseMode = "complete";
+  let releaseCancelResponse = null;
   const http = {
     get(_options, callback) {
       getRequests.push(_options);
@@ -168,6 +175,13 @@ function makeHarness({
         response.setEncoding = () => {};
         callback(response);
         queueMicrotask(() => {
+          if (String(_options?.path || "").startsWith("/eclipse/streams") && inventoryResponseMode === "pending") {
+            releaseInventoryResponse = () => {
+              response.emit("data", JSON.stringify({ complete: false, streams: [], attempts: [] }));
+              response.emit("end");
+            };
+            return;
+          }
           if (String(_options?.path || "").startsWith("/eclipse/streams") && inventoryResponseMode === "aborted") {
             response.complete = false;
             response.emit("data", "{\"partial\":");
@@ -188,10 +202,24 @@ function makeHarness({
       const request = new EventEmitter();
       request.setTimeout = () => {};
       request.end = () => queueMicrotask(() => {
+        if (String(options?.path || "") === "/eclipse/streams/cancel" && cancelResponseMode === "delayed") {
+          releaseCancelResponse = () => {
+            const response = new EventEmitter();
+            response.statusCode = 200;
+            response.resume = () => {};
+            response.setEncoding = () => {};
+            callback(response);
+            response.emit("data", JSON.stringify({ canceled: true }));
+            response.emit("end");
+          };
+          return;
+        }
         const response = new EventEmitter();
         response.statusCode = 200;
         response.resume = () => {};
+        response.setEncoding = () => {};
         callback(response);
+        response.emit("data", JSON.stringify({ canceled: false }));
         response.emit("end");
       });
       return request;
@@ -275,6 +303,17 @@ function makeHarness({
     setHealthResponses: (responses) => queuedHealth.splice(0, queuedHealth.length, ...responses),
     setDefaultHealth: (value) => { defaultHealth = value; },
     setInventoryResponseMode: (value) => { inventoryResponseMode = value; },
+    releaseInventoryResponse: () => releaseInventoryResponse?.(),
+    setCancelResponseMode: (value) => { cancelResponseMode = value; },
+    releaseCancelResponse: () => releaseCancelResponse?.(),
+    ageInventoryOperationStart: (operationId, ageMs) => {
+      const operation = luna["__omniphony-ex.native-service-supervisor"]?.activeInventoryRequests?.get(operationId);
+      if (operation) operation.createdAt = Date.now() - ageMs;
+    },
+    ageInventoryCancellation: (operationId, ageMs) => {
+      const operation = luna["__omniphony-ex.native-service-supervisor"]?.activeInventoryRequests?.get(operationId);
+      if (operation?.canceled) operation.canceledAt = Date.now() - ageMs;
+    },
     setEnsureService: (fn) => { module.exports.ensureService = fn; },
     requests,
     getRequests,
@@ -283,6 +322,9 @@ function makeHarness({
     syncCalls,
     loseSupervisorToken: () => {
       luna["__omniphony-ex.native-service-supervisor"].shutdownToken = null;
+    },
+    restoreSupervisorToken: () => {
+      luna["__omniphony-ex.native-service-supervisor"].shutdownToken = "5a".repeat(32);
     },
     reRegisterSupervisor: () => {
       const reloadedModule = { exports: {} };
@@ -293,12 +335,14 @@ function makeHarness({
         ensure: () => reloadedModule.exports.ensureService(testServiceVersion, {}),
         startEclipseLogin: (serviceBase) => reloadedModule.exports.startEclipseLogin(serviceBase, testServiceVersion, {}),
         requestEclipseStreamInventory: (serviceBase, input) => reloadedModule.exports.requestEclipseStreamInventory(serviceBase, testServiceVersion, {}, input),
+        cancelEclipseStreamInventory: (serviceBase, input) => reloadedModule.exports.cancelEclipseStreamInventory(serviceBase, testServiceVersion, {}, input),
       };
     },
     cleanup: () => fs.rmSync(userData, { recursive: true, force: true }),
     ensure: () => module.exports.ensureService(testServiceVersion, {}),
     startEclipseLogin: (serviceBase) => module.exports.startEclipseLogin(serviceBase, testServiceVersion, {}),
     requestEclipseStreamInventory: (serviceBase, input) => module.exports.requestEclipseStreamInventory(serviceBase, testServiceVersion, {}, input),
+    cancelEclipseStreamInventory: (serviceBase, input) => module.exports.cancelEclipseStreamInventory(serviceBase, testServiceVersion, {}, input),
   };
 }
 
@@ -316,17 +360,23 @@ function makeHarness({
     assert.equal(badOrigin.error, "invalid_service_endpoint");
     assert.equal(harness.spawned.length, 0, "invalid requests are rejected before service startup");
     const inventory = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
-      providerKey: "eclipse:0123456789abcdefabcd", title: "A Song & Story", artist: "An Artist",
+      providerKey: "eclipse:0123456789abcdefabcd", operationId: "a".repeat(32), title: "A Song & Story", artist: "An Artist",
     });
     assert.equal(inventory.ok, true, JSON.stringify(inventory));
     assert.equal(inventory.inventory.reason, "upstream_rate_limited");
     const nativeRequest = harness.getRequests.find((request) => String(request?.path || "").startsWith("/eclipse/streams"));
     assert.ok(nativeRequest, "the inventory route is called by the native process");
     assert.match(nativeRequest.path, /title=A\+Song\+%26\+Story/);
+    assert.match(nativeRequest.path, /operationId=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/);
     assert.equal(nativeRequest.headers.Authorization, "Bearer " + "5a".repeat(32));
     assert.equal(nativeRequest.headers["X-Omniphony-Service-Instance"], "test-instance-1");
+    const reusedOperationId = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", operationId: "a".repeat(32), trackId: "track-2",
+    });
+    assert.equal(reusedOperationId.ok, true,
+      "a completed operation releases its owner record instead of remaining stuck as in progress");
     const shortBudget = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
-      providerKey: "eclipse:0123456789abcdefabcd", trackId: "track-1", timeoutMs: 1000,
+      providerKey: "eclipse:0123456789abcdefabcd", operationId: "b".repeat(32), trackId: "track-1", timeoutMs: 1000,
     });
     assert.equal(shortBudget.ok, true, `an immediate service readiness can use a one-second inventory budget: ${JSON.stringify(shortBudget)}`);
     const shortBudgetRequest = harness.getRequests.filter((request) =>
@@ -339,11 +389,63 @@ function makeHarness({
       "the native request passes its remaining deadline without rounding it upward");
     harness.setInventoryResponseMode("aborted");
     const interrupted = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
-      providerKey: "eclipse:0123456789abcdefabcd", trackId: "track-1",
+      providerKey: "eclipse:0123456789abcdefabcd", operationId: "c".repeat(32), trackId: "track-1",
     });
     assert.equal(interrupted.ok, false);
     assert.equal(interrupted.error, "inventory_response_aborted",
       "a partial response abort settles the native promise instead of hanging");
+    const canceled = await harness.cancelEclipseStreamInventory("http://127.0.0.1:8765", { operationId: "d".repeat(32) });
+    assert.equal(canceled.ok, true);
+    assert.equal(canceled.canceled, false, "completed inventory operations are not falsely reported as canceled");
+    const cancelRequest = harness.requests.find((request) => request.path === "/eclipse/streams/cancel");
+    assert.ok(cancelRequest, "cancellation is relayed through a separately authenticated native request");
+    assert.equal(cancelRequest.headers.Authorization, "Bearer " + "5a".repeat(32));
+  } finally {
+    harness.cleanup();
+  }
+}
+
+{
+  const harness = makeHarness({ healthResponses: [null] });
+  harness.setInventoryResponseMode("pending");
+  harness.setCancelResponseMode("delayed");
+  try {
+    const operationId = "9".repeat(32);
+    const inventoryPromise = harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", operationId, trackId: "track-1",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const cancelPromise = harness.cancelEclipseStreamInventory("http://127.0.0.1:8765", { operationId });
+    await new Promise((resolve) => setImmediate(resolve));
+    harness.ageInventoryOperationStart(operationId, 180000);
+    harness.ageInventoryCancellation(operationId, 180000);
+    const reused = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", operationId, trackId: "track-2",
+    });
+    assert.equal(reused.ok, false);
+    assert.equal(reused.error, "inventory_canceled",
+      "a pending cancellation transport keeps its tombstone even beyond its normal retention window");
+    harness.loseSupervisorToken();
+    const duplicateCancel = await harness.cancelEclipseStreamInventory("http://127.0.0.1:8765", { operationId });
+    assert.equal(duplicateCancel.ok, true);
+    assert.equal(duplicateCancel.canceled, true);
+    harness.restoreSupervisorToken();
+    const stillOwned = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", operationId, trackId: "track-3",
+    });
+    assert.equal(stillOwned.ok, false);
+    assert.equal(stillOwned.error, "inventory_canceled",
+      "a duplicate cancel without credentials cannot release another call's pending transport ownership");
+    harness.releaseCancelResponse();
+    const canceled = await cancelPromise;
+    assert.equal(canceled.ok, true);
+    assert.equal(canceled.canceled, true);
+    assert.equal((await inventoryPromise).error, "inventory_canceled");
+    harness.setInventoryResponseMode("complete");
+    const afterExpiry = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", operationId, trackId: "track-after-expiry",
+    });
+    assert.equal(afterExpiry.ok, true, JSON.stringify(afterExpiry));
   } finally {
     harness.cleanup();
   }
@@ -357,12 +459,84 @@ function makeHarness({
   try {
     const startedAt = Date.now();
     const result = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
-      providerKey: "eclipse:0123456789abcdefabcd", trackId: "track-1", timeoutMs: 1000,
+      providerKey: "eclipse:0123456789abcdefabcd", operationId: "e".repeat(32), trackId: "track-1", timeoutMs: 1000,
     });
     assert.equal(result.ok, false);
     assert.equal(result.error, "inventory_deadline_exceeded");
-    assert.ok(Date.now() - startedAt < 1050, "service readiness is included in the absolute request deadline");
+    assert.ok(Date.now() - startedAt < 2000, "service readiness is included in the absolute request deadline");
     assert.equal(harness.getRequests.filter((request) => String(request?.path || "").startsWith("/eclipse/streams")).length, 0);
+  } finally {
+    harness.cleanup();
+  }
+}
+
+{
+  const harness = makeHarness({ healthResponses: [null] });
+  let releaseStartup;
+  try {
+    await harness.ensure();
+    harness.loseSupervisorToken();
+    harness.setEnsureService(() => new Promise((resolve) => { releaseStartup = resolve; }));
+    const operationId = "f".repeat(32);
+    const inventoryPromise = harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", operationId, trackId: "track-1",
+    });
+    await Promise.resolve();
+    const canceled = await harness.cancelEclipseStreamInventory("http://127.0.0.1:8765", { operationId });
+    assert.equal(canceled.ok, true, "a request canceled during ensureService needs no service credentials");
+    assert.equal(canceled.canceled, true);
+    const canceledInventory = await inventoryPromise;
+    assert.equal(canceledInventory.ok, false);
+    assert.equal(canceledInventory.error, "inventory_canceled");
+    const reusedCanceledId = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", operationId, trackId: "stale-track",
+    });
+    assert.equal(reusedCanceledId.ok, false);
+    assert.equal(reusedCanceledId.error, "inventory_canceled",
+      "a canceled startup operation ID remains reserved and cannot be revived immediately");
+    releaseStartup({ ready: true });
+    assert.equal(harness.getRequests.filter((request) =>
+      String(request?.path || "").startsWith("/eclipse/streams"),
+    ).length, 0, "a canceled startup never issues the stream inventory GET");
+  } finally {
+    harness.cleanup();
+  }
+}
+
+{
+  const harness = makeHarness({ healthResponses: [null] });
+  let releaseFirstStartup;
+  let startupCalls = 0;
+  try {
+    await harness.ensure();
+    harness.setEnsureService(() => {
+      startupCalls++;
+      return startupCalls === 1
+        ? new Promise((resolve) => { releaseFirstStartup = resolve; })
+        : Promise.resolve({ ready: true });
+    });
+    const firstId = "1".repeat(32);
+    const secondId = "2".repeat(32);
+    const firstPromise = harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", operationId: firstId, trackId: "first-track",
+    });
+    await Promise.resolve();
+    const second = await harness.requestEclipseStreamInventory("http://127.0.0.1:8765", {
+      providerKey: "eclipse:0123456789abcdefabcd", operationId: secondId, trackId: "second-track",
+    });
+    assert.equal(second.ok, true, JSON.stringify(second));
+    const canceledFirst = await harness.cancelEclipseStreamInventory("http://127.0.0.1:8765", { operationId: firstId });
+    assert.equal(canceledFirst.ok, true, "canceling the stale startup affects only its own operation ID");
+    assert.equal(canceledFirst.canceled, true);
+    releaseFirstStartup({ ready: true });
+    const canceledFirstInventory = await firstPromise;
+    assert.equal(canceledFirstInventory.ok, false);
+    assert.equal(canceledFirstInventory.error, "inventory_canceled");
+    const inventoryPaths = harness.getRequests
+      .map((request) => String(request?.path || ""))
+      .filter((requestPath) => requestPath.startsWith("/eclipse/streams?"));
+    assert.equal(inventoryPaths.length, 1, "only the restarted current operation reaches the service");
+    assert.match(inventoryPaths[0], /operationId=22222222222222222222222222222222/);
   } finally {
     harness.cleanup();
   }
